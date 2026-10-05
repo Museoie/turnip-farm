@@ -253,8 +253,9 @@ draft clips).
    manually. The user adjusts windows and adds **free-text trick names —
    the UI prompts for the trick name and accepts multiple labels per
    clip** — then confirms.
-3. **Contribution (on confirm, opt-in).** Upload `{video_id, pose key
-   sequence, confirmed clips + labels}`. Keypoints, never video. The
+3. **Contribution (on confirm, opt-in).** Upload `{video_id, source pose
+   sequence, confirmed clips + labels}` — the full source pose sequence
+   once; clips are frame windows into it. Keypoints, never video. The
    farm upserts on ID match, so re-confirmation is safe.
 4. **Model updates.** Poll `GET /api/models/current` periodically;
    download the trick-detection Core ML model; run it over pose
