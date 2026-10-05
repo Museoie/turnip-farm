@@ -1,13 +1,12 @@
 # Turnip Farm + ML Master Plan
 
-*Rev 2 · 2026-10-05 · Draft for review.*
+*Rev 3 · 2026-10-05 · Draft for review.*
 
-*Rev 1 established the direction. Rev 2 incorporates Hoie's gap-review
-decisions: the confirmed on-device contribution flow (no clip lifecycle —
-the farm only persists confirmed clips and labels), the full pose
-interchange format spec, the model output contract, vocabulary
-versioning, the fixture-regression + quarantine anti-poisoning design,
-a phased rollout, and an overview diagram.*
+*Rev 1 established the direction. Rev 2 incorporated Hoie's gap-review
+decisions (confirmed contribution flow, TKP1 format, output contract,
+vocabulary versioning, quarantine design, phasing, overview diagram).
+Rev 3 makes source/clip IDs deterministic (derived, not random) so they
+survive app reinstalls, and adds the reinstall reconciliation flow.*
 
 This document is the master plan for `turnip-farm` (backend + dataset) and
 `turnip-ml` (training), and the contract they hold with `turnip-ios`.
@@ -38,7 +37,7 @@ pipeline never see a pixel.
 ```mermaid
 flowchart TB
     subgraph Device["iOS device — private zone"]
-        A["Capture / import video<br/>(video_id = UUID)"]
+        A["Capture / import video<br/>(deterministic video_id)"]
         B["On-device pose<br/>MoveNet Thunder"]
         C["Clip editor<br/>adjust windows + free-text trick names"]
         D["User confirms + contributes"]
@@ -89,9 +88,16 @@ This is the keystone. Everything else follows from it.
 identifiers, device identifiers, contacts, or anything derived from them.
 
 **May leave the device (per explicit per-clip opt-in):**
-- `video_id` — an opaque UUID v4 generated on-device at capture/import time.
-  It is random, not a content hash, so it cannot be joined against any
-  outside dataset. One ID per source video, stable for its lifetime.
+- `video_id` — an opaque, **deterministic** identifier derived on-device
+  (see §2): for Photos-backed videos,
+  `SHA-256("turnip:phasset:" + PHAsset.localIdentifier)`; for imported
+  files, `SHA-256(file bytes)`. Deterministic — not random — so the ID
+  survives app reinstalls (the localIdentifier belongs to the Photos
+  library, not the app). Still opaque to the server: non-reversible, and
+  not derivable from video bytes by anyone without the Photos entry, so
+  it cannot be joined against outside video datasets. One ID per source
+  video. Side benefit: re-contributing the same video upserts instead of
+  duplicating training data.
 - Pose keypoint sequence — per sampled frame, the model's keypoints
   (`x`, `y`, `confidence`, normalized). A stick figure: no face, no
   background, no clothing, no identity.
@@ -115,10 +121,19 @@ and model artifacts, not video.
 ## 2. Data model (farm)
 
 Postgres. Additive migrations via `dbmate` from day 1 (unchanged
-convention). Identity rule: **`sources.id` and `clips.id` are UUID v4s
-generated on-device** — the farm never mints video or clip identities,
-which is what makes client↔server matching and idempotent re-submission
-work. All writes below are upserts on ID match.
+convention). Identity rule: **`sources.id` and `clips.id` are
+deterministic IDs derived on-device** — the farm never mints video or
+clip identities, which is what makes client↔server matching and
+idempotent re-submission work. All writes below are upserts on ID match.
+
+**ID stability.** Random IDs would die with the app's local store on
+reinstall, orphaning the server-side data. So IDs are deterministic:
+`sources.id` is derived per §1 (stable across reinstalls via the Photos
+library identity or file bytes); `clips.id` is recovered from the
+server, not recomputed — on a fresh install the client recomputes its
+video_ids, calls `GET /api/sources/:id`, and adopts the returned clip
+IDs into its rebuilt local state. Videos deleted from the library stay
+on the server as training data; the client simply cannot relink them.
 
 - `users` — `id`, `apple_subject` (unique), `display_name` (optional),
   `reputation`, `is_blocked`, `created_at`. Holds no personal data
@@ -222,6 +237,8 @@ UUIDs; every write is an upsert on ID match.
 - `POST /api/clips/:id/labels` — label-only update (re-label without
   re-uploading the source): `{labels, start_frame?, end_frame?}`.
   Upsert on `clip_id`.
+- `GET /api/sources` — list your own sources (id, frame_count,
+  clip/label counts, updated_at) for the reinstall reconciliation UI.
 - `GET /api/sources/:id` — fetch your own source with its confirmed
   clips + labels, matched by `video_id` (device restore /
   cross-device). This is the "client matches server label data using
@@ -245,17 +262,21 @@ draft clips).
 
 ## 5. iOS app contract (turnip-ios)
 
-1. **Video identity.** Generate a UUID v4 per captured/imported video;
-   persist the `video_id ↔ PHAsset localIdentifier` mapping in the
-   app-local store. This is the join key for the whole system.
+1. **Video identity (deterministic).** Derive `video_id` per §1 — from
+   the PHAsset localIdentifier for Photos-backed videos, from file
+   bytes for imports. No local ID↔asset mapping to lose: the ID is
+   recomputable after a reinstall. Reinstall reconciliation: enumerate
+   the Photos library → recompute video_ids → `GET /api/sources` to
+   show previously contributed videos → `GET /api/sources/:id` to pull
+   confirmed clips + labels and rebuild local state, adopting the
+   server's clip IDs.
 2. **Clip editor (where labeling lives).** The detector (heuristic now,
    trick model later) proposes clip windows, or the user creates them
    manually. The user adjusts windows and adds **free-text trick names —
    the UI prompts for the trick name and accepts multiple labels per
    clip** — then confirms.
-3. **Contribution (on confirm, opt-in).** Upload `{video_id, source pose
-   sequence, confirmed clips + labels}` — the full source pose sequence
-   once; clips are frame windows into it. Keypoints, never video. The
+3. **Contribution (on confirm, opt-in).** Upload `{video_id, pose key
+   sequence, confirmed clips + labels}`. Keypoints, never video. The
    farm upserts on ID match, so re-confirmation is safe.
 4. **Model updates.** Poll `GET /api/models/current` periodically;
    download the trick-detection Core ML model; run it over pose
