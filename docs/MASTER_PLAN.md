@@ -1,17 +1,24 @@
 # Turnip Farm + ML Master Plan
 
-*Rev 1 · 2026-10-05 · Draft for review.*
+*Rev 2 · 2026-10-05 · Draft for review.*
+
+*Rev 1 established the direction. Rev 2 incorporates Hoie's gap-review
+decisions: the confirmed on-device contribution flow (no clip lifecycle —
+the farm only persists confirmed clips and labels), the full pose
+interchange format spec, the model output contract, vocabulary
+versioning, the fixture-regression + quarantine anti-poisoning design,
+a phased rollout, and an overview diagram.*
 
 This document is the master plan for `turnip-farm` (backend + dataset) and
 `turnip-ml` (training), and the contract they hold with `turnip-ios`.
 It **supersedes** the backend, labeling, and ML sections of
-`turnip-ios/docs/DESIGN.md` (Rev 8) on the points below, and records three
-direction changes Hoie made on 2026-10-05:
+`turnip-ios/docs/DESIGN.md` (Rev 8) on the points listed in §8, and
+records three direction changes Hoie made on 2026-10-05:
 
-1. **Community labeling with free-text trick names.** Users label their clips;
-   labels are free-text, the UI prompts for the trick name, and a clip can
-   carry multiple labels (e.g. a combo: `hook`, `scoot`, `gainer`,
-   `cartfull`).
+1. **Community labeling with free-text trick names.** Users label their
+   clips; labels are free-text, the UI prompts for the trick name, and a
+   clip can carry multiple labels (e.g. a combo: `hook`, `scoot`,
+   `gainer`, `cartfull`).
 2. **Privacy-first farm: no video, ever.** Clips are never sent to the farm
    as video data. What leaves the device is an opaque video identifier plus
    the pose keypoint sequence. The iOS client matches server-side label data
@@ -26,7 +33,53 @@ direction changes Hoie made on 2026-10-05:
 itself stays on-device (MoveNet Thunder, bundled) — the farm and the ML
 pipeline never see a pixel.
 
----
+## Overview
+
+```mermaid
+flowchart TB
+    subgraph Device["iOS device — private zone"]
+        A["Capture / import video<br/>(video_id = UUID)"]
+        B["On-device pose<br/>MoveNet Thunder"]
+        C["Clip editor<br/>adjust windows + free-text trick names"]
+        D["User confirms + contributes"]
+    end
+    subgraph Farm["turnip-farm — keypoints only, never video"]
+        E[("Postgres<br/>sources · clips · labels")]
+        F[("R2<br/>pose blobs (.tkp1.gz)<br/>model artifacts")]
+    end
+    subgraph ML["turnip-ml — nightly"]
+        G["Train trick-detection candidate"]
+        H["Fixture regression test"]
+        I{"Regression?"}
+        J["Discord alert +<br/>quarantine day's data"]
+        K["Publish champion"]
+    end
+    A --> B --> C --> D
+    D -->|"video_id + pose blob<br/>confirmed clips + labels"| E
+    D --> F
+    E -->|"labels + pose refs<br/>(quarantined excluded)"| G
+    G --> H --> I
+    I -->|"yes"| J
+    I -->|"no"| K
+    K -->|"OTA manifest<br/>(model + vocabulary)"| L["iOS downloads trick model<br/>proposes clips + names on-device"]
+    L -.-> C
+```
+
+Video pixels never cross the device boundary — only the pose keypoint
+sequence, opaque identifiers, and confirmed labels travel to the farm.
+The loop is closed: better labels → better model → better on-device
+proposals → easier labeling.
+
+The confirmed contribution flow (no drafts on the server):
+
+1. User creates clips and labels them using Turnip's detection model,
+   or manually, on-device.
+2. User confirms the clips and labels, on-device.
+3. The confirmed clips and labels are sent to the farm and persisted.
+   If clip IDs match existing ones, the labels are overridden (upsert).
+4. The farm runs nightly ML jobs and publishes the detection model.
+5. iOS clients check for model updates periodically and download them.
+6. Repeat from 1.
 
 ## 1. Privacy architecture
 
@@ -42,9 +95,11 @@ identifiers, device identifiers, contacts, or anything derived from them.
 - Pose keypoint sequence — per sampled frame, the model's keypoints
   (`x`, `y`, `confidence`, normalized). A stick figure: no face, no
   background, no clothing, no identity.
-- Label payloads — trick windows (frame ranges) and free-text trick names.
+- Label payloads — confirmed clip windows (frame ranges) and free-text
+  trick names.
 - Account subject — the Sign in with Apple `sub` claim, which is already
-  per-app opaque. Needed to attribute labels for reputation scoring.
+  per-app opaque. Needed to attribute labels for reputation scoring and
+  for quarantine attribution (§6).
 
 **Why keypoints are safe enough:** a pose sequence contains no biometric
 image data. Residual honesty: gait-from-keypoints is a real (if nascent)
@@ -57,178 +112,264 @@ server-side video storage, server-rendered video feed, and every sentence
 with "upload the video to the backend" in it. R2 stays — for pose blobs
 and model artifacts, not video.
 
----
-
 ## 2. Data model (farm)
 
-Postgres. Additive migrations via `dbmate` from day one (unchanged
-convention).
+Postgres. Additive migrations via `dbmate` from day 1 (unchanged
+convention). Identity rule: **`sources.id` and `clips.id` are UUID v4s
+generated on-device** — the farm never mints video or clip identities,
+which is what makes client↔server matching and idempotent re-submission
+work. All writes below are upserts on ID match.
 
 - `users` — `id`, `apple_subject` (unique), `display_name` (optional),
-  `reputation`, `is_blocked`, `created_at`. Unchanged in shape; note the
-  account holds no personal data beyond what Apple gives us.
-- `sources` — one row per contributed source video. `id` UUID **generated
-  on-device** (PK — the farm never mints video identities),
-  `user_id` FK, `frame_count`, `sample_rate`, `keypoint_format`
-  (e.g. `movenet-17`, versioned), `r2_key` (pose blob), `created_at`.
-  No video bytes. No thumbnails.
-- `clips` — `id`, `source_id` FK, `start_frame`, `end_frame`,
-  `auto_detected` (bool: heuristic now, trick model later),
-  `created_at`. A clip is a window into a source, nothing more.
-- `labels` — `id`, `clip_id` FK, `user_id` FK (the labeler),
-  `labels TEXT[]` (free-text trick names, **multiple per clip**),
-  `start_frame` / `end_frame` (nullable — null means "accept the clip
-  window"; labelers may tighten it), `quality_score`, `created_at`.
-  `crop_rects` are gone from the server model: with keypoints, the
-  athlete's location is already known, and crop is a client-side
-  rendering concern for export.
-- `label_taxonomy` — `raw` → `canonical` mapping plus `first_seen`.
-  Free text is preserved forever; training consumes canonical names.
-  Seeded from standard tricking vocabulary, grown from data (see §5).
+  `reputation`, `is_blocked`, `created_at`. Holds no personal data
+  beyond what Apple gives us.
+- `sources` — one row per contributed source video. `id` UUID
+  (device-generated, PK), `user_id` FK, `frame_count`,
+  `sample_rate` (as sent, provenance), `keypoint_format`
+  (e.g. `tkp1`, versioned), `r2_key` (pose blob), `created_at`,
+  `updated_at`. No video bytes. No thumbnails.
+- `clips` — `id` UUID (device-generated, PK), `source_id` FK,
+  `start_frame`, `end_frame`, `auto_detected` (bool: heuristic now,
+  trick model later), `created_at`, `updated_at`.
+  Hierarchy: **Source → Clip → Label**, all one-to-many.
+- `labels` — `id`, `clip_id` FK **UNIQUE** (exactly one label set per
+  clip — re-submission overrides), `user_id` FK (owner/labeler, for
+  attribution), `labels TEXT[]` (free-text trick names, **multiple per
+  clip**), `start_frame` / `end_frame` (nullable — null means "the clip
+  window"; the labeler may tighten it), `taxonomy_version` (vocab in
+  effect at label time), `created_at`, `updated_at`. `crop_rects` are
+  gone: with keypoints the athlete's location is already known, and
+  crop is a client-side rendering concern.
+- `label_taxonomy` — `raw` → `canonical` mapping, `taxonomy_version`
+  (monotonic int, bumped when canonical names are added/changed),
+  `first_seen`. Free text is preserved forever; training consumes
+  canonical names. Seeded from standard tricking vocabulary.
 - `models` — `id`, `version`, `model_type` (`trick-detection`),
-  `r2_key`, `val_metrics` (JSONB), `promoted_at`.
+  `taxonomy_version` (the vocab the model trained on), `r2_key`,
+  `val_metrics` (JSONB), `promoted_at`.
+- `data_quarantine` — `id`, `source_id` FK, `user_id` FK (who uploaded
+  it — the "basic level of identification" for bad data), `reason`,
+  `metrics` (JSONB snapshot), `quarantined_at`, `reviewed_at`,
+  `resolution` (`released` | `purged`). The training export excludes
+  quarantined sources. This is the anti-poisoning work queue (§6).
 - `reports` — retargeted at labels/clips (was: videos).
 - `follows` / feed — **deferred**. A server video feed cannot exist
   without server video. Social sharing stays where DESIGN.md put it:
-  the iOS Share Sheet, zero server involvement. If a feed is wanted
-  later, the honest options are skeleton-preview rendering client-side
-  from keypoints, or revisiting this privacy line deliberately —
-  not silently.
+  the iOS Share Sheet, zero server involvement.
 
-**Pose blob format.** Canonical encoding: little-endian float32 arrays
-(frames × keypoints × 3), gzip-compressed, with a small header
-(magic, format version, keypoint count, frame count, sample rate).
-Size math: 17 keypoints × 3 × 4 bytes × 10 fps ≈ 2 KB/s — a 60-second
-session is ~120 KB. R2 presigned PUT for upload (same pattern as the old
-video upload, now for blobs); the droplet never touches the bytes.
+## 3. Pose interchange format (`TKP1`)
 
----
+The canonical encoding for pose keypoint sequences, on the wire and in
+R2. One format, versioned — no JSON variant (clients may log JSON
+locally, but the wire/storage format is binary).
 
-## 3. API (farm)
+**Temporal conventions:**
+- Canonical sample rate: **10 Hz**. Clients send at their analysis rate
+  (the iOS setting, 1–30, default 10); the farm **resamples to 10 Hz on
+  ingest** and stores canonical only. `sample_rate` on the source row
+  records the as-sent rate for provenance.
+- Resampling: linear interpolation of `x`/`y`; confidence interpolated
+  linearly. **Gaps break interpolation** — if either bracketing frame is
+  a gap, the resampled frame is a gap. Never synthesize pose across
+  missing data.
+
+**Keypoint conventions (MoveNet 17, COCO order):**
+`0 nose, 1 left_eye, 2 right_eye, 3 left_ear, 4 right_ear,
+5 left_shoulder, 6 right_shoulder, 7 left_elbow, 8 right_elbow,
+9 left_wrist, 10 right_wrist, 11 left_hip, 12 right_hip,
+13 left_knee, 14 right_knee, 15 left_ankle, 16 right_ankle.`
+
+**Spatial conventions:** `x`, `y` normalized 0–1 relative to source
+frame dimensions (values may fall outside [0,1] in letterbox-pad regions
+— recorded as-is, never clamped, per the iOS convention). `confidence`
+0–1 per keypoint, as emitted by the model.
+
+**Gap representation:** a frame with no usable pose is all zeros
+(`x=0, y=0, confidence=0` for all 17 keypoints). Consumers treat any
+all-zero-confidence frame as missing. Fixed-size, no special-casing in
+the binary layout.
+
+**Binary layout** (whole blob gzip-compressed):
+
+```
+offset  size  field
+0       4     magic "TKP1"
+4       2     format_version (uint16, =1)
+6       2     keypoint_count (uint16, =17)
+8       4     frame_count (uint32)
+12      4     sample_rate_hz (float32, canonical 10.0)
+16      4     source_sample_rate_hz (float32, as sent)
+20      4     flags (uint32, reserved = 0)
+24      …     frame_count × 17 × 3 float32 LE (x, y, confidence)
+```
+
+Size: 24 + `frame_count` × 204 bytes → ~2 KB/s at 10 Hz; a 60-second
+session is ~122 KB.
+
+## 4. API (farm)
 
 Bun + TypeScript + Postgres (unchanged stack). Auth via Sign in with
-Apple (unchanged contract).
+Apple (unchanged contract). All IDs below are the device-generated
+UUIDs; every write is an upsert on ID match.
 
-- `POST /api/sources` — register a source. Body:
-  `{video_id, frame_count, sample_rate, keypoint_format, clips?:
-  [{start_frame, end_frame, auto_detected}]}` plus the pose blob via
-  presigned R2 PUT (URL minted here). Upload the **full source pose
-  sequence once**; clips are frame windows into it — at ~2 KB/s there is
-  no reason to slice per clip.
-- `GET /api/labels/pending` — N clips needing labels:
-  `[{clip_id, video_id, start_frame, end_frame, pose_url}]`
-  (`pose_url` = presigned R2 GET for the source blob).
-- `POST /api/clips/:id/labels` — `{labels: ["cork", "shuriken"],
-  start_frame?, end_frame?}`. Multiple free-text names per clip;
-  window optional.
+- `POST /api/sources` — submit a confirmed contribution. Body:
+  `{video_id, frame_count, sample_rate, keypoint_format,
+  clips: [{clip_id, start_frame, end_frame, auto_detected,
+  labels: ["cork", ...]}]}` plus the pose blob via presigned R2 PUT.
+  Upload the **full source pose sequence once**; clips are frame
+  windows into it. Re-submission with matching IDs overrides
+  clips/labels (idempotent).
+- `POST /api/clips/:id/labels` — label-only update (re-label without
+  re-uploading the source): `{labels, start_frame?, end_frame?}`.
+  Upsert on `clip_id`.
+- `GET /api/sources/:id` — fetch your own source with its confirmed
+  clips + labels, matched by `video_id` (device restore /
+  cross-device). This is the "client matches server label data using
+  the video identifier" mechanism.
 - `DELETE /api/sources/:id` — owner-only hard delete (row + R2 blob).
-  Replaces the old video delete; same "keep forever, user-deletable"
-  retention posture.
-- `GET /api/models/current` — trick-model manifest (version, URL,
-  checksum). Same shape as before, new model type.
+  Same "keep forever, user-deletable" retention posture.
+- `GET /api/models/current` — trick-model manifest: version, URL,
+  checksum, `taxonomy_version`, and the vocabulary list
+  `[{canonical, aliases[]}]`.
 - `POST /api/models` — training pipeline publishes the champion
   (admin-scoped).
 - `GET /api/labels/export?since=` — training pipeline pull: labels +
-  pose blob references since a watermark.
-- **Dropped:** video upload/serve, video feed endpoints, crop rects in
-  labels.
+  pose blob references since a watermark. **Excludes quarantined
+  sources.**
+- `POST /api/reports` — report a bad label/clip.
 
----
+Dropped from the Rev 1 draft: `GET /api/labels/pending` — there is no
+community labeling queue; labeling happens on-device by the clip owner
+(per the confirmed contribution flow, the farm has no interest in
+draft clips).
 
-## 4. iOS app contract (turnip-ios)
+## 5. iOS app contract (turnip-ios)
 
 1. **Video identity.** Generate a UUID v4 per captured/imported video;
    persist the `video_id ↔ PHAsset localIdentifier` mapping in the
-   app-local store. This is the join key for everything server-side.
-2. **Contribution toggle (per clip, opt-in).** "Contribute to the
-   community dataset" uploads `{video_id, pose key sequence,
-   clip windows}` — keypoints, never video.
-3. **Labeling tab (v2).** Fetches `GET /api/labels/pending`. For each
-   clip, look up the local video by `video_id`:
-   - Found → play the local video with the pose overlay, editable
-     start/end handles, and free-text label chips. The UI **prompts for
-     the trick name** and accepts **multiple labels per clip**.
-   - Not found (deleted, or another device) → render a skeleton
-     animation from the pose keypoints. Labeling works from the stick
-     figure alone — which is also the proof of the privacy property.
-   
-   This covers both "label my own clips" (the primary flow — the
-   owner's client already holds the video) and community labeling of
-   others' clips.
-4. **On-device trick model (endgame).** Poll `GET /api/models/current`
-   for the trick-detection Core ML model; run it over the pose
-   sequence to propose clips **and** trick names, replacing the
-   heuristic `TrickWindowDetector` (which stays as the offline
-   fallback). Two-model story from here on: bundled pose model
-   (MoveNet, unchanged) + OTA trick model.
+   app-local store. This is the join key for the whole system.
+2. **Clip editor (where labeling lives).** The detector (heuristic now,
+   trick model later) proposes clip windows, or the user creates them
+   manually. The user adjusts windows and adds **free-text trick names —
+   the UI prompts for the trick name and accepts multiple labels per
+   clip** — then confirms.
+3. **Contribution (on confirm, opt-in).** Upload `{video_id, pose key
+   sequence, confirmed clips + labels}`. Keypoints, never video. The
+   farm upserts on ID match, so re-confirmation is safe.
+4. **Model updates.** Poll `GET /api/models/current` periodically;
+   download the trick-detection Core ML model; run it over pose
+   sequences to propose clips **and** trick names. The heuristic
+   detector stays as the offline fallback.
+5. Rendering a skeleton from a pose blob when the local video is absent
+   (e.g. restored labels on a new device) remains available as a
+   property of the format — no video needed.
 
----
+## 6. ML program (turnip-ml)
 
-## 5. ML program (turnip-ml)
+**Task.** Temporal trick detection + naming. Input: pose key sequence
+(`T × 17 × 3`, canonical 10 Hz TKP1). Output per source:
 
-**Task reformulation.** Old: fine-tune a pose detector. New: train a
-**trick detection + naming model**. Input: pose key sequence
-(`T × 17 × 3`, variable length). Output: list of
-`(start_frame, end_frame, trick_name)`. This is temporal action
-detection with open-vocabulary names, collapsed to a closed label set
-via the taxonomy.
+```json
+{
+  "source_id": "<uuid>",
+  "tricks": [
+    {"start_frame": 120, "end_frame": 175,
+     "trick_names": ["cork"], "is_combo": false},
+    {"start_frame": 300, "end_frame": 420,
+     "trick_names": ["hook", "scoot", "gainer", "cartfull"],
+     "is_combo": true}
+  ]
+}
+```
+
+- Frames are in **source coordinates** — absolute indices into the
+  source's canonical 10 Hz pose sequence (not clip-relative).
+- `is_combo` is `trick_names.length > 1`, kept as an explicit field for
+  client convenience (display, routing). A combo is **one segment with
+  N names** — no sub-segmentation for MVP.
+- Training target: one segment per confirmed clip window; combo clips
+  carry their N canonical names on the single window.
 
 **Data.** `GET /api/labels/export?since=` → (pose blob, clip windows,
-free-text labels). Curation step: normalize raw strings to canonical
-names via `label_taxonomy` (seed from tricking vocabulary; a combo
-label like `"hook - scoot - gainer - cartfull (combo)"` splits into
-four canonical labels on one window). Raw strings are never discarded.
+free-text labels). Curation: normalize raw strings to canonical names
+via `label_taxonomy` (a combo string like
+`"hook - scoot - gainer - cartfull (combo)"` splits into four canonical
+labels on one window); raw strings never discarded. Non-labeled regions
+of contributed sources serve as background negatives.
 
 **Splits.** 80/10/10 stratified by `user_id` — no user's clips leak
-across splits. The held-out set stays admin-curated.
+across splits. Held-out set stays admin-curated.
 
 **Model.** Baseline: temporal encoder (TCN or small Transformer) over
 the keypoint sequence with a detection head; sliding-window classifier
 + NMS is an acceptable MVP. Architecture choice belongs in the
-training plan, not here — the contract is the input/output framing.
+training plan — the contract is the input/output framing above.
 
 **Metrics.** Segment quality (mAP at tIoU thresholds) **and** name
 accuracy, reported separately. Champion/challenger: promote only on
-≥1% validation improvement, as before.
+≥1% validation improvement.
+
+**Anti-poisoning (nightly).** After training a candidate, run the
+fixture regression suite (the existing pose-accuracy fixtures plus
+trick-labeled fixtures — segment IoU + name accuracy vs. champion):
+- On regression: (1) fire a **Discord webhook alert** with the metrics
+  delta, affected source IDs, and user IDs; (2) **quarantine that day's
+  ingested sources** (`data_quarantine`) and skip them in training;
+  (3) skip promotion.
+- The engineer reviews the quarantine queue, cleans (purge bad
+  sources, release good ones); the next night retries.
+- Attribution comes from `sources.user_id` — the basic identification
+  of who uploaded the bad data.
 
 **Export + deploy.** `coremltools` → Core ML, upload to R2,
-`POST /api/models`. The app picks it up via the existing OTA poll.
+`POST /api/models` with the `taxonomy_version` it trained on. The app
+picks it up via the existing OTA poll.
 
-**What stays.** The `PoseAccuracy` harness and its CI gate: it now
-guards the *input* to the trick model (pose quality on real footage)
-rather than being the thing under training. Fine-tuning MoveNet
-itself is off the table unless the pose escalation ladder in the iOS
-design doc fires on empirical grounds.
+**What stays.** The `PoseAccuracy` harness and CI gate now guard the
+*input* to the trick model (pose quality on real footage). Fine-tuning
+MoveNet itself is off the table unless the pose escalation ladder in
+the iOS design doc fires on empirical grounds.
 
 **Trigger.** Nightly cron or manual dispatch; run only when new labels
 since the last watermark exceed a threshold (start: 50).
 
----
+## 7. Phased rollout
 
-## 6. Suggested changes to turnip-ios DESIGN.md
+- **Phase 0 — foundation (this PR).** Master plan agreed; the doc is
+  the contract.
+- **Phase 1 — farm ingest.** Tables, `POST /api/sources` (+ upsert),
+  pose blob pipeline, labels export, quarantine table, Discord hook
+  config.
+- **Phase 2 — iOS contribution.** Video UUIDs + local mapping, pose
+  upload on confirm, free-text multi-label editor in the clip flow.
+- **Phase 3 — ML training.** Nightly job, fixture regression suite,
+  quarantine flow, taxonomy curation, model publish + OTA manifest.
+- **Phase 4 — on-device trick model.** OTA download, on-device clip +
+  name proposals, heuristic detector as fallback.
 
-These are suggestions for Hoie to apply to `docs/DESIGN.md` (Rev 8);
-this PR does not touch that file.
+## 8. Suggested changes to turnip-ios DESIGN.md
+
+Suggestions for Hoie to apply to `docs/DESIGN.md` (Rev 8); this PR
+does not touch that file.
 
 1. **Backend section** — replace the video-upload/R2-video design with
-   §2–§3 of this plan (`sources`, pose blobs, no video bytes). Delete
+   §2–§4 of this plan (`sources`, pose blobs, no video bytes). Delete
    every "upload the video" sentence.
 2. **Labels** — free-text `TEXT[]`, multiple per clip, labeler-settable
    windows; drop `crop_rects` from the server label model.
 3. **ML section** — the pipeline trains a trick detection model
    (pose sequence → segments + names), not a fine-tuned pose model.
 4. **Decisions** — #2 (*no classifier at launch*) is reversed: the
-   classifier/detector **is** the ML program now. #4 (*keep videos
-   forever*) is moot: there are no videos to keep. Add a privacy
-   decision: *keypoints + opaque IDs only, never pixels* (this plan
-   §1), with the reopen trigger being a deliberate product decision,
-   never convenience.
+   detector **is** the ML program now. #4 (*keep videos forever*) is
+   moot: there are no videos to keep. Add a privacy decision:
+   *keypoints + opaque IDs only, never pixels* (§1), reopenable only
+   by deliberate product decision, never convenience.
 5. **OTA models** — two-model story: bundled MoveNet (pose, unchanged)
    + OTA trick-detection model (replaces the old "pose+action model"
    language).
-6. **Labeling UI** — prompt for the trick name, multi-label chips,
-   match server clips to local video by `video_id`, skeleton fallback
-   when the video is gone.
+6. **Clip editor / labeling** — the label editor lives in the clip
+   confirmation flow: prompt for the trick name, multi-label chips,
+   confirm-to-contribute. No server labeling queue.
 7. **New section: video identity** — UUID v4 per video, local
    `video_id ↔ PHAsset` mapping, the join key for the whole system.
 8. **Social feed** — either defer it explicitly (recommended: Share
@@ -238,23 +379,17 @@ this PR does not touch that file.
 9. **Problem statement** — the "community labeling + continuous
    training platform" paragraph should now say the community trains
    *trick detection*, and the privacy claim ("nothing leaves your
-   device" in the README) becomes literally true for v2 as well.
+   device") becomes literally true for v2 as well.
 
----
+## 9. Open questions
 
-## 7. Open questions
-
-1. **Label taxonomy curation.** Who canonicalizes new free-text names?
-   Proposal: seed from standard tricking vocabulary; auto-suggest
-   canonical matches in the labeling UI (fuzzy match); a trusted-user
-   queue resolves the unmatched remainder.
-2. **Auto window suggestions for labelers.** Keep the clip window as
-   the suggested label window (yes — reduces labeling effort; the
-   labeler tightens when wrong).
-3. **Multi-device.** A `video_id` created on the iPhone won't resolve
-   on the user's iPad → skeleton fallback covers it. Acceptable?
-4. **Pose blob hosting.** R2 presigned PUT (recommended, keeps the
-   droplet stateless) vs. direct POST for sub-1MB blobs. Either works;
-   pick one in implementation.
-5. **Reputation without video.** The existing reputation/spot-check
-   design transfers unchanged (it scores *labels*, never footage).
+1. **Taxonomy curation.** Who canonicalizes new free-text names?
+   Proposal: seed from standard tricking vocabulary; fuzzy-match
+   suggestions in the label editor; a trusted-user queue resolves the
+   unmatched remainder. (Versioning itself is decided — §2/§6.)
+2. **Multi-device.** A `video_id` created on the iPhone won't resolve
+   on the user's iPad. `GET /api/sources/:id` restores clips + labels;
+   video stays behind. Acceptable for v1?
+3. **Reputation without video.** The existing reputation/spot-check
+   design transfers unchanged (it scores *labels*, never footage) —
+   plus quarantine attribution via `sources.user_id`.
