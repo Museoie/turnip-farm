@@ -253,6 +253,12 @@ match.
   clips + labels, matched by `video_id` (device restore /
   cross-device). This is the "client matches server label data using
   the video identifier" mechanism.
+- `GET /api/sources/:id/pose` — owner-only presigned R2 GET of the
+  source's TKP1 pose blob. Used by a device that no longer holds the
+  local video (reinstall restore, cross-device) to render skeleton
+  previews from keypoints alone (§5.5). Presigned per request, scoped
+  to the single blob, short-lived; the owner-only rule is what keeps
+  one user's pose sequences from ever being downloadable by another.
 - `DELETE /api/sources/:id` — owner-only hard delete (row + R2 blob).
   Same "keep forever, user-deletable" retention posture.
 - `GET /api/models/current` — trick-model manifest: version, URL,
@@ -292,9 +298,12 @@ draft clips).
    download the trick-detection Core ML model; run it over pose
    sequences to propose clips **and** trick names. The heuristic
    detector stays as the offline fallback.
-5. Rendering a skeleton from a pose blob when the local video is absent
-   (e.g. restored labels on a new device) remains available as a
-   property of the format — no video needed.
+5. Rendering a skeleton when the local video is absent (e.g. restored
+   labels on a new device): the client fetches the pose blob through
+   `GET /api/sources/:id/pose` (owner-only, §4) and renders the skeleton
+   straight from the TKP1 frames — no video needed. The rendering
+   itself is a property of the format; the download path is the new
+   endpoint above.
 
 ## 6. ML program (turnip-ml)
 
