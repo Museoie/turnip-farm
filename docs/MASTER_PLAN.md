@@ -2,8 +2,8 @@
 
 *Rev 3 · 2026-10-05 · Draft for review.*
 
-*Rev 1 established the direction. Rev 2 incorporated Hoie's gap-review
-decisions (confirmed contribution flow, TKP1 format, output contract,
+*Rev 1 established the direction. Rev 2 incorporated the maintainer's
+gap-review decisions (confirmed contribution flow, TKP1 format, output contract,
 vocabulary versioning, quarantine design, phasing, overview diagram).
 Rev 3 makes source/clip IDs deterministic (derived, not random) so they
 survive app reinstalls, and adds the reinstall reconciliation flow.*
@@ -12,7 +12,7 @@ This document is the master plan for `turnip-farm` (backend + dataset) and
 `turnip-ml` (training), and the contract they hold with `turnip-ios`.
 It **supersedes** the backend, labeling, and ML sections of
 `turnip-ios/docs/DESIGN.md` (Rev 8) on the points listed in §8, and
-records three direction changes Hoie made on 2026-10-05:
+records three direction changes the maintainer made on 2026-10-05:
 
 1. **Community labeling with free-text trick names.** Users label their
    clips; labels are free-text, the UI prompts for the trick name, and a
@@ -98,6 +98,10 @@ identifiers, device identifiers, contacts, or anything derived from them.
   it cannot be joined against outside video datasets. One ID per source
   video. Side benefit: re-contributing the same video upserts instead of
   duplicating training data.
+  Caveat: for imports the ID is `SHA-256(file bytes)`, so two users
+  importing the identical file compute the identical `video_id` —
+  joinable against identical files (which is also what enables the dedup
+  side-benefit).
 - Pose keypoint sequence — per sampled frame, the model's keypoints
   (`x`, `y`, `confidence`, normalized). A stick figure: no face, no
   background, no clothing, no identity.
@@ -121,10 +125,12 @@ and model artifacts, not video.
 ## 2. Data model (farm)
 
 Postgres. Additive migrations via `dbmate` from day 1 (unchanged
-convention). Identity rule: **`sources.id` and `clips.id` are
-deterministic IDs derived on-device** — the farm never mints video or
-clip identities, which is what makes client↔server matching and
-idempotent re-submission work. All writes below are upserts on ID match.
+convention). Identity rule: **`sources.id` is the deterministic
+`video_id` derived on-device per §1** — the farm never mints source
+identities, which is what makes client↔server matching and idempotent
+re-submission work. `clips.id` is client-minted (UUIDv4) once and
+recovered from the server after reinstall (§5.1), not re-derivable.
+All writes below are upserts on ID match.
 
 **ID stability.** Random IDs would die with the app's local store on
 reinstall, orphaning the server-side data. So IDs are deterministic:
@@ -138,12 +144,15 @@ on the server as training data; the client simply cannot relink them.
 - `users` — `id`, `apple_subject` (unique), `display_name` (optional),
   `reputation`, `is_blocked`, `created_at`. Holds no personal data
   beyond what Apple gives us.
-- `sources` — one row per contributed source video. `id` UUID
-  (device-generated, PK), `user_id` FK, `frame_count`,
+- `sources` — one row per contributed source video. `id` CHAR(64)
+  (SHA-256 hex digest per §1, PK), `user_id` FK, `frame_count`,
   `sample_rate` (as sent, provenance), `keypoint_format`
-  (e.g. `tkp1`, versioned), `r2_key` (pose blob), `created_at`,
-  `updated_at`. No video bytes. No thumbnails.
-- `clips` — `id` UUID (device-generated, PK), `source_id` FK,
+  (e.g. `tkp1`, versioned), `r2_key` (pose blob), `sha256` (hex
+  digest of the blob — integrity check, consistent with the model
+  manifest's checksum), `created_at`, `updated_at`. No video bytes.
+  No thumbnails.
+- `clips` — `id` UUID (client-minted once, PK — recovered from the
+  server after reinstall, not re-derivable), `source_id` FK,
   `start_frame`, `end_frame`, `auto_detected` (bool: heuristic now,
   trick model later), `created_at`, `updated_at`.
   Hierarchy: **Source → Clip → Label**, all one-to-many.
@@ -224,8 +233,9 @@ session is ~122 KB.
 ## 4. API (farm)
 
 Bun + TypeScript + Postgres (unchanged stack). Auth via Sign in with
-Apple (unchanged contract). All IDs below are the device-generated
-UUIDs; every write is an upsert on ID match.
+Apple (unchanged contract). `sources.id` is the §1 SHA-256 hex digest;
+`clip_id`s are client-minted UUIDs; every write is an upsert on ID
+match.
 
 - `POST /api/sources` — submit a confirmed contribution. Body:
   `{video_id, frame_count, sample_rate, keypoint_format,
@@ -293,7 +303,7 @@ draft clips).
 
 ```json
 {
-  "source_id": "<uuid>",
+  "source_id": "<sha256-hex>",
   "tricks": [
     {"start_frame": 120, "end_frame": 175,
      "trick_names": ["cork"], "is_combo": false},
@@ -320,7 +330,11 @@ labels on one window); raw strings never discarded. Non-labeled regions
 of contributed sources serve as background negatives.
 
 **Splits.** 80/10/10 stratified by `user_id` — no user's clips leak
-across splits. Held-out set stays admin-curated.
+across splits. Held-out set stays admin-curated. Bootstrap guard: until
+the contributor pool exceeds ~20 users (or any split would hold fewer
+than 50 clips), fall back to unstratified random splits —
+user-stratification on a handful of contributors yields degenerate
+splits (one user dominating all three, or near-empty val/test).
 
 **Model.** Baseline: temporal encoder (TCN or small Transformer) over
 the keypoint sequence with a detection head; sliding-window classifier
@@ -362,8 +376,9 @@ since the last watermark exceed a threshold (start: 50).
 - **Phase 1 — farm ingest.** Tables, `POST /api/sources` (+ upsert),
   pose blob pipeline, labels export, quarantine table, Discord hook
   config.
-- **Phase 2 — iOS contribution.** Video UUIDs + local mapping, pose
-  upload on confirm, free-text multi-label editor in the clip flow.
+- **Phase 2 — iOS contribution.** Deterministic video IDs +
+  reinstall reconciliation (§5.1), pose upload on confirm, free-text
+  multi-label editor in the clip flow.
 - **Phase 3 — ML training.** Nightly job, fixture regression suite,
   quarantine flow, taxonomy curation, model publish + OTA manifest.
 - **Phase 4 — on-device trick model.** OTA download, on-device clip +
@@ -371,7 +386,7 @@ since the last watermark exceed a threshold (start: 50).
 
 ## 8. Suggested changes to turnip-ios DESIGN.md
 
-Suggestions for Hoie to apply to `docs/DESIGN.md` (Rev 8); this PR
+Suggestions for the maintainer to apply to `docs/DESIGN.md` (Rev 8); this PR
 does not touch that file.
 
 1. **Backend section** — replace the video-upload/R2-video design with
@@ -392,16 +407,21 @@ does not touch that file.
 6. **Clip editor / labeling** — the label editor lives in the clip
    confirmation flow: prompt for the trick name, multi-label chips,
    confirm-to-contribute. No server labeling queue.
-7. **New section: video identity** — UUID v4 per video, local
-   `video_id ↔ PHAsset` mapping, the join key for the whole system.
+7. **New section: video identity** — deterministic video IDs
+   recomputed from the Photos library
+   (`SHA-256("turnip:phasset:" + localIdentifier)`) or file bytes, no
+   local ID↔asset mapping to lose; reinstall reconciliation via
+   `GET /api/sources` + `GET /api/sources/:id` (§5.1).
 8. **Social feed** — either defer it explicitly (recommended: Share
    Sheet already covers sharing) or restate it as client-rendered
    skeleton previews. The current server-feed design is incompatible
    with §1.
 9. **Problem statement** — the "community labeling + continuous
    training platform" paragraph should now say the community trains
-   *trick detection*, and the privacy claim ("nothing leaves your
-   device") becomes literally true for v2 as well.
+   *trick detection*, and the privacy claim should read "no video
+   pixels ever leave the device" — pose keypoint sequences, labels,
+   and the Apple `sub` do leave per explicit opt-in (§1), and
+   gait-from-keypoints re-identification is real research.
 
 ## 9. Open questions
 
