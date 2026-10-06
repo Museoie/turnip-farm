@@ -70,13 +70,29 @@ Two departures from the master plan's label draft follow from this:
    defined.
 9. `r2_key` is deterministic: `poses/<source_id>.tkp1.gz`.
    Re-contribution overwrites the same key.
-10. Blob integrity is verified **server-side at clip-submission time**
-    (fetch the R2 object, compare SHA-256 against `sources.sha256`).
-    A source row registered but never uploaded is a harmless dangling row
-    that self-heals on re-contribution.
+10. Blob integrity is two-layered, because the farm resamples on ingest
+    and stores canonical-only (TKP1 §6):
+    - **Transport.** The presigned PUT URL requires the client to attach
+      a content checksum (`Content-MD5` or `x-amz-checksum-sha256`);
+      storage rejects a corrupted upload at write time. The client never
+      supplies the stored digest.
+    - **Stored.** `sources.sha256` is the SHA-256 of the **canonical**
+      `.tkp1.gz` blob bytes as stored — computed by the farm at ingest,
+      after resampling to 10 Hz; NULL until ingest completes. A digest of
+      the as-sent bytes would be invalidated by ingest for every
+      non-10 Hz contribution, so it is never stored.
+    A farm-side ingest worker resamples the staged upload to canonical
+    10 Hz, stores it at `r2_key`, sets `sources.sha256`, and deletes the
+    staged object. Clip submission re-verifies the stored blob against
+    `sources.sha256` (`422 BLOB_DIGEST_MISMATCH`); a NULL digest means
+    the blob is not ingested yet (`422 BLOB_MISSING`). A source row
+    registered but never uploaded is a harmless dangling row that
+    self-heals on re-contribution.
 11. `updated_at` is set explicitly in every upsert's `DO UPDATE` clause;
     no database triggers.
-12. Label names are trimmed at the API boundary; uniqueness is on
+12. Label names are trimmed at the API boundary; case-insensitive
+    duplicates are deduped pre-insert (§5) — a unique index rejects
+    duplicates, it does not collapse them. Uniqueness is enforced on
     `(clip_id, lower(trick_name))`; the original casing is preserved in
     storage and the raw string is never altered.
 13. **Source ownership is first-writer-wins.** `user_id` is never
@@ -129,10 +145,14 @@ CREATE TABLE sources (
   -- 10 Hz TKP1 (see TKP1.md §6).
   keypoint_format TEXT NOT NULL DEFAULT 'tkp1',
   r2_key          TEXT NOT NULL,
-  -- Deterministic: poses/<id>.tkp1.gz. Re-contribution overwrites.
-  sha256          CHAR(64) NOT NULL,
-  -- Hex digest of the .tkp1.gz blob BYTES (integrity), distinct from `id`
-  -- (digest of the asset identity). Verified at clip-submission time.
+  -- Deterministic: poses/<id>.tkp1.gz. Holds the canonical 10 Hz blob;
+  -- the as-sent upload lands on a staging key and is promoted at ingest
+  -- (§1.2.10). Re-contribution overwrites.
+  sha256          CHAR(64),
+  -- SHA-256 of the canonical `.tkp1.gz` blob bytes as stored. Computed
+  -- by the farm at ingest (TKP1 §6 resampling); never client-supplied;
+  -- NULL until the canonical blob is stored. Distinct from `id`
+  -- (digest of the asset identity).
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT sources_id_hex  CHECK (id     ~ '^[0-9a-f]{64}$'),
@@ -186,7 +206,7 @@ CREATE INDEX label_taxonomy_lookup_idx
 CREATE TABLE models (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   version          TEXT NOT NULL UNIQUE,
-  -- e.g. trickdet-20261006-01. Immutable: a version is never re-published.
+  -- e.g. trick-v1.2. Immutable: a version is never re-published.
   model_type       TEXT NOT NULL DEFAULT 'trick-detection'
                    CHECK (model_type = 'trick-detection'),
   taxonomy_version INTEGER NOT NULL,
@@ -195,6 +215,20 @@ CREATE TABLE models (
   sha256           CHAR(64) NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
   -- Digest of the model artifact bytes; shipped in the manifest so the
   -- client can verify the download.
+  byte_size        BIGINT,
+  -- Artifact size in bytes; the client uses it for the download
+  -- progress UI and a pre-flight storage check.
+  min_client_version TEXT,
+  -- Minimum client build that may install this model (OTA skip gate).
+  input_desc       JSONB,
+  -- Model input descriptor (feature layout, e.g. the T×52 gap-channel
+  -- tensor) so the client can construct the input.
+  output_desc      JSONB,
+  -- Model output descriptor (segment + trick-name schema).
+  holdout_report_r2_key TEXT,
+  -- R2 key of the holdout evaluation report for this version.
+  training_run_id  TEXT,
+  -- Training-pipeline run that produced this version (provenance).
   val_metrics      JSONB NOT NULL DEFAULT '{}',
   promoted_at      TIMESTAMPTZ,
   -- NULL = trained but not champion. The current model is the row with the
@@ -273,15 +307,15 @@ as a side effect of contribution.
 
 ```sql
 INSERT INTO sources
-  (id, user_id, frame_count, sample_rate, keypoint_format, r2_key, sha256, updated_at)
-VALUES ($1, $2, $3, $4, $5, 'poses/' || $1 || '.tkp1.gz', $6, now())
+  (id, user_id, frame_count, sample_rate, keypoint_format, r2_key, updated_at)
+VALUES ($1, $2, $3, $4, $5, 'poses/' || $1 || '.tkp1.gz', now())
 ON CONFLICT (id) DO UPDATE SET
   -- user_id is deliberately NOT overwritten: first writer wins (§1.2.13).
+  -- sha256 is deliberately NOT overwritten: owned by ingest (§1.2.10).
   frame_count     = EXCLUDED.frame_count,
   sample_rate     = EXCLUDED.sample_rate,
   keypoint_format = EXCLUDED.keypoint_format,
   r2_key          = EXCLUDED.r2_key,
-  sha256          = EXCLUDED.sha256,
   updated_at      = now();
 ```
 
@@ -314,8 +348,10 @@ ON CONFLICT (raw, taxonomy_version) DO NOTHING;
 
 ```sql
 INSERT INTO models
-  (version, taxonomy_version, r2_key, sha256, val_metrics, promoted_at)
-VALUES ($1, $2, $3, $4, $5, now())
+  (version, taxonomy_version, r2_key, sha256, byte_size, min_client_version,
+   input_desc, output_desc, holdout_report_r2_key, training_run_id,
+   val_metrics, promoted_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
 ON CONFLICT (version) DO NOTHING;
 -- rowcount 0 → 409 VERSION_EXISTS
 ```
@@ -340,10 +376,17 @@ SELECT max(taxonomy_version) INTO v_tax FROM label_taxonomy;
 -- 3. per clip in the batch:
 DELETE FROM labels WHERE clip_id = $1;
 INSERT INTO labels (clip_id, trick_name, taxonomy_version)
-SELECT $1, trim(name), v_tax
-FROM unnest($2::text[]) AS name
-WHERE trim(name) <> '';
+SELECT $1, deduped.name, v_tax
+FROM (
+  SELECT DISTINCT ON (lower(trim(name))) trim(name) AS name
+  FROM unnest($2::text[]) AS name
+  WHERE trim(name) <> ''
+  ORDER BY lower(trim(name)), trim(name)
+) AS deduped;
 -- (empty array → DELETE only; the clip is left unlabeled)
+-- Dedup on lower(trim(name)) BEFORE insert: the unique index on
+-- (clip_id, lower(trick_name)) rejects duplicates, it does not collapse
+-- them. DISTINCT ON keeps the alphabetically-first casing per group.
 
 COMMIT;
 ```
@@ -449,20 +492,20 @@ Request:
   "video_id": "<64-char lowercase hex>",
   "frame_count": 600,
   "sample_rate": 10.0,
-  "keypoint_format": "tkp1",
-  "sha256": "<64-char hex digest of the .tkp1.gz blob bytes>"
+  "keypoint_format": "tkp1"
 }
 ```
 
-Validation: `video_id` and `sha256` match `^[0-9a-f]{64}$`;
-`frame_count > 0`; `sample_rate` within the client's analysis range;
-`keypoint_format` must be `tkp1` (anything else →
+Validation: `video_id` matches `^[0-9a-f]{64}$`; `frame_count > 0`;
+`sample_rate` in `1..30` Hz (the normative client analysis range, TKP1
+§6); `keypoint_format` must be `tkp1` (anything else →
 `422 UNSUPPORTED_FORMAT`).
 
 Behavior: upserts the source row per §4 (`r2_key =
-poses/<video_id>.tkp1.gz`; `user_id` never overwritten on conflict). If
-the conflicting row belongs to a different user →
-`409 SOURCE_ALREADY_CLAIMED` (the farm already holds these exact bytes).
+poses/<video_id>.tkp1.gz`; `user_id` never overwritten on conflict;
+`sha256` left for ingest). If the conflicting row belongs to a
+different user → `409 SOURCE_ALREADY_CLAIMED` (the farm already holds
+this source).
 
 Response (`201` new, `200` re-registered):
 
@@ -476,16 +519,23 @@ Response (`201` new, `200` re-registered):
 }
 ```
 
-`blob_present` is determined by the farm HEADing the R2 object at
-registration time; when true, the client skips the PUT and goes straight
-to clip submission. `frame_count` is the canonical 10 Hz count (client
-computes it per TKP1 §6); clip windows submitted later are validated
-against it, so the whole API speaks canonical indices.
+`blob_present` is true when the canonical blob is stored
+(`sources.sha256 IS NOT NULL`); the client skips the PUT and goes
+straight to clip submission. `frame_count` is the canonical 10 Hz count
+(client computes it per TKP1 §6); clip windows submitted later are
+validated against it, so the whole API speaks canonical indices.
 
 The client then `PUT`s the `.tkp1.gz` blob to `upload_url` with
-`Content-Type: application/gzip`, then submits clips (§7.3
-`POST /api/clips`). A source row with no blob yet is a harmless dangling
-row; it self-heals when the client re-registers and uploads.
+`Content-Type: application/gzip` and a `Content-MD5` (or
+`x-amz-checksum-sha256`) checksum header — the URL rejects a checksum
+mismatch at write time, which is the transport-integrity layer
+(§1.2.10). The upload lands on a staging key; the ingest worker
+resamples it to canonical 10 Hz, stores it at `r2_key`, sets
+`sources.sha256`, and deletes the staged object. The client waits for
+ingest (poll registration until `blob_present`, or retry clip
+submission), then submits clips (§7.3 `POST /api/clips`). A source row
+with no ingested blob yet is a harmless dangling row; it self-heals
+when the client re-registers and uploads.
 
 #### `POST /api/clips` — batch upsert clips + replace their label sets
 
@@ -512,10 +562,12 @@ Behavior, in a single transaction:
    else the whole batch fails with `404 NOT_FOUND`.
 2. `0 <= start_frame < end_frame <= source.frame_count`, else
    `422 VALIDATION_ERROR` (with the batch index and field in `details`).
-3. **Blob verification** (once per distinct source in the batch): fetch
-   the R2 object at `r2_key`; if absent → `422 BLOB_MISSING`; if its
-   SHA-256 differs from `sources.sha256` → `422 BLOB_DIGEST_MISMATCH`.
-   The client re-uploads via `POST /api/sources` and retries.
+3. **Blob verification** (once per distinct source in the batch): the
+   canonical blob must be ingested — `sources.sha256 IS NULL` →
+   `422 BLOB_MISSING` (the client waits for ingest, re-uploads via
+   `POST /api/sources`, and retries). Otherwise fetch the R2 object at
+   `r2_key` and compare its SHA-256 against `sources.sha256`; a
+   mismatch → `422 BLOB_DIGEST_MISMATCH`.
 4. Upsert the clip rows (§4).
 5. Replace each clip's label set (§5); `labels` is optional per clip and
    may be `[]` (clears the set).
@@ -530,8 +582,8 @@ Response `200`:
 }
 ```
 
-`labels` entries are trimmed; blank entries are dropped; duplicates
-(case-insensitive) collapse via the unique index.
+`labels` entries are trimmed; blank entries are dropped;
+case-insensitive duplicates are deduped before insert (§5).
 
 #### `POST /api/clips/:id/labels` — replace one clip's label set
 
@@ -554,7 +606,8 @@ Response `200`:
 #### `GET /api/sources` — list my sources (reinstall reconciliation)
 
 Query params: `limit` (default 100, max 1000), `cursor` (opaque;
-`updated_at` of the last item from the previous page).
+`(updated_at, id)` of the last item from the previous page — keyset on
+both, since `updated_at` alone ties and would skip or duplicate rows).
 
 Response `200`:
 
@@ -587,7 +640,7 @@ Response `200` (`404` if missing or not mine):
     "frame_count": 600,
     "sample_rate": 10.0,
     "keypoint_format": "tkp1",
-    "sha256": "<blob digest>",
+    "sha256": "<canonical blob digest; null until ingested>",
     "created_at": "2026-10-06T07:00:00Z",
     "updated_at": "2026-10-06T07:00:00Z"
   },
@@ -639,11 +692,17 @@ Response `200`:
 
 ```json
 {
-  "version": "trickdet-20261006-01",
+  "version": "trick-v1.2",
   "model_type": "trick-detection",
   "taxonomy_version": 3,
   "url": "<presigned R2 GET, 15-minute expiry>",
   "sha256": "<64-char hex of the artifact bytes>",
+  "byte_size": 48203110,
+  "min_client_version": "2.4.0",
+  "input_desc": {"layout": "T×52", "channels": "gap-channel pose features", "rate_hz": 10},
+  "output_desc": {"segments": "source-frame coordinates", "trick_names": "string[]", "is_combo": "derived"},
+  "holdout_report_r2_key": "reports/trick-v1.2-holdout.json",
+  "training_run_id": "run-20261006-01",
   "val_metrics": {"seg_map_05": 0.62, "name_accuracy": 0.81},
   "vocabulary": [
     {"canonical": "cork", "aliases": ["cork", "corkscrew"]},
@@ -664,10 +723,16 @@ Request:
 
 ```json
 {
-  "version": "trickdet-20261006-01",
+  "version": "trick-v1.2",
   "taxonomy_version": 3,
-  "r2_key": "models/trickdet-20261006-01.mlmodelc.zip",
+  "r2_key": "models/trick-v1.2.mlmodelc.zip",
   "sha256": "<64-char hex>",
+  "byte_size": 48203110,
+  "min_client_version": "2.4.0",
+  "input_desc": {"layout": "T×52", "channels": "gap-channel pose features", "rate_hz": 10},
+  "output_desc": {"segments": "source-frame coordinates", "trick_names": "string[]", "is_combo": "derived"},
+  "holdout_report_r2_key": "reports/trick-v1.2-holdout.json",
+  "training_run_id": "run-20261006-01",
   "val_metrics": {"seg_map_05": 0.62, "name_accuracy": 0.81}
 }
 ```

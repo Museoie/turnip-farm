@@ -101,10 +101,13 @@ analysis rate of 1–30 Hz):
   Canonical `frame_count = floor(((n - 1) / r) * 10) + 1`. (For `n = 1`,
   `frame_count = 1`.)
 - For each canonical timestamp `t = k / 10`: source position
-  `p = t * r`; `i = floor(p)`, `frac = p - i`; the canonical frame is
+  `p = t * r`; `i = floor(p)`, `frac = p - i`. When `frac == 0` the
+  canonical frame is `S[i]` exactly (no interpolation) — this is the
+  last canonical frame whenever `10(n-1)/r` is an integer, and `S[i+1]`
+  does not exist there. Otherwise the canonical frame is
   `(1 - frac) * S[i] + frac * S[i+1]`, applied per-channel to
-  `(x, y, confidence)`. By construction `p <= n - 1`, so `S[i+1]` always
-  exists.
+  `(x, y, confidence)`. By construction `p <= n - 1`, and `S[i+1]`
+  always exists when `frac > 0`.
 - Source rate above 10 Hz → downsampled; below 10 Hz → upsampled;
   exactly 10 Hz → copied unchanged.
 
