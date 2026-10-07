@@ -6,7 +6,7 @@ implementing the contract in the master plan
 merged Rev 3). It specifies the Postgres schema, index strategy, upsert
 semantics, the training-data export pattern, and the full REST API, at a
 level of detail intended to be implementable without guessing. Companion
-documents: the `TKP1` wire-format specification (`POSE_FORMAT.md`); the iOS
+documents: the pose wire-format specification (`POSE_FORMAT.md`); the iOS
 contribution design and the ML training design are specified separately.
 Stack: Bun + TypeScript + Postgres + R2, per the master plan.
 
@@ -71,7 +71,7 @@ Two departures from the master plan's label draft follow from this:
 9. `r2_key` is deterministic: `poses/<source_id>.tkp1.gz`.
    Re-contribution overwrites the same key.
 10. Blob integrity is two-layered, because the farm resamples on ingest
-    and stores canonical-only (TKP1 §6):
+    and stores canonical-only (POSE_FORMAT.md §6):
     - **Transport.** The presigned PUT URL requires the client to attach
       a content checksum (`Content-MD5` or `x-amz-checksum-sha256`);
       storage rejects a corrupted upload at write time. The client never
@@ -137,12 +137,12 @@ CREATE TABLE sources (
   user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   frame_count     INTEGER NOT NULL CHECK (frame_count > 0),
   -- Canonical 10 Hz frame count of the stored pose sequence. The client
-  -- computes it from its analysis rate via the TKP1 §6 resampling map;
+  -- computes it from its analysis rate via the POSE_FORMAT.md §6 resampling map;
   -- clip windows are validated against it, so every index the API
   -- accepts is canonical.
   sample_rate     REAL NOT NULL,
   -- As-sent analysis rate, provenance only. Stored pose data is canonical
-  -- 10 Hz TKP1 (see POSE_FORMAT.md §6).
+  -- 10 Hz pose format (see POSE_FORMAT.md §6).
   keypoint_format TEXT NOT NULL DEFAULT 'tkp1',
   r2_key          TEXT NOT NULL,
   -- Deterministic: poses/<id>.tkp1.gz. Holds the canonical 10 Hz blob;
@@ -150,7 +150,7 @@ CREATE TABLE sources (
   -- (§1.2.10). Re-contribution overwrites.
   sha256          CHAR(64),
   -- SHA-256 of the canonical `.tkp1.gz` blob bytes as stored. Computed
-  -- by the farm at ingest (TKP1 §6 resampling); never client-supplied;
+  -- by the farm at ingest (POSE_FORMAT.md §6 resampling); never client-supplied;
   -- NULL until the canonical blob is stored. Distinct from `id`
   -- (digest of the asset identity).
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -507,7 +507,7 @@ Request:
 ```
 
 Validation: `video_id` matches `^[0-9a-f]{64}$`; `frame_count > 0`;
-`sample_rate` in `1..30` Hz (the normative client analysis range, TKP1
+`sample_rate` in `1..30` Hz (the normative client analysis range, POSE_FORMAT.md
 §6); `keypoint_format` must be `tkp1` (anything else →
 `422 UNSUPPORTED_FORMAT`).
 
@@ -532,7 +532,7 @@ Response (`201` new, `200` re-registered):
 `blob_present` is true when the canonical blob is stored
 (`sources.sha256 IS NOT NULL`); the client skips the PUT and goes
 straight to clip submission. `frame_count` is the canonical 10 Hz count
-(client computes it per TKP1 §6); clip windows submitted later are
+(client computes it per POSE_FORMAT.md §6); clip windows submitted later are
 validated against it, so the whole API speaks canonical indices.
 
 The client then `PUT`s the `.tkp1.gz` blob to `upload_url` with

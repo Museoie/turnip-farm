@@ -1,10 +1,10 @@
-# TKP1 — Pose Interchange Format Specification
+# Pose Format — Interchange Format Specification
 
-**Scope.** This document is the byte-level specification of `TKP1`
-(TKP = Turnip KeyPoints, `1` = format version 1), the
-canonical encoding for pose keypoint sequences defined by the master plan
+**Scope.** This document is the byte-level specification of the pose
+format, the canonical encoding for pose keypoint sequences defined by the
+master plan
 (`https://github.com/hoiekim/turnip-farm/blob/main/docs/MASTER_PLAN.md`,
-§3). TKP1 is used on the wire (client → farm pose-blob upload) and at rest
+§3). It is used on the wire (client → farm pose-blob upload) and at rest
 (R2 pose blobs). It is the *only* pose representation the farm accepts or
 stores — no JSON variant. Implementers should be able to write a conformant
 encoder and decoder from this document plus the test vectors in §11 alone.
@@ -14,7 +14,7 @@ encoder and decoder from this document plus the test vectors in §11 alone.
 
 ## 1. Overview
 
-A TKP1 blob is a 24-byte header followed by a dense frame array, with the
+A pose-format blob is a 24-byte header followed by a dense frame array, with the
 whole blob gzip-compressed (single member, RFC 1952) for transfer and
 storage. Files are named `<name>.tkp1.gz`. The canonical sample rate is
 **10 Hz**; the farm resamples client submissions to 10 Hz on ingest and
