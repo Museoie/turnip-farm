@@ -424,8 +424,9 @@ JOIN labels l ON l.clip_id   = c.id
 LEFT JOIN data_quarantine q
        ON q.source_id = s.id AND q.resolved_at IS NULL
 WHERE q.id IS NULL
-  AND GREATEST(s.updated_at, c.updated_at, l.updated_at) > $1  -- since cursor
-ORDER BY row_cursor ASC
+  AND (GREATEST(s.updated_at, c.updated_at, l.updated_at), c.id, l.trick_name)
+      > ($1, $2, $3)  -- since cursor: (row_cursor, clip_id, trick_name)
+ORDER BY row_cursor ASC, clip_id ASC, trick_name ASC
 LIMIT 10000;
 ```
 
@@ -434,8 +435,17 @@ Notes:
 - Sources with no labels contribute no rows. (Unlabeled *regions* of
   labeled sources serve as background negatives — derived from clip
   windows, not from label-less sources.)
-- `next_cursor` = `max(row_cursor)` over the returned rows; the training
-  job passes it back as `since`.
+- Keyset is on `(row_cursor, clip_id, trick_name)`, not `row_cursor`
+  alone: `row_cursor` ties are guaranteed, not rare — §5 replaces a
+  clip's label set in the same transaction as the clip upserts, and
+  Postgres `now()` returns the transaction start, so every row a batch
+  touches shares the exact same `updated_at`. Keying on `row_cursor`
+  alone with `next_cursor = max(row_cursor)` would silently skip rows
+  sharing the max cursor value past the `LIMIT` boundary. This mirrors
+  the `GET /api/sources` keyset (§7.3), which keys on
+  `(updated_at, id)` for the same reason.
+- `next_cursor` = `(row_cursor, clip_id, trick_name)` of the last
+  returned row; the training job passes all three back as `since`.
 - Canonicalization (`raw → canonical`) happens in the training job using
   the `taxonomy` block shipped with the export response (§7,
   `GET /api/labels/export`), not in SQL.
@@ -471,7 +481,7 @@ endpoints.
   ```
 
   Codes: `UNAUTHENTICATED` (401), `ACCOUNT_BLOCKED` (403), `NOT_FOUND`
-  (404), `VALIDATION_ERROR` (422), `UNSUPPORTED_FORMAT` (422),
+  (404), `NO_MODEL` (404), `VALIDATION_ERROR` (422), `UNSUPPORTED_FORMAT` (422),
   `BLOB_MISSING` (422), `BLOB_DIGEST_MISMATCH` (422),
   `SOURCE_ALREADY_CLAIMED` (409), `VERSION_EXISTS` (409),
   `RATE_LIMITED` (429), `INTERNAL` (500).
@@ -743,8 +753,9 @@ Behavior: inserts per §4 with `promoted_at = now()`; an existing
 
 #### `GET /api/labels/export?since=` — training pull (service key)
 
-`since` is an RFC 3339 cursor (`row_cursor` from §6); omit for a full
-pull. Returns label-granular rows (one per label row), quarantined
+`since` is the opaque cursor from the previous response's `next_cursor`
+(the §6 `(row_cursor, clip_id, trick_name)` triple, encoded opaquely);
+omit for a full pull. Returns label-granular rows (one per label row), quarantined
 sources excluded, ordered by cursor ascending, `limit` 10000:
 
 ```json
@@ -765,7 +776,7 @@ sources excluded, ordered by cursor ascending, `limit` 10000:
   "taxonomy": [
     {"raw": "corkscrew", "canonical": "cork", "taxonomy_version": 3}
   ],
-  "next_cursor": "2026-10-06T07:00:00Z"
+  "next_cursor": "<opaque>"  // null when exhausted
 }
 ```
 

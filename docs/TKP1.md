@@ -136,7 +136,8 @@ missing data, and MUST NOT synthesize pose where none was detected.
   at 10 Hz (≈ 122 KB for a 60-second session). Gzip typically shrinks
   this a further 5–25% depending on motion (static backgrounds and gap
   runs compress well; see the §11.1 vector: 636 → 93 bytes for a sparse
-  example, which is not representative of real footage).
+  example, which is not representative of real footage; exact gzipped
+  size is encoder-dependent).
 
 ## 9. Versioning
 
@@ -184,12 +185,17 @@ the rule above, as intended.
 - Frame 2: keypoint 0 (nose) = `(0.51, 0.21, 0.94)`, keypoint 5
   (left_shoulder) = `(0.46, 0.36, 0.89)`; all other keypoints zero.
 
-Digests (uncompressed blob; gzip with `mtime = 0`):
+Digests (uncompressed blob only):
 
 ```
 sha256(.tkp1)     = 37ba29d3c206f3b9dd41219e29354c480791d000533efdfc8096ee6f0959cac9
-sha256(.tkp1.gz)  = c68a7344652b31241f9255ea765153ca5a91ac8521ccff0acb840a528939e670
 ```
+
+No digest is given for `.tkp1.gz`: deflate output varies by encoder
+and compression level even with `mtime = 0`, so a gzip digest is not
+reproducible from this document. A conformant implementation MUST
+produce the byte-identical `.tkp1` above (checked by its digest); the
+gzip wrapping is transport only.
 
 Annotated header (24 bytes):
 
