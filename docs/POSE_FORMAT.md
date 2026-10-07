@@ -1,6 +1,7 @@
 # TKP1 — Pose Interchange Format Specification
 
-**Scope.** This document is the byte-level specification of `TKP1`, the
+**Scope.** This document is the byte-level specification of `TKP1`
+(TKP = Turnip KeyPoints, `1` = format version 1), the
 canonical encoding for pose keypoint sequences defined by the master plan
 (`https://github.com/hoiekim/turnip-farm/blob/main/docs/MASTER_PLAN.md`,
 §3). TKP1 is used on the wire (client → farm pose-blob upload) and at rest

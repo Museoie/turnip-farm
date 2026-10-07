@@ -6,7 +6,7 @@ implementing the contract in the master plan
 merged Rev 3). It specifies the Postgres schema, index strategy, upsert
 semantics, the training-data export pattern, and the full REST API, at a
 level of detail intended to be implementable without guessing. Companion
-documents: the `TKP1` wire-format specification (`TKP1.md`); the iOS
+documents: the `TKP1` wire-format specification (`POSE_FORMAT.md`); the iOS
 contribution design and the ML training design are specified separately.
 Stack: Bun + TypeScript + Postgres + R2, per the master plan.
 
@@ -142,7 +142,7 @@ CREATE TABLE sources (
   -- accepts is canonical.
   sample_rate     REAL NOT NULL,
   -- As-sent analysis rate, provenance only. Stored pose data is canonical
-  -- 10 Hz TKP1 (see TKP1.md §6).
+  -- 10 Hz TKP1 (see POSE_FORMAT.md §6).
   keypoint_format TEXT NOT NULL DEFAULT 'tkp1',
   r2_key          TEXT NOT NULL,
   -- Deterministic: poses/<id>.tkp1.gz. Holds the canonical 10 Hz blob;
