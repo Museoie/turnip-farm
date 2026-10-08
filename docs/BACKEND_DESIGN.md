@@ -705,6 +705,7 @@ Response `200`:
   "version": "trick-v1.2",
   "model_type": "trick-detection",
   "taxonomy_version": 3,
+  "r2_key": "models/trick-v1.2.mlmodelc.zip",
   "url": "<presigned R2 GET, 15-minute expiry>",
   "sha256": "<64-char hex of the artifact bytes>",
   "byte_size": 48203110,
