@@ -355,7 +355,7 @@ accuracy, reported separately. Champion/challenger: promote only on
 ≥1% validation improvement.
 
 **Anti-poisoning (nightly).** After training a candidate, run the
-fixture regression suite (the existing pose-accuracy fixtures plus
+fixture regression suite (the pose fixture clips on R2 plus
 trick-labeled fixtures — segment IoU + name accuracy vs. champion):
 - On regression: (1) fire a **Discord webhook alert** with the metrics
   delta, affected source IDs, and user IDs; (2) **quarantine that day's
@@ -370,10 +370,12 @@ trick-labeled fixtures — segment IoU + name accuracy vs. champion):
 `POST /api/models` with the `taxonomy_version` it trained on. The app
 picks it up via the existing OTA poll.
 
-**What stays.** The `PoseAccuracy` harness and CI gate now guard the
-*input* to the trick model (pose quality on real footage). Fine-tuning
+**What stays.** Pose estimation remains MoveNet's job — fine-tuning
 MoveNet itself is off the table unless the pose escalation ladder in
-the iOS design doc fires on empirical grounds.
+the iOS design doc fires on empirical grounds. (The `PoseAccuracy`
+harness and CI gate were removed from turnip-ml in
+hoiekim/turnip-ml#22: the pose model is a pinned third-party artifact
+that nothing in the pipeline changes.)
 
 **Trigger.** Nightly cron or manual dispatch; run only when new labels
 since the last watermark exceed a threshold (start: 50).
