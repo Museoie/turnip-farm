@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# local configuration — copy .env.example to .env
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
