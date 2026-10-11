@@ -9,10 +9,14 @@
     "start": "bun dist/index.js",
     "build": "bun build src/index.ts --target bun --outdir dist",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "db:migrate": "dbmate --no-dump-schema migrate",
+    "db:status": "dbmate status",
+    "db:new": "dbmate new"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
+    "dbmate": "2.36.0",
     "typescript": "^7.0.2"
   }
 }

@@ -31,8 +31,8 @@ The design documents are the contract. Read them before changing behavior:
 ## Status
 
 This is a scaffold. The service starts, validates its configuration, and
-serves `GET /healthz`. The schema and the endpoints are tracked as separate
-issues.
+serves `GET /healthz`. The Postgres schema (BACKEND_DESIGN.md §3) is in
+place as dbmate migrations; the endpoints are tracked as separate issues.
 
 ## Layout
 
@@ -44,8 +44,9 @@ src/
   *.test.ts        tests (bun test), next to the code they cover
 db/
   migrations/      dbmate migrations, additive only (BACKEND_DESIGN.md §2)
+  schema.test.ts   checks a migrated database against BACKEND_DESIGN.md §3
 docs/              design documents (see above)
-.github/workflows/ CI: install, typecheck, test, build
+.github/workflows/ CI: install, migrate (twice), typecheck, test, build
 ```
 
 ## Development
@@ -60,12 +61,36 @@ bun run dev            # watch mode on http://localhost:3000
 curl -i localhost:3000/healthz
 ```
 
-| Command             | What it does                                    |
-| ------------------- | ----------------------------------------------- |
-| `bun test`          | Run the test suite                              |
-| `bun run typecheck` | Type-check with `tsc --noEmit`                  |
-| `bun run build`     | Bundle `src/index.ts` into `dist/`              |
-| `bun run start`     | Run the bundle in `dist/` (build first)         |
+| Command              | What it does                                    |
+| -------------------- | ----------------------------------------------- |
+| `bun test`           | Run the test suite                              |
+| `bun run typecheck`  | Type-check with `tsc --noEmit`                  |
+| `bun run build`      | Bundle `src/index.ts` into `dist/`              |
+| `bun run start`      | Run the bundle in `dist/` (build first)         |
+| `bun run db:migrate` | Apply pending migrations to `DATABASE_URL`      |
+| `bun run db:status`  | List applied and pending migrations             |
+| `bun run db:new`     | Create a migration: `bun run db:new <name>`     |
+
+### Database
+
+Migrations run with [dbmate](https://github.com/amacneil/dbmate), installed
+as a pinned dev dependency, against `DATABASE_URL`. A throwaway local
+Postgres 16:
+
+```sh
+docker run -d --name turnip-pg -p 5432:5432 \
+  -e POSTGRES_USER=turnip -e POSTGRES_PASSWORD=turnip -e POSTGRES_DB=turnip \
+  postgres:16-alpine
+bun run db:migrate
+```
+
+dbmate refuses a server without TLS unless the URL ends in
+`?sslmode=disable`, as the one in `.env.example` does.
+
+`db/schema.test.ts` runs only when `TEST_DATABASE_URL` names a migrated
+database. It never reads `DATABASE_URL`, and every test rolls its
+transaction back, so pointing it at the local database above is safe. CI
+sets it, and the tests fail rather than skip when it is missing there.
 
 ### Configuration
 
@@ -96,6 +121,8 @@ exits with status 1 and lists every problem at once.
    BACKEND_DESIGN.md §8.
 4. **Open a PR against `main`.** Start the description with a
    `## Design alignment` section naming the doc sections it implements, then
-   a summary. CI (typecheck, test, build) must be green.
+   a summary. CI (migrate, typecheck, test, build) must be green.
 5. **Migrations are additive.** Never edit or drop an applied migration; add
-   a new one.
+   a new one. Keep every statement re-runnable (`IF NOT EXISTS`,
+   `ON CONFLICT DO NOTHING`) and leave `migrate:down` empty; CI applies the
+   migrations twice to check.
