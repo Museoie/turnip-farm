@@ -1,7 +1,13 @@
 // The API error shape: {"error": {"code", "message", "details"}}.
 
 // BACKEND_DESIGN.md §7.2 error codes; extended as endpoints land.
-export type ErrorCode = "UNAUTHENTICATED" | "ACCOUNT_BLOCKED" | "NOT_FOUND" | "INTERNAL";
+export type ErrorCode =
+  | "UNAUTHENTICATED"
+  | "ACCOUNT_BLOCKED"
+  | "NOT_FOUND"
+  | "VALIDATION_ERROR"
+  | "INTERNAL"
+  | "APPLE_UNAVAILABLE";
 
 export function errorResponse(
   status: number,

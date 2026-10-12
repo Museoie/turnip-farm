@@ -50,11 +50,13 @@ jobs:
       - name: Migrate
         run: bun run db:migrate
 
-      # Migrations must be re-runnable (BACKEND_DESIGN.md §2): forget every
-      # applied version, then apply them all again over the existing schema.
-      - name: Re-run migrations
+      # Migrations must be re-runnable (BACKEND_DESIGN.md §2): unrecord the
+      # newest one (its down section is empty) and apply it again. Only the
+      # newest: after the one-time column drop in §2, older migrations can
+      # re-apply only to the schema they produced.
+      - name: Re-run the newest migration
         run: |
-          bun -e 'await Bun.sql`TRUNCATE schema_migrations`'
+          bun run db:rollback
           bun run db:migrate
 
       - name: Typecheck
