@@ -1,12 +1,7 @@
 // HTTP surface. Routing lives here, apart from src/index.ts, so tests can
 // start a real server on an ephemeral port without loading config.
 
-// BACKEND_DESIGN.md §7.2 error codes; extended as endpoints land.
-export type ErrorCode = "NOT_FOUND" | "INTERNAL";
-
-export function errorResponse(status: number, code: ErrorCode, message: string): Response {
-  return Response.json({ error: { code, message, details: {} } }, { status });
-}
+import { errorResponse } from "./errors";
 
 export function handleRequest(req: Request): Response {
   const { pathname } = new URL(req.url);

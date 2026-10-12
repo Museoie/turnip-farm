@@ -32,19 +32,23 @@ The design documents are the contract. Read them before changing behavior:
 
 This is a scaffold. The service starts, validates its configuration, and
 serves `GET /healthz`. The Postgres schema (BACKEND_DESIGN.md §3) is in
-place as dbmate migrations; the endpoints are tracked as separate issues.
+place as dbmate migrations, and Sign in with Apple authentication (§7.1) is
+ready for the endpoints, which are tracked as separate issues.
 
 ## Layout
 
 ```
 src/
   index.ts         entry point: loads config, starts the server
-  app.ts           HTTP routing and the API error shape
+  app.ts           HTTP routing
+  errors.ts        the API error shape (BACKEND_DESIGN.md §7.2)
+  auth.ts          Sign in with Apple token verification (BACKEND_DESIGN.md §7.1)
   config.ts        env-based configuration; fails fast on missing variables
   *.test.ts        tests (bun test), next to the code they cover
 db/
   migrations/      dbmate migrations, additive only (BACKEND_DESIGN.md §2)
   schema.test.ts   checks a migrated database against BACKEND_DESIGN.md §3
+  testing.ts       helpers for tests that need a database
 docs/              design documents (see above)
 .github/workflows/ CI: install, migrate (twice), typecheck, test, build
 ```
@@ -87,9 +91,10 @@ bun run db:migrate
 dbmate refuses a server without TLS unless the URL ends in
 `?sslmode=disable`, as the one in `.env.example` does.
 
-`db/schema.test.ts` runs only when `TEST_DATABASE_URL` names a migrated
-database. It never reads `DATABASE_URL`, and every test rolls its
-transaction back, so pointing it at the local database above is safe. CI
+Tests that need a database (`db/schema.test.ts` and parts of
+`src/auth.test.ts`) run only when `TEST_DATABASE_URL` names a migrated
+database. They never read `DATABASE_URL`, and every test rolls its
+transaction back, so pointing them at the local database above is safe. CI
 sets it, and the tests fail rather than skip when it is missing there.
 
 ### Configuration

@@ -1,35 +1,16 @@
 // Checks a migrated database against BACKEND_DESIGN.md §3. Runs only when
-// TEST_DATABASE_URL names one — never DATABASE_URL, which Bun loads from a
-// developer's .env. Every test runs in a transaction that is rolled back, so
-// the database is left as it was found.
+// TEST_DATABASE_URL is set; see db/testing.ts.
 
 import { type SavepointSQL, SQL, type TransactionSQL } from "bun";
 import { afterAll, describe, expect, test } from "bun:test";
-
-const url = process.env.TEST_DATABASE_URL;
-if (!url && process.env.CI) {
-  throw new Error("TEST_DATABASE_URL must be set in CI; the schema tests would silently skip");
-}
+import { TEST_DATABASE_URL, inRollback } from "./testing";
 
 const SOURCE_ID = "a".repeat(64);
 const DIGEST = "b".repeat(64);
 
-class Rollback extends Error {}
-
-describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
-  const sql = new SQL(url ?? "");
+describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
+  const sql = new SQL(TEST_DATABASE_URL ?? "");
   afterAll(() => sql.close());
-
-  async function inRollback(fn: (tx: TransactionSQL) => Promise<void>): Promise<void> {
-    try {
-      await sql.begin(async (tx) => {
-        await fn(tx);
-        throw new Rollback();
-      });
-    } catch (err) {
-      if (!(err instanceof Rollback)) throw err;
-    }
-  }
 
   // Runs one statement under a savepoint and returns the name of the
   // constraint it violated (undefined if it succeeded), leaving the
@@ -113,7 +94,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("sources: hex IDs and digests, NULL digest until ingest", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       await insertClip(tx);
       const insert = (id: string, sha256: string | null) => (sp: SavepointSQL) =>
         sp`INSERT INTO sources (id, user_id, frame_count, sample_rate, r2_key, sha256)
@@ -129,7 +110,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("clips: windows are non-empty and start at frame 0 or later", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       await insertClip(tx);
       const insert = (start: number, end: number) => (sp: SavepointSQL) =>
         sp`INSERT INTO clips (source_id, start_frame, end_frame) VALUES (${SOURCE_ID}, ${start}, ${end})`;
@@ -140,7 +121,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("labels: one row per case-insensitive trick name per clip, stored trimmed (§1.2.12)", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       const clipId = await insertClip(tx);
       const insert = (name: string) => (sp: SavepointSQL) =>
         sp`INSERT INTO labels (clip_id, trick_name, taxonomy_version) VALUES (${clipId}, ${name}, 1)`;
@@ -156,7 +137,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("models: versions are unique and the artifact digest is hex", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       const insert = (version: string, sha256: string, modelType = "trick-detection") =>
         (sp: SavepointSQL) =>
           sp`INSERT INTO models (version, model_type, taxonomy_version, r2_key, sha256)
@@ -172,7 +153,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("data_quarantine: one open quarantine per source; resolution set with resolved_at (§1.2.4)", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       await insertClip(tx);
       const quarantine = (sp: SavepointSQL) =>
         sp`INSERT INTO data_quarantine (source_id, user_id, reason) VALUES (${SOURCE_ID}, 'user-1', 'regression')`;
@@ -193,7 +174,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("reports: target types are constrained and new reports are open", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       await tx`INSERT INTO users (id) VALUES ('user-1')`;
       const insert = (targetType: string) => (sp: SavepointSQL) =>
         sp`INSERT INTO reports (reporter_user_id, target_type, target_id, reason)
@@ -207,7 +188,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("deleting a user cascades to sources, clips, labels, and quarantine rows", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       const clipId = await insertClip(tx);
       await tx`INSERT INTO labels (clip_id, trick_name, taxonomy_version) VALUES (${clipId}, 'cork', 1)`;
       await tx`INSERT INTO data_quarantine (source_id, user_id, reason) VALUES (${SOURCE_ID}, 'user-1', 'regression')`;
