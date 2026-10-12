@@ -165,11 +165,10 @@ Two departures from the master plan's label draft follow from this:
 
 - Postgres 16+. Additive migrations via `dbmate` (`db/migrations/`),
   never destructive; every migration is additive and re-runnable.
-  One-time exception: unlinking sources from accounts (§1.2.17) drops
-  `sources.user_id` and `data_quarantine.user_id`. That is safe only
-  while no deployed environment holds data. If one does by the time
-  the migration lands, the columns stay instead, nullable and never
-  written.
+  One-time exception (maintainer decision, 2026-10-12): unlinking
+  sources from accounts (§1.2.17) drops `sources.user_id` and
+  `data_quarantine.user_id`. This is allowed because it lands before
+  the first deployment, when no environment holds data.
 - `CREATE EXTENSION IF NOT EXISTS pgcrypto;` for `gen_random_uuid()`.
 - All timestamps `TIMESTAMPTZ`, `DEFAULT now()`.
 - Identifiers: `sources.id` is the deterministic 64-char lowercase hex
