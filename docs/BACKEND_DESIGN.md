@@ -36,11 +36,12 @@ database, not application code, the job of deduplicating re-submissions.
 
 Two departures from the master plan's label draft follow from this:
 
-- **No per-label `user_id`.** Only the clip owner ever submits labels (the
-  confirmed contribution flow has no community labeling queue), so
-  attribution is `labels → clips → sources.user_id` — which is also the
-  attribution the quarantine flow uses. A per-label `user_id` would be a
-  second source of truth for the same fact.
+- **No per-label `user_id`.** Only the source's owner ever submits labels
+  (the confirmed contribution flow has no community labeling queue), so
+  attribution is `labels → clips → sources → source_attribution`, which
+  is also the attribution the quarantine flow uses, and it exists only
+  for 30 days after the source's last write (§1.2.17). A per-label
+  `user_id` would be a second, longer-lived link to the same account.
 - **No per-label `start_frame` / `end_frame`.** The label window *is* the
   clip window. The training target is one segment per confirmed clip window
   (master plan §6), so a second, label-level window is redundant. If a
@@ -95,26 +96,85 @@ Two departures from the master plan's label draft follow from this:
     duplicates, it does not collapse them. Uniqueness is enforced on
     `(clip_id, lower(trick_name))`; the original casing is preserved in
     storage and the raw string is never altered.
-13. **Source ownership is first-writer-wins.** `user_id` is never
-    overwritten on source upsert. Rationale: for imported files the
-    `video_id` is `SHA-256(file bytes)`, so two contributors importing the
-    byte-identical file compute the identical ID (master plan §1 caveat).
-    Transferring ownership to the second writer would let strangers claim
-    each other's sources; keeping the first writer also matches the dedup
-    intent (the second identical contribution carries no new bytes). A
-    second contributor registering an already-claimed `video_id` receives
-    `409 SOURCE_ALREADY_CLAIMED`.
+13. **Source ownership is first-writer-wins, proven by a source key.**
+    The first contribution of a `video_id` sets its source key: 32 random
+    bytes the client generates and keeps (§7.2); the farm stores only
+    `sources.source_key_hash`, which is never overwritten. Every later
+    read or write of that source must present the key. Rationale: for
+    imported files the `video_id` is `SHA-256(file bytes)`, so two
+    contributors importing the byte-identical file compute the identical
+    ID (master plan §1 caveat). Transferring ownership to the second
+    writer would let strangers claim each other's sources; keeping the
+    first writer also matches the dedup intent (the second identical
+    contribution carries no new bytes). A second contributor registering
+    an already-claimed `video_id` without its key receives
+    `409 SOURCE_ALREADY_CLAIMED`. Ownership is a key rather than an
+    account, so the farm can serve owners without linking sources to
+    accounts (§1.2.17).
+14. **Sessions, not per-request identity tokens.** Apple's guidance is
+    to verify the identity token once and then run your own session:
+    "After verifying the identity token, your app is responsible for
+    managing the user session", and "User interaction is required any
+    time a new identity token is requested" (Apple, *Verifying a user*).
+    Identity tokens are observed to expire about ten minutes after issue
+    (Apple doesn't document the figure), and the device cannot refresh
+    them silently, so verifying them on every request would lock users
+    out minutes after sign-in. The farm verifies the identity token
+    once, at `POST /api/auth/apple`, and issues its own opaque session
+    token (§7.1). The API stays stateless in the deployment sense:
+    sessions live in Postgres, not in process memory.
+15. **Apple's refresh token is kept, encrypted, for revocation only.**
+    App Review guideline 5.1.1(v) requires in-app account deletion, and
+    apps using Sign in with Apple should revoke the user's tokens through
+    the REST API when an account is deleted. Revocation needs a refresh
+    or access token, so sign-in exchanges the authorization code and
+    stores the refresh token encrypted (§3, §7.1). Revoking it
+    invalidates "the tokens and associated user authorizations for a
+    user" (Apple, *Token revocation*), so the latest token per user is
+    enough even across devices; each sign-in replaces it. The farm does
+    **not** run Apple's optional daily refresh-token validation: Apple
+    throttles it, server-to-server notifications (§7.3) report revoked
+    consent and deleted Apple Accounts, and the client checks
+    `getCredentialState` on launch (§7.1).
+16. **Blocked users can still leave.** `is_blocked` removes contribution
+    rights, not the right to sign out or delete the account (§7.1).
+17. **Contributions are linked to an account for 30 days at most.** The
+    farm needs to know *who* contributed for one purpose: finding and
+    blocking an account that poisons the dataset (master plan §6), which
+    takes days, not years. So `sources` carries no account column.
+    Instead, a `source_attribution` row links a source to the account
+    that last wrote it. Every contribution write refreshes it, and it is
+    deleted 30 days after the source's last write: a source that is still
+    being edited stays linked, and one left alone is unlinked 30 days
+    after its last edit. Nothing else needs the link. Ownership is the
+    source key (§1.2.13), training splits by source rather than by user,
+    and reputation is not computed from contributions (§9 Q2). Reports
+    are the one other place an account meets a contribution:
+    `reports.reporter_user_id` sits next to a `target_id`, and since
+    only a source's key holder can see it, the reporter is usually its
+    contributor. Reports are therefore deleted 30 days after they are
+    filed, by the same purge (§4). Once unlinked, the farm treats a
+    contribution as belonging to no account.
+    Some linkage remains possible outside the farm's records: a pose
+    sequence can be matched against a public video of the person in it,
+    and anyone holding an imported file can recompute its `video_id`.
+    Whether that makes unlinked contributions personal data is a question
+    for counsel (§9 Q9).
 
 ## 2. Conventions
 
 - Postgres 16+. Additive migrations via `dbmate` (`db/migrations/`),
   never destructive; every migration is additive and re-runnable.
+  One-time exception (maintainer decision, 2026-10-12): unlinking
+  sources from accounts (§1.2.17) drops `sources.user_id` and
+  `data_quarantine.user_id`. This is allowed because it lands before
+  the first deployment, when no environment holds data.
 - `CREATE EXTENSION IF NOT EXISTS pgcrypto;` for `gen_random_uuid()`.
 - All timestamps `TIMESTAMPTZ`, `DEFAULT now()`.
 - Identifiers: `sources.id` is the deterministic 64-char lowercase hex
   digest from the client; `clips.id` is a client-minted UUIDv4 the farm
   never mints; every other PK is `gen_random_uuid()`.
-- No PII columns anywhere (see §9).
+- No PII columns anywhere (see §8).
 
 ## 3. Tables
 
@@ -124,17 +184,42 @@ CREATE TABLE users (
   -- Sign in with Apple `sub` claim: per-app opaque pseudonymous subject.
   -- No name, email, or other Apple profile data is stored.
   reputation  DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+  -- Unused: reputation is not computed from contributions (§1.2.17, §9 Q2).
   is_blocked  BOOLEAN NOT NULL DEFAULT FALSE,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  apple_refresh_token BYTEA
+  -- Apple refresh token from the sign-in code exchange (§7.1), used only
+  -- to revoke the user's authorization on account deletion (§1.2.15).
+  -- AES-256-GCM under APPLE_REFRESH_TOKEN_KEY with users.id as additional
+  -- authenticated data, stored as 12-byte nonce || ciphertext || 16-byte
+  -- tag. NULL after consent-revoked (§7.3).
 );
+
+CREATE TABLE sessions (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash   CHAR(64) NOT NULL UNIQUE CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+  -- Lowercase hex SHA-256 of the session token (§7.1). The token itself
+  -- is never stored, so a leaked table or backup yields no credentials.
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Refreshed at most once a day (§7.1), so reads don't become writes.
+  expires_at   TIMESTAMPTZ NOT NULL
+  -- Idle expiry: 90 days after last_used_at.
+);
+CREATE INDEX sessions_user_id_idx ON sessions (user_id);
+CREATE INDEX sessions_expires_at_idx ON sessions (expires_at);
 
 CREATE TABLE sources (
   id              CHAR(64) PRIMARY KEY,
   -- Deterministic video_id (master plan §1): SHA-256 hex of
   -- "turnip:phasset:" + PHAsset.localIdentifier (Photos videos) or of the
   -- file bytes (imports). The farm never mints source identities.
-  user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  source_key_hash CHAR(64) NOT NULL CHECK (source_key_hash ~ '^[0-9a-f]{64}$'),
+  -- Lowercase hex SHA-256 of the owner's source key (§1.2.13, §7.2). Set
+  -- by the first contribution, never overwritten. There is no account
+  -- column: the link to an account lives in source_attribution.
   frame_count     INTEGER NOT NULL CHECK (frame_count > 0),
   -- Canonical 10 Hz frame count of the stored pose sequence. The client
   -- computes it from its analysis rate via the POSE_FORMAT.md §6 resampling map;
@@ -158,7 +243,19 @@ CREATE TABLE sources (
   CONSTRAINT sources_id_hex  CHECK (id     ~ '^[0-9a-f]{64}$'),
   CONSTRAINT sources_sha_hex CHECK (sha256 ~ '^[0-9a-f]{64}$')
 );
-CREATE INDEX sources_user_id_idx ON sources (user_id);
+
+CREATE TABLE source_attribution (
+  source_id     CHAR(64) PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+  user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- The account that last wrote the source (§1.2.17): the only link
+  -- between a contribution and an account, kept for anti-poisoning.
+  attributed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  -- Refreshed by every contribution write (§4); the row is deleted 30
+  -- days after it. The farm keeps no other record of the link.
+);
+CREATE INDEX source_attribution_user_id_idx ON source_attribution (user_id);
+CREATE INDEX source_attribution_attributed_at_idx
+  ON source_attribution (attributed_at);
 
 CREATE TABLE clips (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -239,8 +336,8 @@ CREATE TABLE models (
 CREATE TABLE data_quarantine (
   id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   source_id      CHAR(64) NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-  user_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  -- Who uploaded the bad data (master plan §6 attribution).
+  -- No user_id: who uploaded the bad data is read from source_attribution
+  -- while it exists (§1.2.17), never copied here.
   reason         TEXT NOT NULL,
   metrics        JSONB,
   -- Snapshot of the regression metrics that triggered the quarantine.
@@ -260,6 +357,8 @@ CREATE INDEX data_quarantine_open_idx
 CREATE TABLE reports (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   reporter_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- Usually the target's own contributor (§1.2.17), so a report is
+  -- deleted 30 days after created_at (§4).
   target_type      TEXT NOT NULL CHECK (target_type IN ('source', 'clip', 'label')),
   target_id        TEXT NOT NULL,
   reason           TEXT NOT NULL,
@@ -293,31 +392,72 @@ Every write is keyed on a client-supplied identity, which is what makes
 re-submission idempotent. No `Idempotency-Key` header is needed; the IDs
 *are* the idempotency keys.
 
-**`users`** — identity row; immutable on the contribution path:
+**`users`** — identity row, written only at sign-in (§7.1), keyed by the
+Apple `sub`; a re-sign-in replaces only the stored Apple refresh token:
 
 ```sql
-INSERT INTO users (id) VALUES ($1)
-ON CONFLICT (id) DO NOTHING;
+INSERT INTO users (id, apple_refresh_token) VALUES ($1, $2)
+ON CONFLICT (id) DO UPDATE SET
+  apple_refresh_token = EXCLUDED.apple_refresh_token,
+  updated_at          = now()
+RETURNING is_blocked;
 ```
 
-`reputation` / `is_blocked` change only through the moderation path, never
-as a side effect of contribution.
+Contribution never writes `users`. `reputation` / `is_blocked` change only
+through the moderation path.
 
-**`sources`** — full replace on re-contribution, except ownership:
+**`sessions`** — one row per sign-in; a user may hold several (one per
+device or install). Sign-in purges expired rows, then inserts:
+
+```sql
+DELETE FROM sessions WHERE expires_at < now();
+INSERT INTO sessions (user_id, token_hash, expires_at)
+VALUES ($1, $2, now() + interval '90 days');
+```
+
+**`sources`** — full replace on re-contribution, except ownership. `$2`
+is the SHA-256 hex of the presented source key:
 
 ```sql
 INSERT INTO sources
-  (id, user_id, frame_count, sample_rate, keypoint_format, r2_key, updated_at)
+  (id, source_key_hash, frame_count, sample_rate, keypoint_format, r2_key, updated_at)
 VALUES ($1, $2, $3, $4, $5, 'poses/' || $1 || '.tkp1.gz', now())
 ON CONFLICT (id) DO UPDATE SET
-  -- user_id is deliberately NOT overwritten: first writer wins (§1.2.13).
+  -- source_key_hash is deliberately NOT overwritten: first writer wins (§1.2.13).
   -- sha256 is deliberately NOT overwritten: owned by ingest (§1.2.10).
   frame_count     = EXCLUDED.frame_count,
   sample_rate     = EXCLUDED.sample_rate,
   keypoint_format = EXCLUDED.keypoint_format,
   r2_key          = EXCLUDED.r2_key,
-  updated_at      = now();
+  updated_at      = now()
+WHERE sources.source_key_hash = EXCLUDED.source_key_hash
+RETURNING (xmax = 0) AS inserted;
+-- no row → claimed under another key → 409 SOURCE_ALREADY_CLAIMED
+-- inserted → 201; otherwise → 200
 ```
+
+**`source_attribution`** — every contribution write (`POST /api/sources`,
+`POST /api/clips`, `POST /api/clips/:id/labels`) records the caller as
+the source's last writer, in the same transaction:
+
+```sql
+INSERT INTO source_attribution (source_id, user_id) VALUES ($1, $2)
+ON CONFLICT (source_id) DO UPDATE SET
+  user_id       = EXCLUDED.user_id,
+  attributed_at = now();
+```
+
+The farm process deletes expired rows at startup and hourly, together
+with reports past the same window (§1.2.17):
+
+```sql
+DELETE FROM source_attribution WHERE attributed_at < now() - interval '30 days';
+DELETE FROM reports            WHERE created_at    < now() - interval '30 days';
+```
+
+Every read of `source_attribution` also filters on
+`attributed_at >= now() - interval '30 days'`, so a late purge never
+extends the link.
 
 **`clips`** — batch upsert, one statement for the whole batch:
 
@@ -409,7 +549,6 @@ means **has an open (unresolved) quarantine row**:
 
 ```sql
 SELECT s.id            AS source_id,
-       s.user_id,                       -- for user-stratified splits
        s.r2_key,
        s.sha256        AS blob_sha256,
        c.id            AS clip_id,
@@ -441,11 +580,19 @@ Notes:
   Postgres `now()` returns the transaction start, so every row a batch
   touches shares the exact same `updated_at`. Keying on `row_cursor`
   alone with `next_cursor = max(row_cursor)` would silently skip rows
-  sharing the max cursor value past the `LIMIT` boundary. This mirrors
-  the `GET /api/sources` keyset (§7.3), which keys on
-  `(updated_at, id)` for the same reason.
+  sharing the max cursor value past the `LIMIT` boundary.
 - `next_cursor` = `(row_cursor, clip_id, trick_name)` of the last
   returned row; the training job passes all three back as `since`.
+- **The export carries no deletions.** A source deleted by its owner,
+  by account deletion, or by a quarantine purge, and a label dropped
+  when a clip's label set is replaced, simply stop appearing. An
+  incremental pull never learns of them. The training job therefore
+  builds every dataset from a **full pull** (no `since`) and discards
+  any locally cached pose blob whose source is absent from it. `since`
+  is only for cheap change detection, such as counting new labels
+  before deciding to train.
+- No account identifier is exported (§1.2.17). Training splits by
+  source.
 - Canonicalization (`raw → canonical`) happens in the training job using
   the `taxonomy` block shipped with the export response (§7,
   `GET /api/labels/export`), not in SQL.
@@ -457,19 +604,99 @@ RFC 3339 (`2026-10-06T07:30:00Z`).
 
 ### 7.1 Authentication
 
-**Client (all endpoints except the two pipeline endpoints):** Sign in with
-Apple. The client sends `Authorization: Bearer <apple-identity-token>`.
-The farm verifies the JWT on every request (stateless; Apple's JWKS
-cached): RS256 signature, `iss = https://appleid.apple.com`,
-`aud` = the app's client ID, `exp` within a small clock-skew leeway.
-The `sub` claim becomes `users.id` (upserted on first sight). Every query
-is scoped with `user_id = <sub>`; there is no cross-user access.
+**Client sessions** (every endpoint not named below). The client signs
+in once with `POST /api/auth/apple` (§7.3), the only client endpoint
+that sees Apple tokens, and receives a farm session token (§1.2.14).
+Every other client request sends `Authorization: Bearer <session token>`.
+The farm hashes the token and looks it up:
+
+```sql
+SELECT s.id, s.user_id, s.last_used_at, u.is_blocked
+FROM sessions s
+JOIN users u ON u.id = s.user_id
+WHERE s.token_hash = $1 AND s.expires_at > now();
+```
+
+No row → `401 UNAUTHENTICATED`; the client discards the token and signs
+in again. `is_blocked` → `403 ACCOUNT_BLOCKED`, except on
+`POST /api/auth/signout` and `DELETE /api/account` (§1.2.16). Otherwise
+the request runs as the session's user. Account data (sessions, the
+account itself) is scoped with `user_id = <session user_id>`;
+contributions are reached only through source keys (§7.2), so there is
+no cross-user access either way. When `last_used_at` is more than a day
+old, the session slides forward:
+
+```sql
+UPDATE sessions
+SET last_used_at = now(), expires_at = now() + interval '90 days'
+WHERE id = $1 AND last_used_at < now() - interval '1 day';
+```
+
+A session token is 32 bytes from a CSPRNG, base64url-encoded without
+padding (43 characters); the farm stores only its lowercase hex SHA-256
+(`sessions.token_hash`). The token carries no claims. The row is the
+source of truth, so sign-out, revoked consent, and account deletion end
+sessions immediately. Sessions expire after 90 days without use; Apple
+notes that "User sessions are long-lived on device".
 
 **Pipeline** (`POST /api/models`, `GET /api/labels/export`): pre-shared
 service key, `Authorization: Bearer <TURNIP_PIPELINE_KEY>`.
 
-Blocked users (`users.is_blocked`) receive `403 ACCOUNT_BLOCKED` on all
-endpoints.
+**Apple** (`POST /api/auth/apple/notifications`): no bearer token; the
+body is a JWT signed by Apple, verified as below.
+
+**Verifying an Apple JWT.** The identity token at sign-in, the `id_token`
+returned by the code exchange, and server-to-server notifications are
+checked the same way: RS256 signature against Apple's JWKS
+(`https://appleid.apple.com/auth/keys`; cached, key matched by `kid`,
+refetched when an unknown `kid` appears), `iss = https://appleid.apple.com`,
+`aud = APP_BUNDLE_ID`, and `exp` within a 60-second clock-skew leeway.
+Notifications carry `iat` and `jti` but no `exp`, so `exp` is required
+only on identity tokens. The farm reads only `sub` (and, for
+notifications, `events`); Apple's email claims are never stored or
+logged (§8).
+
+**Apple credentials.** The code exchange and token revocation
+authenticate the farm to Apple with `client_id = APP_BUNDLE_ID` and a
+client secret: an ES256 JWT signed with the Sign in with Apple private
+key, header `{"alg": "ES256", "kid": APPLE_KEY_ID}`, claims
+`iss = APPLE_TEAM_ID`, `sub = APP_BUNDLE_ID`,
+`aud = https://appleid.apple.com`, `iat` = now, and `exp` no more than
+six months later (Apple's limit). Configuration: `APP_BUNDLE_ID`,
+`APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_PRIVATE_KEY` (the `.p8` PEM), and
+`APPLE_REFRESH_TOKEN_KEY` (32 random bytes, base64: the AES-256-GCM key
+for `users.apple_refresh_token`).
+
+**Client contract** (turnip-ios):
+
+- Per sign-in attempt, generate a random raw nonce, set
+  `ASAuthorizationAppleIDRequest.nonce` to its lowercase hex SHA-256, and
+  send the raw nonce with `identityToken` and `authorizationCode` to
+  `POST /api/auth/apple`. The code is single-use and valid for five
+  minutes, so send it right away.
+- Keep the session token in the Keychain with
+  `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, so background
+  uploads can read it and it never migrates to another device.
+- On launch, call `getCredentialState(forUserID:)`. On `.revoked` or
+  `.notFound`, call `POST /api/auth/signout`, delete the token, and show
+  the signed-out state. Also observe `credentialRevokedNotification`.
+- On any `401`, delete the token and sign in again.
+- When a source is first contributed, generate its source key (§7.2)
+  and keep it in the Keychain under its `video_id`, with the same
+  accessibility as the session token. Keychain items survive app
+  deletion and reinstall on current iOS, but Apple doesn't guarantee
+  it, so a lost key is an expected state, not an error.
+- Account deletion: delete every source the app holds a key for, then
+  call `DELETE /api/account`, then delete the local keys and session
+  token (§7.3).
+- Disclosure, shown at contribution consent and again at account
+  deletion: contributions stay linked to the account for 30 days after
+  the last edit, and after that are kept without any link to it.
+  Deleting the account removes every contribution the app can still
+  find. The rest can't be traced back to the user and remain in the
+  training data. The consent copy also asks users to contribute only
+  clips of themselves, or of people who agreed: the person in a clip
+  may not be the account holder.
 
 ### 7.2 Conventions
 
@@ -484,14 +711,160 @@ endpoints.
   (404), `NO_MODEL` (404), `VALIDATION_ERROR` (422), `UNSUPPORTED_FORMAT` (422),
   `BLOB_MISSING` (422), `BLOB_DIGEST_MISMATCH` (422),
   `SOURCE_ALREADY_CLAIMED` (409), `VERSION_EXISTS` (409),
-  `RATE_LIMITED` (429), `INTERNAL` (500).
-- **Ownership privacy:** single-resource GETs return `404 NOT_FOUND`
-  (not 403) when the resource exists but belongs to another user.
+  `RATE_LIMITED` (429), `INTERNAL` (500), `APPLE_UNAVAILABLE` (503:
+  Apple's token or revocation endpoint is unreachable or answered 5xx;
+  retry later).
+- **Source keys** prove ownership of a source (§1.2.13).
+  - **What a key is:** 32 random bytes the client generates once per
+    source when it first contributes it, sent base64url-encoded without
+    padding (43 characters). The farm stores only its SHA-256 hex
+    (`sources.source_key_hash`).
+  - **How it travels:**
+    - the `source_key` field on `POST /api/sources` and
+      `POST /api/clips/:id/labels`;
+    - a per-clip `source_key` in the `POST /api/clips` batch;
+    - a `Source-Key` header on `GET /api/sources/:id`,
+      `GET /api/sources/:id/pose` and `DELETE /api/sources/:id`.
+  - **Two credentials:** contribution endpoints need both a session and
+    the key. The session is for rate limiting, blocking, and attribution
+    (§1.2.17); the key is for ownership.
+  - **Losing it:** a client that loses a key (e.g. its Keychain is
+    gone) can no longer manage that source. It treats the source as
+    contributed but unmanageable.
+- **Ownership privacy:** a missing or wrong source key gets
+  `404 NOT_FOUND` (not 403) on reads, deletes, and clip writes, so
+  resource IDs are not usable as an ownership oracle. Registration is
+  the one exception: a `video_id` already claimed under another key
+  gets `409 SOURCE_ALREADY_CLAIMED`.
 - **Rate limiting:** per-user token bucket on POST endpoints
   (suggested: 60 requests/minute; `429 RATE_LIMITED` with
-  `Retry-After`).
+  `Retry-After`). `POST /api/auth/apple` has no user yet, so it is
+  limited per client IP (suggested: 10 requests/minute).
 
 ### 7.3 Endpoints
+
+#### `POST /api/auth/apple` — sign in, get a session token
+
+No session required. Request:
+
+```json
+{
+  "identity_token": "<ASAuthorizationAppleIDCredential.identityToken>",
+  "authorization_code": "<ASAuthorizationAppleIDCredential.authorizationCode>",
+  "nonce": "<raw nonce; its SHA-256 hex was set on the Apple request>"
+}
+```
+
+Behavior, in order:
+
+1. Verify `identity_token` as an Apple JWT (§7.1), and require its
+   `nonce` claim to equal the lowercase hex SHA-256 of the request's
+   `nonce`. Any failure → `401 UNAUTHENTICATED`.
+2. Exchange the code: `POST https://appleid.apple.com/auth/token`, form
+   fields `client_id`, `client_secret` (§7.1), `code`,
+   `grant_type=authorization_code` (no `redirect_uri` for a native app).
+   Apple's `invalid_grant` (code expired, already used, or revoked) →
+   `401 UNAUTHENTICATED`. Unreachable, timeout, or 5xx →
+   `503 APPLE_UNAVAILABLE`. Any other error (e.g. `invalid_client`)
+   means the farm is misconfigured → `500 INTERNAL`.
+3. Verify the response's `id_token` as an Apple JWT (§7.1); its `sub`
+   must equal the identity token's `sub`, else `401 UNAUTHENTICATED`.
+4. In one transaction: upsert the user with the encrypted
+   `refresh_token`, purge expired sessions, and insert the new session
+   (§4).
+
+A blocked user still gets a session (§1.2.16); every other endpoint
+then answers `403 ACCOUNT_BLOCKED`.
+
+Response `200`:
+
+```json
+{"session_token": "<43-char base64url>", "expires_at": "2027-01-04T07:00:00Z"}
+```
+
+#### `POST /api/auth/signout` — end this session
+
+Deletes the session whose `token_hash` matches the bearer token, if
+any. `204` whether or not a session matched, so a client can always
+sign out cleanly. Allowed for blocked users.
+
+#### `DELETE /api/account` — delete my account
+
+App Review guideline 5.1.1(v). Session required; allowed for blocked
+users.
+
+**Client first.** Contributions are not linked to the account beyond
+the attribution window (§1.2.17), so the farm cannot find them all.
+Before calling this endpoint, the app deletes every source it holds a
+key for, with `DELETE /api/sources/:id`. The farm cannot enforce this
+step. Contributions whose keys the app no longer holds, and that are
+past the window, remain as training data that no record links to the
+user. The app says so when the user contributes and again when they
+delete the account (§7.1, §8).
+
+**Then the server**, in order, so a retry after a partial failure
+finishes the job:
+
+1. If `users.apple_refresh_token` is set, decrypt it and revoke it:
+   `POST https://appleid.apple.com/auth/revoke`, form fields
+   `client_id`, `client_secret` (§7.1), `token`,
+   `token_type_hint=refresh_token`. Apple answers `200` both when it
+   revokes the token and when the token was already invalid.
+   Unreachable, timeout, or 5xx → `503 APPLE_UNAVAILABLE` with nothing
+   deleted. Any other error is logged and deletion proceeds: the user's
+   right to delete does not depend on Apple's answer.
+2. Delete every source still attributed to the user (within the
+   window, §4): first its R2 blob and any staged upload, then the row.
+   Clips, labels, quarantine rows, and attribution cascade.
+3. `DELETE FROM users WHERE id = $1`. Sessions, reports, and any
+   remaining attribution rows cascade.
+
+Response `204`. A retry after success gets `401` (the session is gone).
+
+#### `POST /api/auth/apple/notifications` — Apple server-to-server notifications
+
+Apple posts here when a user changes their Sign in with Apple account;
+the URL is registered for the App ID in the Apple Developer account
+(§9). No session; authenticity comes from Apple's signature. Body:
+
+```json
+{"payload": "<JWT signed by Apple>"}
+```
+
+Verify `payload` as an Apple JWT (§7.1); failure → `401`. The `events`
+claim is documented as an object; parse it if it arrives as a
+JSON-encoded string instead. Apple's documented shape:
+
+```json
+{
+  "iss": "https://appleid.apple.com",
+  "aud": "<APP_BUNDLE_ID>",
+  "iat": 1508184845,
+  "jti": "abede...67890",
+  "events": {
+    "type": "consent-revoked",
+    "sub": "820417.faa325acbc78e1be1668ba852d492d8a.0219",
+    "event_time": 1508184845
+  }
+}
+```
+
+By `events.type`, for the user `events.sub`:
+
+- `consent-revoked` (the user stopped using Sign in with Apple for the
+  app): delete all their sessions and set `apple_refresh_token = NULL`
+  (Apple has already invalidated it). Contributions stay; the user can
+  sign in again, or delete the account.
+- `account-deleted` (the user deleted their Apple Account; Apple has
+  invalidated all their tokens, and they can never sign in again to
+  delete their data): run `DELETE /api/account` steps 2 and 3. Sources
+  past the attribution window are not linked to the account and stay.
+- `email-enabled`, `email-disabled`: ignored. These events carry an
+  email address, which the farm never stores or logs.
+
+An unknown `sub` or `type` is a no-op. Response `200` once handled;
+`500` on a transient failure (e.g. R2 unreachable), since whether Apple
+redelivers is undocumented (§9).
 
 #### `POST /api/sources` — register a source, get the blob upload URL
 
@@ -500,21 +873,24 @@ Request:
 ```json
 {
   "video_id": "<64-char lowercase hex>",
+  "source_key": "<43-char base64url; generated by the client for this source>",
   "frame_count": 600,
   "sample_rate": 10.0,
   "keypoint_format": "tkp1"
 }
 ```
 
-Validation: `video_id` matches `^[0-9a-f]{64}$`; `frame_count > 0`;
-`sample_rate` in `1..30` Hz (the normative client analysis range, POSE_FORMAT.md
-§6); `keypoint_format` must be `tkp1` (anything else →
+Validation: `video_id` matches `^[0-9a-f]{64}$`; `source_key` is 43
+base64url characters (§7.2); `frame_count > 0`; `sample_rate` in
+`1..30` Hz (the normative client analysis range, POSE_FORMAT.md §6);
+`keypoint_format` must be `tkp1` (anything else →
 `422 UNSUPPORTED_FORMAT`).
 
 Behavior: upserts the source row per §4 (`r2_key =
-poses/<video_id>.tkp1.gz`; `user_id` never overwritten on conflict;
-`sha256` left for ingest). If the conflicting row belongs to a
-different user → `409 SOURCE_ALREADY_CLAIMED` (the farm already holds
+poses/<video_id>.tkp1.gz`; `source_key_hash` set on insert and never
+overwritten; `sha256` left for ingest), and records the caller in
+`source_attribution` (§4). If the `video_id` is already claimed under a
+different key → `409 SOURCE_ALREADY_CLAIMED` (the farm already holds
 this source).
 
 Response (`201` new, `200` re-registered):
@@ -557,6 +933,7 @@ Request:
     {
       "clip_id": "<uuidv4, client-minted>",
       "source_id": "<64-char hex>",
+      "source_key": "<the source's key>",
       "start_frame": 120,
       "end_frame": 175,
       "auto_detected": false,
@@ -568,8 +945,10 @@ Request:
 
 Behavior, in a single transaction:
 
-1. For each clip: the source must exist **and** belong to the caller,
-   else the whole batch fails with `404 NOT_FOUND`.
+1. For each clip: the source must exist, its `source_key` must match,
+   and an existing `clip_id` must already belong to that source (clips
+   never move between sources). Otherwise the whole batch fails with
+   `404 NOT_FOUND`.
 2. `0 <= start_frame < end_frame <= source.frame_count`, else
    `422 VALIDATION_ERROR` (with the batch index and field in `details`).
 3. **Blob verification** (once per distinct source in the batch): the
@@ -581,6 +960,8 @@ Behavior, in a single transaction:
 4. Upsert the clip rows (§4).
 5. Replace each clip's label set (§5); `labels` is optional per clip and
    may be `[]` (clears the set).
+6. Record the caller in `source_attribution` for each distinct source
+   (§4).
 
 Response `200`:
 
@@ -600,12 +981,13 @@ case-insensitive duplicates are deduped before insert (§5).
 Request:
 
 ```json
-{"labels": ["hook", "scoot", "gainer", "cartfull"]}
+{"source_key": "<the key of the clip's source>", "labels": ["hook", "scoot", "gainer", "cartfull"]}
 ```
 
-Behavior: the clip must exist and belong to the caller (`404`
-otherwise); runs the §5 replacement for that clip only. Idempotent:
-submitting the current set is a no-op semantically.
+Behavior: the clip must exist and `source_key` must match its source
+(`404` otherwise); runs the §5 replacement for that clip only and
+records the caller in `source_attribution` (§4). Idempotent: submitting
+the current set is a no-op semantically.
 
 Response `200`:
 
@@ -613,35 +995,14 @@ Response `200`:
 {"clip_id": "<uuid>", "labels": ["hook", "scoot", "gainer", "cartfull"], "taxonomy_version": 3}
 ```
 
-#### `GET /api/sources` — list my sources (reinstall reconciliation)
-
-Query params: `limit` (default 100, max 1000), `cursor` (opaque;
-`(updated_at, id)` of the last item from the previous page — keyset on
-both, since `updated_at` alone ties and would skip or duplicate rows).
-
-Response `200`:
-
-```json
-{
-  "sources": [
-    {
-      "id": "<video_id>",
-      "frame_count": 600,
-      "clip_count": 2,
-      "label_count": 3,
-      "updated_at": "2026-10-06T07:00:00Z"
-    }
-  ],
-  "next_cursor": "<opaque>"  // null when exhausted
-}
-```
-
-`clip_count` / `label_count` come from `count()` over the joins; sources
-with no clips report `0`/`0` (e.g. registered but never confirmed).
+There is no "list my sources" endpoint: the farm doesn't know which
+sources are whose (§1.2.17). The client knows, from the source keys it
+holds.
 
 #### `GET /api/sources/:id` — source with confirmed clips + labels
 
-Response `200` (`404` if missing or not mine):
+`Source-Key` header required. Response `200` (`404` if missing or the
+key doesn't match):
 
 ```json
 {
@@ -668,14 +1029,16 @@ Response `200` (`404` if missing or not mine):
 }
 ```
 
-This is the reinstall-reconciliation read: the client recomputes its
-`video_id`s, lists sources, and pulls each source's clips + labels,
-adopting the server's clip IDs into its rebuilt local state (master
-plan §5.1).
+This is the reinstall-reconciliation read. The client reads the source
+keys left in its Keychain (stored per `video_id`), recomputes the
+`video_id`s of the videos it still has, and pulls each matching
+source's clips + labels, adopting the server's clip IDs into its
+rebuilt local state (master plan §5.1).
 
 #### `GET /api/sources/:id/pose` — owner-only pose blob download
 
-Response `200` (`404` if missing or not mine):
+`Source-Key` header required. Response `200` (`404` if missing or the
+key doesn't match):
 
 ```json
 {
@@ -684,17 +1047,19 @@ Response `200` (`404` if missing or not mine):
 }
 ```
 
-Used by a device that no longer holds the local video (reinstall
-restore, cross-device) to render skeleton previews from keypoints alone.
-Presigned per request, scoped to the single blob; the owner-only rule is
-what keeps one contributor's pose sequences from ever being downloadable
-by another.
+Used by a device that no longer holds the local video but still holds
+the key (e.g. reinstall restore) to render skeleton previews from
+keypoints alone. Presigned per request, scoped to the single blob; the
+key requirement is what keeps one contributor's pose sequences from
+ever being downloadable by another.
 
 #### `DELETE /api/sources/:id` — owner-only hard delete
 
-Deletes the R2 blob and the source row; clips, labels, and quarantine
-rows cascade. `204` on success (`404` if missing or not mine). This is
-the "keep forever, user-deletable" retention posture (master plan §4).
+`Source-Key` header required. Deletes the R2 blob and the source row;
+clips, labels, quarantine rows, and attribution cascade. `204` on
+success (`404` if missing or the key doesn't match). This is the "keep
+forever, user-deletable" retention posture (master plan §4): deletable
+by whoever holds the key.
 
 #### `GET /api/models/current` — trick-model manifest
 
@@ -764,7 +1129,6 @@ sources excluded, ordered by cursor ascending, `limit` 10000:
   "rows": [
     {
       "source_id": "<video_id>",
-      "user_id": "<apple sub>",
       "r2_key": "poses/<video_id>.tkp1.gz",
       "blob_sha256": "<64-char hex>",
       "clip_id": "<uuid>",
@@ -796,7 +1160,8 @@ Request:
 
 `target_type` ∈ `source | clip | label`. Response `201`:
 `{"id": "<report uuid>"}`. Reports are a moderation queue for future
-use; they do not change training data by themselves.
+use; they do not change training data by themselves. A report is
+deleted 30 days after it is filed (§1.2.17, §4), reviewed or not.
 
 ## 8. What the farm never accepts or stores
 
@@ -809,24 +1174,72 @@ checklist:
   The `PHAsset.localIdentifier` **never leaves the device**; the farm
   sees only its SHA-256-derived digest, which it cannot reverse.
 - No Apple profile data beyond the `sub` claim: no name, no email.
+  Identity tokens and email notifications carry an email address; it is
+  discarded unread.
 - R2 keys contain only the opaque source ID
   (`poses/<video_id>.tkp1.gz`); presigned URLs are per-request,
   single-blob, short-lived.
-- Request logs must not record Apple identity tokens; error payloads
-  must not echo pose data.
+- Credentials are stored only in protected form: session tokens as
+  SHA-256 hashes, Apple refresh tokens AES-256-GCM encrypted (§3).
+- Request logs and error payloads never contain Apple identity tokens,
+  authorization codes, refresh tokens, session tokens, source keys, or
+  pose data.
+- Contributions carry no account identifier. The only link is
+  `source_attribution`, deleted 30 days after a source's last write
+  (§1.2.17), and nothing may outlive it:
+  - **Logs:** request logs never record a user ID or session ID next to
+    a source or clip ID. The farm's logs and the reverse proxy's access
+    logs are kept 30 days at most.
+  - **Backups:** database backups are kept 30 days at most.
+  - **Alerts:** anti-poisoning alerts name sources and counts, never
+    accounts. The maintainer reads attribution from the database while
+    it exists.
+  - **Exports:** nothing exported to training carries an account
+    identifier (§6).
+  - **Reports:** deleted 30 days after they are filed, since the
+    reporter is usually the target's contributor (§1.2.17).
+- Account deletion (§7.3) removes the account, its sessions, and every
+  contribution still attributed to it or still keyed on the device.
+  Contributions the device can no longer find stay, unlinked; users are
+  told so at consent and at deletion. Deleted data leaves the next
+  training dataset, because training rebuilds from a full pull (§6).
+  Models already trained on it are treated as anonymous, pending the
+  assessment in §9 Q8.
 
 ## 9. Open questions
 
 1. **Pipeline key management.** Who issues and rotates
    `TURNIP_PIPELINE_KEY`, and where is it stored? (Ops decision.)
-2. **Reputation formula.** The master plan names `users.reputation` but
-   specifies no algorithm. Training-time sampling weights and any
-   contributor-facing effects need a definition before Phase 3.
-3. **Apple token verification cost.** Specified as stateless
-   per-request verification; revisit with caching if the contribution
-   endpoints get hot.
+2. **Reputation formula.** *Settled by §1.2.17:* reputation is not
+   computed from contributions, which keep no lasting account link, and
+   `users.reputation` stays unused. Any future per-account signal has
+   to come from account-level events, such as confirmed reports.
+3. **Apple token verification cost.** *Resolved:* identity tokens are
+   verified once, at sign-in; requests carry farm session tokens
+   (§1.2.14, §7.1).
 4. **R2 topology.** Bucket, region, and presigned-URL TTL policy are ops
    details not specified here (15-minute TTLs assumed above).
 5. **Taxonomy curation.** Who canonicalizes new free-text names and
    bumps `taxonomy_version` (master plan §9 Q1) — the versioning
    mechanics are specified here; the human process is not.
+6. **Apple key and secret management.** Where `APPLE_PRIVATE_KEY` and
+   `APPLE_REFRESH_TOKEN_KEY` live, and how the latter rotates. A
+   rotation needs a key ID on the stored ciphertext, which §3 does not
+   have yet. (Ops decision.)
+7. **Server-to-server notifications.** The endpoint URL must be
+   registered for the App ID in the Apple Developer account, and Apple
+   does not document redelivery. A missed `account-deleted` leaves that
+   user's data until an operator removes it. (Ops decision.)
+8. **Trained-model anonymity.** Every device receives the model, so
+   treating it as anonymous needs a documented assessment (EDPB Opinion
+   28/2024): a membership-inference check in the holdout evaluation,
+   and confirmation that no pose sequences ship inside model artifacts.
+   Owned by the training design.
+9. **Residual linkage.** Unlinked contributions can still be matched
+   against a public video of the person in them, and an imported
+   file's `video_id` can be recomputed by anyone holding the file
+   (§1.2.17). Counsel should confirm whether that leaves them personal
+   data.
+10. **Log and backup retention.** §8 caps logs and database backups at
+    30 days; the deployment runbook has to implement that for Postgres
+    backups, the farm's logs, and the reverse proxy's access logs.

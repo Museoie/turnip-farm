@@ -1,12 +1,16 @@
 # Turnip Farm + ML Master Plan
 
-*Rev 3 · 2026-10-05 · Draft for review.*
+*Rev 4 · 2026-10-12 · Draft for review.*
 
 *Rev 1 established the direction. Rev 2 incorporated the maintainer's
 gap-review decisions (confirmed contribution flow, TKP1 format, output contract,
 vocabulary versioning, quarantine design, phasing, overview diagram).
 Rev 3 makes source/clip IDs deterministic (derived, not random) so they
-survive app reinstalls, and adds the reinstall reconciliation flow.*
+survive app reinstalls, and adds the reinstall reconciliation flow.
+Rev 4 unlinks contributions from accounts: ownership is a per-source
+key held by the client, the account link lasts 30 days after a source's
+last write (for anti-poisoning attribution only), training splits by
+source, and reputation is no longer computed from labels.*
 
 This document is the master plan for `turnip-farm` (backend + dataset) and
 `turnip-ml` (training), and the contract they hold with `turnip-ios`.
@@ -108,8 +112,11 @@ identifiers, device identifiers, contacts, or anything derived from them.
 - Label payloads — confirmed clip windows (frame ranges) and free-text
   trick names.
 - Account subject — the Sign in with Apple `sub` claim, which is already
-  per-app opaque. Needed to attribute labels for reputation scoring and
-  for quarantine attribution (§6).
+  per-app opaque. Needed for sign-in, rate limiting, and blocking. It is
+  linked to a contribution only for quarantine attribution (§6), and
+  only until 30 days after the contribution's last write; after that
+  the contribution has no account link. Ownership of a contribution is
+  a per-source key the client holds, not the account.
 
 **Why keypoints are safe enough:** a pose sequence contains no biometric
 image data. Residual honesty: gait-from-keypoints is a real (if nascent)
@@ -145,7 +152,8 @@ on the server as training data; the client simply cannot relink them.
   `reputation`, `is_blocked`, `created_at`. Holds no personal data
   beyond what Apple gives us.
 - `sources` — one row per contributed source video. `id` CHAR(64)
-  (SHA-256 hex digest per §1, PK), `user_id` FK, `frame_count`,
+  (SHA-256 hex digest per §1, PK), `source_key_hash` (ownership: hash
+  of a key the client holds; no account column), `frame_count`,
   `sample_rate` (as sent, provenance), `keypoint_format`
   (e.g. `tkp1`, versioned), `r2_key` (pose blob), `sha256` (hex
   digest of the blob — integrity check, consistent with the model
@@ -157,13 +165,13 @@ on the server as training data; the client simply cannot relink them.
   trick model later), `created_at`, `updated_at`.
   Hierarchy: **Source → Clip → Label**, all one-to-many.
 - `labels` — `id`, `clip_id` FK **UNIQUE** (exactly one label set per
-  clip — re-submission overrides), `user_id` FK (owner/labeler, for
-  attribution), `labels TEXT[]` (free-text trick names, **multiple per
-  clip**), `start_frame` / `end_frame` (nullable — null means "the clip
-  window"; the labeler may tighten it), `taxonomy_version` (vocab in
-  effect at label time), `created_at`, `updated_at`. `crop_rects` are
-  gone: with keypoints the athlete's location is already known, and
-  crop is a client-side rendering concern.
+  clip — re-submission overrides), `labels TEXT[]` (free-text trick
+  names, **multiple per clip**), `start_frame` / `end_frame` (nullable —
+  null means "the clip window"; the labeler may tighten it),
+  `taxonomy_version` (vocab in effect at label time), `created_at`,
+  `updated_at`. `crop_rects` are gone: with keypoints the athlete's
+  location is already known, and crop is a client-side rendering
+  concern.
 - `label_taxonomy` — `raw` → `canonical` mapping, `taxonomy_version`
   (monotonic int, bumped when canonical names are added/changed),
   `first_seen`. Free text is preserved forever; training consumes
@@ -171,8 +179,11 @@ on the server as training data; the client simply cannot relink them.
 - `models` — `id`, `version`, `model_type` (`trick-detection`),
   `taxonomy_version` (the vocab the model trained on), `r2_key`,
   `val_metrics` (JSONB), `promoted_at`.
-- `data_quarantine` — `id`, `source_id` FK, `user_id` FK (who uploaded
-  it — the "basic level of identification" for bad data), `reason`,
+- `source_attribution` — `source_id` FK, `user_id` FK, `attributed_at`:
+  the account that last wrote the source, deleted 30 days after that
+  write. The only link between a contribution and an account, kept as
+  the "basic level of identification" for bad data (§6).
+- `data_quarantine` — `id`, `source_id` FK, `reason`,
   `metrics` (JSONB snapshot), `quarantined_at`, `reviewed_at`,
   `resolution` (`released` | `purged`). The training export excludes
   quarantined sources. This is the anti-poisoning work queue (§6).
@@ -247,19 +258,21 @@ match.
 - `POST /api/clips/:id/labels` — label-only update (re-label without
   re-uploading the source): `{labels, start_frame?, end_frame?}`.
   Upsert on `clip_id`.
-- `GET /api/sources` — list your own sources (id, frame_count,
-  clip/label counts, updated_at) for the reinstall reconciliation UI.
-- `GET /api/sources/:id` — fetch your own source with its confirmed
-  clips + labels, matched by `video_id` (device restore /
-  cross-device). This is the "client matches server label data using
-  the video identifier" mechanism.
-- `GET /api/sources/:id/pose` — owner-only presigned R2 GET of the
-  source's TKP1 pose blob. Used by a device that no longer holds the
-  local video (reinstall restore, cross-device) to render skeleton
-  previews from keypoints alone (§5.5). Presigned per request, scoped
-  to the single blob, short-lived; the owner-only rule is what keeps
-  one user's pose sequences from ever being downloadable by another.
-- `DELETE /api/sources/:id` — owner-only hard delete (row + R2 blob).
+- `GET /api/sources/:id` — fetch your own source (proven by its source
+  key) with its confirmed clips + labels, matched by `video_id`
+  (device restore). This is the "client matches server label data
+  using the video identifier" mechanism. There is no "list my sources"
+  call: the farm doesn't know which sources are whose; the client
+  does, from the source keys it holds.
+- `GET /api/sources/:id/pose` — owner-only (source key) presigned R2
+  GET of the source's TKP1 pose blob. Used by a device that no longer
+  holds the local video but still holds the key (reinstall restore) to
+  render skeleton previews from keypoints alone (§5.5). Presigned per
+  request, scoped to the single blob, short-lived; the key requirement
+  is what keeps one user's pose sequences from ever being downloadable
+  by another.
+- `DELETE /api/sources/:id` — owner-only (source key) hard delete
+  (row + R2 blob).
   Same "keep forever, user-deletable" retention posture.
 - `GET /api/models/current` — trick-model manifest: version, URL,
   checksum, `taxonomy_version`, and the vocabulary list
@@ -281,11 +294,11 @@ draft clips).
 1. **Video identity (deterministic).** Derive `video_id` per §1 — from
    the PHAsset localIdentifier for Photos-backed videos, from file
    bytes for imports. No local ID↔asset mapping to lose: the ID is
-   recomputable after a reinstall. Reinstall reconciliation: enumerate
-   the Photos library → recompute video_ids → `GET /api/sources` to
-   show previously contributed videos → `GET /api/sources/:id` to pull
-   confirmed clips + labels and rebuild local state, adopting the
-   server's clip IDs.
+   recomputable after a reinstall. Reinstall reconciliation: read the
+   source keys left in the Keychain (stored per video_id) → enumerate
+   the Photos library and recompute video_ids → for each match,
+   `GET /api/sources/:id` with its key to pull confirmed clips + labels
+   and rebuild local state, adopting the server's clip IDs.
 2. **Clip editor (where labeling lives).** The detector (heuristic now,
    trick model later) proposes clip windows, or the user creates them
    manually. The user adjusts windows and adds **free-text trick names —
@@ -338,12 +351,11 @@ via `label_taxonomy` (a combo string like
 labels on one window); raw strings never discarded. Non-labeled regions
 of contributed sources serve as background negatives.
 
-**Splits.** 80/10/10 stratified by `user_id` — no user's clips leak
-across splits. Held-out set stays admin-curated. Bootstrap guard: until
-the contributor pool exceeds ~20 users (or any split would hold fewer
-than 50 clips), fall back to unstratified random splits —
-user-stratification on a handful of contributors yields degenerate
-splits (one user dominating all three, or near-empty val/test).
+**Splits.** 80/10/10 by source — all clips of one source land in one
+split. Contributions carry no lasting account link (§1), so one
+person's different videos can land in different splits, which can
+flatter validation scores slightly. The held-out set stays
+admin-curated and is the check on that.
 
 **Model.** Baseline: temporal encoder (TCN or small Transformer) over
 the keypoint sequence with a detection head; sliding-window classifier
@@ -358,13 +370,17 @@ accuracy, reported separately. Champion/challenger: promote only on
 fixture regression suite (the pose fixture clips on R2 plus
 trick-labeled fixtures — segment IoU + name accuracy vs. champion):
 - On regression: (1) fire a **Discord webhook alert** with the metrics
-  delta, affected source IDs, and user IDs; (2) **quarantine that day's
-  ingested sources** (`data_quarantine`) and skip them in training;
-  (3) skip promotion.
+  delta and affected source IDs (never account IDs: an alert outlives
+  the attribution window); (2) **quarantine that day's ingested
+  sources** (`data_quarantine`) and skip them in training; (3) skip
+  promotion.
 - The engineer reviews the quarantine queue, cleans (purge bad
   sources, release good ones); the next night retries.
-- Attribution comes from `sources.user_id` — the basic identification
-  of who uploaded the bad data.
+- Attribution comes from the farm's `source_attribution`, which links
+  a source to the account that last wrote it until 30 days after that
+  write. That is the basic identification of who uploaded the bad
+  data, and enough time for the nightly gate and the review. After the
+  window, nobody can tell who uploaded a source.
 
 **Export + deploy.** `coremltools` → Core ML, upload to R2,
 `POST /api/models` with the `taxonomy_version` it trained on. The app
@@ -422,7 +438,7 @@ does not touch that file.
    recomputed from the Photos library
    (`SHA-256("turnip:phasset:" + localIdentifier)`) or file bytes, no
    local ID↔asset mapping to lose; reinstall reconciliation via
-   `GET /api/sources` + `GET /api/sources/:id` (§5.1).
+   `GET /api/sources/:id` with the source keys the app holds (§5.1).
 8. **Social feed** — either defer it explicitly (recommended: Share
    Sheet already covers sharing) or restate it as client-rendered
    skeleton previews. The current server-feed design is incompatible
@@ -441,8 +457,9 @@ does not touch that file.
    suggestions in the label editor; a trusted-user queue resolves the
    unmatched remainder. (Versioning itself is decided — §2/§6.)
 2. **Multi-device.** A `video_id` created on the iPhone won't resolve
-   on the user's iPad. `GET /api/sources/:id` restores clips + labels;
-   video stays behind. Acceptable for v1?
-3. **Reputation without video.** The existing reputation/spot-check
-   design transfers unchanged (it scores *labels*, never footage) —
-   plus quarantine attribution via `sources.user_id`.
+   on the user's iPad, and its source key stays on the iPhone.
+   `GET /api/sources/:id` restores clips + labels on the device that
+   holds the key; video stays behind. Acceptable for v1?
+3. **Reputation without video.** *Settled in Rev 4:* labels are not
+   scored per account, because contributions keep no lasting account
+   link (§1). Quarantine attribution uses the 30-day link (§6).
