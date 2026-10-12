@@ -148,8 +148,13 @@ Two departures from the master plan's label draft follow from this:
     being edited stays linked, and one left alone is unlinked 30 days
     after its last edit. Nothing else needs the link. Ownership is the
     source key (§1.2.13), training splits by source rather than by user,
-    and reputation is not computed from contributions (§9 Q2). Once
-    unlinked, the farm treats a contribution as belonging to no account.
+    and reputation is not computed from contributions (§9 Q2). Reports
+    are the one other place an account meets a contribution:
+    `reports.reporter_user_id` sits next to a `target_id`, and since
+    only a source's key holder can see it, the reporter is usually its
+    contributor. Reports are therefore deleted 30 days after they are
+    filed, by the same purge (§4). Once unlinked, the farm treats a
+    contribution as belonging to no account.
     Some linkage remains possible outside the farm's records: a pose
     sequence can be matched against a public video of the person in it,
     and anyone holding an imported file can recompute its `video_id`.
@@ -353,6 +358,8 @@ CREATE INDEX data_quarantine_open_idx
 CREATE TABLE reports (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   reporter_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  -- Usually the target's own contributor (§1.2.17), so a report is
+  -- deleted 30 days after created_at (§4).
   target_type      TEXT NOT NULL CHECK (target_type IN ('source', 'clip', 'label')),
   target_id        TEXT NOT NULL,
   reason           TEXT NOT NULL,
@@ -441,10 +448,12 @@ ON CONFLICT (source_id) DO UPDATE SET
   attributed_at = now();
 ```
 
-The farm process deletes expired rows at startup and hourly:
+The farm process deletes expired rows at startup and hourly, together
+with reports past the same window (§1.2.17):
 
 ```sql
 DELETE FROM source_attribution WHERE attributed_at < now() - interval '30 days';
+DELETE FROM reports            WHERE created_at    < now() - interval '30 days';
 ```
 
 Every read of `source_attribution` also filters on
@@ -1152,7 +1161,8 @@ Request:
 
 `target_type` ∈ `source | clip | label`. Response `201`:
 `{"id": "<report uuid>"}`. Reports are a moderation queue for future
-use; they do not change training data by themselves.
+use; they do not change training data by themselves. A report is
+deleted 30 days after it is filed (§1.2.17, §4), reviewed or not.
 
 ## 8. What the farm never accepts or stores
 
@@ -1187,6 +1197,8 @@ checklist:
     it exists.
   - **Exports:** nothing exported to training carries an account
     identifier (§6).
+  - **Reports:** deleted 30 days after they are filed, since the
+    reporter is usually the target's contributor (§1.2.17).
 - Account deletion (§7.3) removes the account, its sessions, and every
   contribution still attributed to it or still keyed on the device.
   Contributions the device can no longer find stay, unlinked; users are
