@@ -104,6 +104,33 @@ Two departures from the master plan's label draft follow from this:
     intent (the second identical contribution carries no new bytes). A
     second contributor registering an already-claimed `video_id` receives
     `409 SOURCE_ALREADY_CLAIMED`.
+14. **Sessions, not per-request identity tokens.** Apple's guidance is
+    to verify the identity token once and then run your own session:
+    "After verifying the identity token, your app is responsible for
+    managing the user session", and "User interaction is required any
+    time a new identity token is requested" (Apple, *Verifying a user*).
+    Identity tokens are observed to expire about ten minutes after issue
+    (Apple doesn't document the figure), and the device cannot refresh
+    them silently, so verifying them on every request would lock users
+    out minutes after sign-in. The farm verifies the identity token
+    once, at `POST /api/auth/apple`, and issues its own opaque session
+    token (§7.1). The API stays stateless in the deployment sense:
+    sessions live in Postgres, not in process memory.
+15. **Apple's refresh token is kept, encrypted, for revocation only.**
+    App Review guideline 5.1.1(v) requires in-app account deletion, and
+    apps using Sign in with Apple should revoke the user's tokens through
+    the REST API when an account is deleted. Revocation needs a refresh
+    or access token, so sign-in exchanges the authorization code and
+    stores the refresh token encrypted (§3, §7.1). Revoking it
+    invalidates "the tokens and associated user authorizations for a
+    user" (Apple, *Token revocation*), so the latest token per user is
+    enough even across devices; each sign-in replaces it. The farm does
+    **not** run Apple's optional daily refresh-token validation: Apple
+    throttles it, server-to-server notifications (§7.3) report revoked
+    consent and deleted Apple Accounts, and the client checks
+    `getCredentialState` on launch (§7.1).
+16. **Blocked users can still leave.** `is_blocked` removes contribution
+    rights, not the right to sign out or delete the account (§7.1).
 
 ## 2. Conventions
 
@@ -126,8 +153,29 @@ CREATE TABLE users (
   reputation  DOUBLE PRECISION NOT NULL DEFAULT 1.0,
   is_blocked  BOOLEAN NOT NULL DEFAULT FALSE,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  apple_refresh_token BYTEA
+  -- Apple refresh token from the sign-in code exchange (§7.1), used only
+  -- to revoke the user's authorization on account deletion (§1.2.15).
+  -- AES-256-GCM under APPLE_REFRESH_TOKEN_KEY with users.id as additional
+  -- authenticated data, stored as 12-byte nonce || ciphertext || 16-byte
+  -- tag. NULL after consent-revoked (§7.3).
 );
+
+CREATE TABLE sessions (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash   CHAR(64) NOT NULL UNIQUE CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+  -- Lowercase hex SHA-256 of the session token (§7.1). The token itself
+  -- is never stored, so a leaked table or backup yields no credentials.
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Refreshed at most once a day (§7.1), so reads don't become writes.
+  expires_at   TIMESTAMPTZ NOT NULL
+  -- Idle expiry: 90 days after last_used_at.
+);
+CREATE INDEX sessions_user_id_idx ON sessions (user_id);
+CREATE INDEX sessions_expires_at_idx ON sessions (expires_at);
 
 CREATE TABLE sources (
   id              CHAR(64) PRIMARY KEY,
@@ -293,15 +341,28 @@ Every write is keyed on a client-supplied identity, which is what makes
 re-submission idempotent. No `Idempotency-Key` header is needed; the IDs
 *are* the idempotency keys.
 
-**`users`** — identity row; immutable on the contribution path:
+**`users`** — identity row, written only at sign-in (§7.1), keyed by the
+Apple `sub`; a re-sign-in replaces only the stored Apple refresh token:
 
 ```sql
-INSERT INTO users (id) VALUES ($1)
-ON CONFLICT (id) DO NOTHING;
+INSERT INTO users (id, apple_refresh_token) VALUES ($1, $2)
+ON CONFLICT (id) DO UPDATE SET
+  apple_refresh_token = EXCLUDED.apple_refresh_token,
+  updated_at          = now()
+RETURNING is_blocked;
 ```
 
-`reputation` / `is_blocked` change only through the moderation path, never
-as a side effect of contribution.
+Contribution never writes `users`. `reputation` / `is_blocked` change only
+through the moderation path.
+
+**`sessions`** — one row per sign-in; a user may hold several (one per
+device or install). Sign-in purges expired rows, then inserts:
+
+```sql
+DELETE FROM sessions WHERE expires_at < now();
+INSERT INTO sessions (user_id, token_hash, expires_at)
+VALUES ($1, $2, now() + interval '90 days');
+```
 
 **`sources`** — full replace on re-contribution, except ownership:
 
@@ -457,19 +518,81 @@ RFC 3339 (`2026-10-06T07:30:00Z`).
 
 ### 7.1 Authentication
 
-**Client (all endpoints except the two pipeline endpoints):** Sign in with
-Apple. The client sends `Authorization: Bearer <apple-identity-token>`.
-The farm verifies the JWT on every request (stateless; Apple's JWKS
-cached): RS256 signature, `iss = https://appleid.apple.com`,
-`aud` = the app's client ID, `exp` within a small clock-skew leeway.
-The `sub` claim becomes `users.id` (upserted on first sight). Every query
-is scoped with `user_id = <sub>`; there is no cross-user access.
+**Client sessions** (every endpoint not named below). The client signs
+in once with `POST /api/auth/apple` (§7.3), the only client endpoint
+that sees Apple tokens, and receives a farm session token (§1.2.14).
+Every other client request sends `Authorization: Bearer <session token>`.
+The farm hashes the token and looks it up:
+
+```sql
+SELECT s.id, s.user_id, s.last_used_at, u.is_blocked
+FROM sessions s
+JOIN users u ON u.id = s.user_id
+WHERE s.token_hash = $1 AND s.expires_at > now();
+```
+
+No row → `401 UNAUTHENTICATED`; the client discards the token and signs
+in again. `is_blocked` → `403 ACCOUNT_BLOCKED`, except on
+`POST /api/auth/signout` and `DELETE /api/account` (§1.2.16). Otherwise
+the request runs as the session's user: every query is scoped with
+`user_id = <session user_id>`, and there is no cross-user access. When
+`last_used_at` is more than a day old, the session slides forward:
+
+```sql
+UPDATE sessions
+SET last_used_at = now(), expires_at = now() + interval '90 days'
+WHERE id = $1 AND last_used_at < now() - interval '1 day';
+```
+
+A session token is 32 bytes from a CSPRNG, base64url-encoded without
+padding (43 characters); the farm stores only its lowercase hex SHA-256
+(`sessions.token_hash`). The token carries no claims. The row is the
+source of truth, so sign-out, revoked consent, and account deletion end
+sessions immediately. Sessions expire after 90 days without use; Apple
+notes that "User sessions are long-lived on device".
 
 **Pipeline** (`POST /api/models`, `GET /api/labels/export`): pre-shared
 service key, `Authorization: Bearer <TURNIP_PIPELINE_KEY>`.
 
-Blocked users (`users.is_blocked`) receive `403 ACCOUNT_BLOCKED` on all
-endpoints.
+**Apple** (`POST /api/auth/apple/notifications`): no bearer token; the
+body is a JWT signed by Apple, verified as below.
+
+**Verifying an Apple JWT.** The identity token at sign-in, the `id_token`
+returned by the code exchange, and server-to-server notifications are
+checked the same way: RS256 signature against Apple's JWKS
+(`https://appleid.apple.com/auth/keys`; cached, key matched by `kid`,
+refetched when an unknown `kid` appears), `iss = https://appleid.apple.com`,
+`aud = APP_BUNDLE_ID`, and `exp` within a 60-second clock-skew leeway.
+Notifications carry `iat` and `jti` but no `exp`, so `exp` is required
+only on identity tokens. The farm reads only `sub` (and, for
+notifications, `events`); Apple's email claims are never stored or
+logged (§8).
+
+**Apple credentials.** The code exchange and token revocation
+authenticate the farm to Apple with `client_id = APP_BUNDLE_ID` and a
+client secret: an ES256 JWT signed with the Sign in with Apple private
+key, header `{"alg": "ES256", "kid": APPLE_KEY_ID}`, claims
+`iss = APPLE_TEAM_ID`, `sub = APP_BUNDLE_ID`,
+`aud = https://appleid.apple.com`, `iat` = now, and `exp` no more than
+six months later (Apple's limit). Configuration: `APP_BUNDLE_ID`,
+`APPLE_TEAM_ID`, `APPLE_KEY_ID`, `APPLE_PRIVATE_KEY` (the `.p8` PEM), and
+`APPLE_REFRESH_TOKEN_KEY` (32 random bytes, base64: the AES-256-GCM key
+for `users.apple_refresh_token`).
+
+**Client contract** (turnip-ios):
+
+- Per sign-in attempt, generate a random raw nonce, set
+  `ASAuthorizationAppleIDRequest.nonce` to its lowercase hex SHA-256, and
+  send the raw nonce with `identityToken` and `authorizationCode` to
+  `POST /api/auth/apple`. The code is single-use and valid for five
+  minutes, so send it right away.
+- Keep the session token in the Keychain with
+  `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, so background
+  uploads can read it and it never migrates to another device.
+- On launch, call `getCredentialState(forUserID:)`. On `.revoked` or
+  `.notFound`, call `POST /api/auth/signout`, delete the token, and show
+  the signed-out state. Also observe `credentialRevokedNotification`.
+- On any `401`, delete the token and sign in again.
 
 ### 7.2 Conventions
 
@@ -484,14 +607,127 @@ endpoints.
   (404), `NO_MODEL` (404), `VALIDATION_ERROR` (422), `UNSUPPORTED_FORMAT` (422),
   `BLOB_MISSING` (422), `BLOB_DIGEST_MISMATCH` (422),
   `SOURCE_ALREADY_CLAIMED` (409), `VERSION_EXISTS` (409),
-  `RATE_LIMITED` (429), `INTERNAL` (500).
+  `RATE_LIMITED` (429), `INTERNAL` (500), `APPLE_UNAVAILABLE` (503:
+  Apple's token or revocation endpoint is unreachable or answered 5xx;
+  retry later).
 - **Ownership privacy:** single-resource GETs return `404 NOT_FOUND`
   (not 403) when the resource exists but belongs to another user.
 - **Rate limiting:** per-user token bucket on POST endpoints
   (suggested: 60 requests/minute; `429 RATE_LIMITED` with
-  `Retry-After`).
+  `Retry-After`). `POST /api/auth/apple` has no user yet, so it is
+  limited per client IP (suggested: 10 requests/minute).
 
 ### 7.3 Endpoints
+
+#### `POST /api/auth/apple` — sign in, get a session token
+
+No session required. Request:
+
+```json
+{
+  "identity_token": "<ASAuthorizationAppleIDCredential.identityToken>",
+  "authorization_code": "<ASAuthorizationAppleIDCredential.authorizationCode>",
+  "nonce": "<raw nonce; its SHA-256 hex was set on the Apple request>"
+}
+```
+
+Behavior, in order:
+
+1. Verify `identity_token` as an Apple JWT (§7.1), and require its
+   `nonce` claim to equal the lowercase hex SHA-256 of the request's
+   `nonce`. Any failure → `401 UNAUTHENTICATED`.
+2. Exchange the code: `POST https://appleid.apple.com/auth/token`, form
+   fields `client_id`, `client_secret` (§7.1), `code`,
+   `grant_type=authorization_code` (no `redirect_uri` for a native app).
+   Apple's `invalid_grant` (code expired, already used, or revoked) →
+   `401 UNAUTHENTICATED`. Unreachable, timeout, or 5xx →
+   `503 APPLE_UNAVAILABLE`. Any other error (e.g. `invalid_client`)
+   means the farm is misconfigured → `500 INTERNAL`.
+3. Verify the response's `id_token` as an Apple JWT (§7.1); its `sub`
+   must equal the identity token's `sub`, else `401 UNAUTHENTICATED`.
+4. In one transaction: upsert the user with the encrypted
+   `refresh_token`, purge expired sessions, and insert the new session
+   (§4).
+
+A blocked user still gets a session (§1.2.16); every other endpoint
+then answers `403 ACCOUNT_BLOCKED`.
+
+Response `200`:
+
+```json
+{"session_token": "<43-char base64url>", "expires_at": "2027-01-04T07:00:00Z"}
+```
+
+#### `POST /api/auth/signout` — end this session
+
+Deletes the session whose `token_hash` matches the bearer token, if
+any. `204` whether or not a session matched, so a client can always
+sign out cleanly. Allowed for blocked users.
+
+#### `DELETE /api/account` — delete my account
+
+App Review guideline 5.1.1(v). Session required; allowed for blocked
+users. Steps, in order, so a retry after a partial failure finishes the
+job:
+
+1. If `users.apple_refresh_token` is set, decrypt it and revoke it:
+   `POST https://appleid.apple.com/auth/revoke`, form fields
+   `client_id`, `client_secret` (§7.1), `token`,
+   `token_type_hint=refresh_token`. Apple answers `200` both when it
+   revokes the token and when the token was already invalid.
+   Unreachable, timeout, or 5xx → `503 APPLE_UNAVAILABLE` with nothing
+   deleted. Any other error is logged and deletion proceeds: the user's
+   right to delete does not depend on Apple's answer.
+2. Delete the R2 blobs of all the user's sources, and any staged
+   uploads.
+3. `DELETE FROM users WHERE id = $1`. Sources, clips, labels,
+   quarantine rows, reports, and sessions cascade.
+
+Response `204`. A retry after success gets `401` (the session is gone).
+
+#### `POST /api/auth/apple/notifications` — Apple server-to-server notifications
+
+Apple posts here when a user changes their Sign in with Apple account;
+the URL is registered for the App ID in the Apple Developer account
+(§9). No session; authenticity comes from Apple's signature. Body:
+
+```json
+{"payload": "<JWT signed by Apple>"}
+```
+
+Verify `payload` as an Apple JWT (§7.1); failure → `401`. The `events`
+claim is documented as an object; parse it if it arrives as a
+JSON-encoded string instead. Apple's documented shape:
+
+```json
+{
+  "iss": "https://appleid.apple.com",
+  "aud": "<APP_BUNDLE_ID>",
+  "iat": 1508184845,
+  "jti": "abede...67890",
+  "events": {
+    "type": "consent-revoked",
+    "sub": "820417.faa325acbc78e1be1668ba852d492d8a.0219",
+    "event_time": 1508184845
+  }
+}
+```
+
+By `events.type`, for the user `events.sub`:
+
+- `consent-revoked` (the user stopped using Sign in with Apple for the
+  app): delete all their sessions and set `apple_refresh_token = NULL`
+  (Apple has already invalidated it). Contributions stay; the user can
+  sign in again, or delete the account.
+- `account-deleted` (the user deleted their Apple Account; Apple has
+  invalidated all their tokens, and they can never sign in again to
+  delete their data): run `DELETE /api/account` steps 2 and 3.
+- `email-enabled`, `email-disabled`: ignored. These events carry an
+  email address, which the farm never stores or logs.
+
+An unknown `sub` or `type` is a no-op. Response `200` once handled;
+`500` on a transient failure (e.g. R2 unreachable), since whether Apple
+redelivers is undocumented (§9).
 
 #### `POST /api/sources` — register a source, get the blob upload URL
 
@@ -809,11 +1045,18 @@ checklist:
   The `PHAsset.localIdentifier` **never leaves the device**; the farm
   sees only its SHA-256-derived digest, which it cannot reverse.
 - No Apple profile data beyond the `sub` claim: no name, no email.
+  Identity tokens and email notifications carry an email address; it is
+  discarded unread.
 - R2 keys contain only the opaque source ID
   (`poses/<video_id>.tkp1.gz`); presigned URLs are per-request,
   single-blob, short-lived.
-- Request logs must not record Apple identity tokens; error payloads
-  must not echo pose data.
+- Credentials are stored only in protected form: session tokens as
+  SHA-256 hashes, Apple refresh tokens AES-256-GCM encrypted (§3).
+- Request logs and error payloads never contain Apple identity tokens,
+  authorization codes, refresh tokens, session tokens, or pose data.
+- Account deletion (§7.3) removes the user's sources, clips, labels,
+  and pose blobs from the farm and from every later training export.
+  Models already trained on that data are not retrained.
 
 ## 9. Open questions
 
@@ -822,11 +1065,19 @@ checklist:
 2. **Reputation formula.** The master plan names `users.reputation` but
    specifies no algorithm. Training-time sampling weights and any
    contributor-facing effects need a definition before Phase 3.
-3. **Apple token verification cost.** Specified as stateless
-   per-request verification; revisit with caching if the contribution
-   endpoints get hot.
+3. **Apple token verification cost.** *Resolved:* identity tokens are
+   verified once, at sign-in; requests carry farm session tokens
+   (§1.2.14, §7.1).
 4. **R2 topology.** Bucket, region, and presigned-URL TTL policy are ops
    details not specified here (15-minute TTLs assumed above).
 5. **Taxonomy curation.** Who canonicalizes new free-text names and
    bumps `taxonomy_version` (master plan §9 Q1) — the versioning
    mechanics are specified here; the human process is not.
+6. **Apple key and secret management.** Where `APPLE_PRIVATE_KEY` and
+   `APPLE_REFRESH_TOKEN_KEY` live, and how the latter rotates. A
+   rotation needs a key ID on the stored ciphertext, which §3 does not
+   have yet. (Ops decision.)
+7. **Server-to-server notifications.** The endpoint URL must be
+   registered for the App ID in the Apple Developer account, and Apple
+   does not document redelivery. A missed `account-deleted` leaves that
+   user's data until an operator removes it. (Ops decision.)
