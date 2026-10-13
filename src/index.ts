@@ -3,6 +3,8 @@ import { startServer } from "./app";
 import { createAppleTokenVerifier, createCodeExchanger, importApplePrivateKey } from "./auth/apple";
 import { importRefreshTokenKey } from "./auth/tokens";
 import { type Config, ConfigError, loadConfig } from "./config";
+import { R2BlobStore } from "./ingest/store";
+import { createPostgresSourceStore, startIngestPoller } from "./ingest/worker";
 
 function loadConfigOrExit(): Config {
   try {
@@ -27,9 +29,10 @@ async function importApplePrivateKeyOrExit(pem: string): Promise<CryptoKey> {
 
 const config = loadConfigOrExit();
 const privateKey = await importApplePrivateKeyOrExit(config.apple.privateKeyPem);
+const sql = new SQL(config.databaseUrl);
 
 const server = startServer(config.port, {
-  sql: new SQL(config.databaseUrl),
+  sql,
   verifyIdentityToken: createAppleTokenVerifier({ audience: config.appBundleId }),
   exchangeCode: createCodeExchanger({
     credentials: {
@@ -42,3 +45,21 @@ const server = startServer(config.port, {
   refreshTokenKey: await importRefreshTokenKey(config.apple.refreshTokenKey),
 });
 console.log(`turnip-farm listening on ${server.url}`);
+
+// The ingest worker's "or poll" trigger (BACKEND_DESIGN.md §1.2.10):
+// sweep the staging prefix on an interval. Optional env override;
+// 0 disables (e.g. when R2 event notifications drive ingest instead).
+const ingestIntervalMs = parseIngestIntervalMs(process.env.INGEST_POLL_INTERVAL_MS);
+if (ingestIntervalMs > 0) {
+  startIngestPoller(
+    { store: new R2BlobStore(config.r2), sources: createPostgresSourceStore(sql) },
+    ingestIntervalMs,
+  );
+  console.log(`ingest poller running every ${ingestIntervalMs}ms`);
+}
+
+function parseIngestIntervalMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 30_000;
+  const ms = Number(raw);
+  return Number.isInteger(ms) && ms >= 0 ? ms : 30_000;
+}
