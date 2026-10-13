@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { ConfigError, DEFAULT_PORT, REQUIRED_ENV, loadConfig } from "./config";
 
+const PEM_LINES = ["-----BEGIN PRIVATE KEY-----", "MIGTAgEAMBMGByqGSM49AgEGCCqGSM49", "-----END PRIVATE KEY-----"];
+const REFRESH_KEY_BYTES = new Uint8Array(32).fill(7);
+
 const FULL_ENV = {
   DATABASE_URL: "postgres://turnip:turnip@localhost:5432/turnip",
   R2_ACCOUNT_ID: "account",
@@ -8,6 +11,11 @@ const FULL_ENV = {
   R2_SECRET_ACCESS_KEY: "secret-key",
   R2_BUCKET: "turnip",
   APP_BUNDLE_ID: "kim.hoie.turnip",
+  APPLE_TEAM_ID: "TEAM123456",
+  APPLE_KEY_ID: "KEY1234567",
+  // One line with literal \n escapes, as a .env file usually carries it.
+  APPLE_PRIVATE_KEY: PEM_LINES.join("\\n"),
+  APPLE_REFRESH_TOKEN_KEY: Buffer.from(REFRESH_KEY_BYTES).toString("base64"),
   TURNIP_PIPELINE_KEY: "pipeline-key",
 };
 
@@ -33,8 +41,19 @@ describe("loadConfig", () => {
         bucket: "turnip",
       },
       appBundleId: "kim.hoie.turnip",
+      apple: {
+        teamId: "TEAM123456",
+        keyId: "KEY1234567",
+        privateKeyPem: PEM_LINES.join("\n"),
+        refreshTokenKey: REFRESH_KEY_BYTES,
+      },
       pipelineKey: "pipeline-key",
     });
+  });
+
+  test("accepts a PEM with real newlines", () => {
+    const config = loadConfig({ ...FULL_ENV, APPLE_PRIVATE_KEY: PEM_LINES.join("\n") });
+    expect(config.apple.privateKeyPem).toBe(PEM_LINES.join("\n"));
   });
 
   test("reports every missing variable at once", () => {
@@ -59,6 +78,22 @@ describe("loadConfig", () => {
   test.each(["abc", "0", "65536", "80.5", "-1"])("rejects PORT=%p", (port) => {
     expect(problemsFor({ ...FULL_ENV, PORT: port })).toEqual([
       `PORT must be an integer between 1 and 65535 (got "${port}")`,
+    ]);
+  });
+
+  test("rejects an APPLE_PRIVATE_KEY that isn't a PKCS#8 PEM", () => {
+    expect(problemsFor({ ...FULL_ENV, APPLE_PRIVATE_KEY: "not-a-key" })).toEqual([
+      "APPLE_PRIVATE_KEY must be the PKCS#8 PEM contents of the .p8 key",
+    ]);
+  });
+
+  test.each([
+    ["too short", Buffer.alloc(16).toString("base64")],
+    ["too long", Buffer.alloc(33).toString("base64")],
+    ["not base64", "%".repeat(44)],
+  ])("rejects an APPLE_REFRESH_TOKEN_KEY that is %s", (_, key) => {
+    expect(problemsFor({ ...FULL_ENV, APPLE_REFRESH_TOKEN_KEY: key })).toEqual([
+      "APPLE_REFRESH_TOKEN_KEY must be 32 random bytes, base64-encoded",
     ]);
   });
 

@@ -1,35 +1,18 @@
-// Checks a migrated database against BACKEND_DESIGN.md §3. Runs only when
-// TEST_DATABASE_URL names one — never DATABASE_URL, which Bun loads from a
-// developer's .env. Every test runs in a transaction that is rolled back, so
-// the database is left as it was found.
+// Checks a migrated database against BACKEND_DESIGN.md §3 (with the sessions
+// and unlinking changes). Runs only when TEST_DATABASE_URL is set; see
+// db/testing.ts.
 
 import { type SavepointSQL, SQL, type TransactionSQL } from "bun";
 import { afterAll, describe, expect, test } from "bun:test";
-
-const url = process.env.TEST_DATABASE_URL;
-if (!url && process.env.CI) {
-  throw new Error("TEST_DATABASE_URL must be set in CI; the schema tests would silently skip");
-}
+import { TEST_DATABASE_URL, inRollback } from "./testing";
 
 const SOURCE_ID = "a".repeat(64);
 const DIGEST = "b".repeat(64);
+const KEY_HASH = "d".repeat(64);
 
-class Rollback extends Error {}
-
-describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
-  const sql = new SQL(url ?? "");
+describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
+  const sql = new SQL(TEST_DATABASE_URL ?? "");
   afterAll(() => sql.close());
-
-  async function inRollback(fn: (tx: TransactionSQL) => Promise<void>): Promise<void> {
-    try {
-      await sql.begin(async (tx) => {
-        await fn(tx);
-        throw new Rollback();
-      });
-    } catch (err) {
-      if (!(err instanceof Rollback)) throw err;
-    }
-  }
 
   // Runs one statement under a savepoint and returns the name of the
   // constraint it violated (undefined if it succeeded), leaving the
@@ -47,12 +30,11 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
     }
   }
 
-  // A user owning one source with one clip; returns the clip ID.
+  // One source with one clip; returns the clip ID.
   async function insertClip(tx: TransactionSQL): Promise<string> {
-    await tx`INSERT INTO users (id) VALUES ('user-1')`;
     await tx`
-      INSERT INTO sources (id, user_id, frame_count, sample_rate, r2_key)
-      VALUES (${SOURCE_ID}, 'user-1', 600, 30, ${`poses/${SOURCE_ID}.tkp1.gz`})`;
+      INSERT INTO sources (id, source_key_hash, frame_count, sample_rate, r2_key)
+      VALUES (${SOURCE_ID}, ${KEY_HASH}, 600, 30, ${`poses/${SOURCE_ID}.tkp1.gz`})`;
     const [clip] = await tx`
       INSERT INTO clips (source_id, start_frame, end_frame)
       VALUES (${SOURCE_ID}, 120, 175)
@@ -73,6 +55,8 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
       "models",
       "reports",
       "schema_migrations", // dbmate's applied-version ledger
+      "sessions",
+      "source_attribution",
       "sources",
       "users",
     ]);
@@ -98,10 +82,25 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
       "CREATE UNIQUE INDEX models_version_key ON public.models USING btree (version)",
       "CREATE UNIQUE INDEX reports_pkey ON public.reports USING btree (id)",
       "CREATE INDEX reports_status_idx ON public.reports USING btree (status, created_at) WHERE (status = 'open'::text)",
+      "CREATE INDEX sessions_expires_at_idx ON public.sessions USING btree (expires_at)",
+      "CREATE UNIQUE INDEX sessions_pkey ON public.sessions USING btree (id)",
+      "CREATE UNIQUE INDEX sessions_token_hash_key ON public.sessions USING btree (token_hash)",
+      "CREATE INDEX sessions_user_id_idx ON public.sessions USING btree (user_id)",
+      "CREATE INDEX source_attribution_attributed_at_idx ON public.source_attribution USING btree (attributed_at)",
+      "CREATE UNIQUE INDEX source_attribution_pkey ON public.source_attribution USING btree (source_id)",
+      "CREATE INDEX source_attribution_user_id_idx ON public.source_attribution USING btree (user_id)",
       "CREATE UNIQUE INDEX sources_pkey ON public.sources USING btree (id)",
-      "CREATE INDEX sources_user_id_idx ON public.sources USING btree (user_id)",
       "CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id)",
     ]);
+  });
+
+  test("contributions carry no account column (§1.2.17)", async () => {
+    const rows = await sql`
+      SELECT table_name || '.' || column_name AS col FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name IN ('sources', 'data_quarantine')
+        AND column_name IN ('user_id', 'source_key_hash')
+      ORDER BY 1`;
+    expect(rows.map((r: { col: string }) => r.col)).toEqual(["sources.source_key_hash"]);
   });
 
   test("seeds taxonomy version 1, so the current version is always defined (§1.2.8)", async () => {
@@ -112,15 +111,16 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
     expect(canonical).toBe("cork");
   });
 
-  test("sources: hex IDs and digests, NULL digest until ingest", async () => {
-    await inRollback(async (tx) => {
+  test("sources: hex IDs, key hashes, and digests, NULL digest until ingest", async () => {
+    await inRollback(sql, async (tx) => {
       await insertClip(tx);
-      const insert = (id: string, sha256: string | null) => (sp: SavepointSQL) =>
-        sp`INSERT INTO sources (id, user_id, frame_count, sample_rate, r2_key, sha256)
-           VALUES (${id}, 'user-1', 600, 10, 'k', ${sha256})`;
+      const insert = (id: string, sha256: string | null, keyHash = KEY_HASH) => (sp: SavepointSQL) =>
+        sp`INSERT INTO sources (id, source_key_hash, frame_count, sample_rate, r2_key, sha256)
+           VALUES (${id}, ${keyHash}, 600, 10, 'k', ${sha256})`;
       expect(await violation(tx, insert("A".repeat(64), null))).toBe("sources_id_hex");
       expect(await violation(tx, insert("c".repeat(63), null))).toBe("sources_id_hex");
       expect(await violation(tx, insert("c".repeat(64), "B".repeat(64)))).toBe("sources_sha_hex");
+      expect(await violation(tx, insert("c".repeat(64), null, "D".repeat(64)))).toBe("sources_source_key_hash_check");
       expect(await violation(tx, insert("c".repeat(64), DIGEST))).toBeUndefined();
 
       const [source] = await tx`SELECT sha256, keypoint_format FROM sources WHERE id = ${SOURCE_ID}`;
@@ -129,7 +129,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("clips: windows are non-empty and start at frame 0 or later", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       await insertClip(tx);
       const insert = (start: number, end: number) => (sp: SavepointSQL) =>
         sp`INSERT INTO clips (source_id, start_frame, end_frame) VALUES (${SOURCE_ID}, ${start}, ${end})`;
@@ -140,7 +140,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("labels: one row per case-insensitive trick name per clip, stored trimmed (§1.2.12)", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       const clipId = await insertClip(tx);
       const insert = (name: string) => (sp: SavepointSQL) =>
         sp`INSERT INTO labels (clip_id, trick_name, taxonomy_version) VALUES (${clipId}, ${name}, 1)`;
@@ -156,7 +156,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("models: versions are unique and the artifact digest is hex", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       const insert = (version: string, sha256: string, modelType = "trick-detection") =>
         (sp: SavepointSQL) =>
           sp`INSERT INTO models (version, model_type, taxonomy_version, r2_key, sha256)
@@ -172,10 +172,10 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("data_quarantine: one open quarantine per source; resolution set with resolved_at (§1.2.4)", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       await insertClip(tx);
       const quarantine = (sp: SavepointSQL) =>
-        sp`INSERT INTO data_quarantine (source_id, user_id, reason) VALUES (${SOURCE_ID}, 'user-1', 'regression')`;
+        sp`INSERT INTO data_quarantine (source_id, reason) VALUES (${SOURCE_ID}, 'regression')`;
       expect(await violation(tx, quarantine)).toBeUndefined();
       expect(await violation(tx, quarantine)).toBe("data_quarantine_open_uniq");
 
@@ -193,7 +193,7 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
   });
 
   test("reports: target types are constrained and new reports are open", async () => {
-    await inRollback(async (tx) => {
+    await inRollback(sql, async (tx) => {
       await tx`INSERT INTO users (id) VALUES ('user-1')`;
       const insert = (targetType: string) => (sp: SavepointSQL) =>
         sp`INSERT INTO reports (reporter_user_id, target_type, target_id, reason)
@@ -206,20 +206,53 @@ describe.skipIf(!url)("schema (BACKEND_DESIGN.md §3)", () => {
     });
   });
 
-  test("deleting a user cascades to sources, clips, labels, and quarantine rows", async () => {
-    await inRollback(async (tx) => {
+  test("sessions: one row per hashed token", async () => {
+    await inRollback(sql, async (tx) => {
+      await tx`INSERT INTO users (id) VALUES ('user-1')`;
+      const insert = (tokenHash: string) => (sp: SavepointSQL) =>
+        sp`INSERT INTO sessions (user_id, token_hash, expires_at)
+           VALUES ('user-1', ${tokenHash}, now() + interval '90 days')`;
+      expect(await violation(tx, insert(KEY_HASH))).toBeUndefined();
+      expect(await violation(tx, insert(KEY_HASH))).toBe("sessions_token_hash_key");
+      expect(await violation(tx, insert("not-hex"))).toBe("sessions_token_hash_check");
+    });
+  });
+
+  test("deleting a source cascades to clips, labels, quarantine rows, and attribution", async () => {
+    await inRollback(sql, async (tx) => {
       const clipId = await insertClip(tx);
+      await tx`INSERT INTO users (id) VALUES ('user-1')`;
       await tx`INSERT INTO labels (clip_id, trick_name, taxonomy_version) VALUES (${clipId}, 'cork', 1)`;
-      await tx`INSERT INTO data_quarantine (source_id, user_id, reason) VALUES (${SOURCE_ID}, 'user-1', 'regression')`;
+      await tx`INSERT INTO data_quarantine (source_id, reason) VALUES (${SOURCE_ID}, 'regression')`;
+      await tx`INSERT INTO source_attribution (source_id, user_id) VALUES (${SOURCE_ID}, 'user-1')`;
+
+      await tx`DELETE FROM sources WHERE id = ${SOURCE_ID}`;
+
+      const [counts] = await tx`
+        SELECT (SELECT count(*) FROM clips WHERE id = ${clipId})::int                         AS clips,
+               (SELECT count(*) FROM labels WHERE clip_id = ${clipId})::int                   AS labels,
+               (SELECT count(*) FROM data_quarantine WHERE source_id = ${SOURCE_ID})::int     AS quarantine,
+               (SELECT count(*) FROM source_attribution WHERE source_id = ${SOURCE_ID})::int  AS attribution`;
+      expect(counts).toEqual({ clips: 0, labels: 0, quarantine: 0, attribution: 0 });
+    });
+  });
+
+  test("deleting a user cascades to sessions, attribution, and reports, but not to sources", async () => {
+    await inRollback(sql, async (tx) => {
+      await insertClip(tx);
+      await tx`INSERT INTO users (id) VALUES ('user-1')`;
+      await tx`INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ('user-1', ${KEY_HASH}, now() + interval '1 day')`;
+      await tx`INSERT INTO source_attribution (source_id, user_id) VALUES (${SOURCE_ID}, 'user-1')`;
+      await tx`INSERT INTO reports (reporter_user_id, target_type, target_id, reason) VALUES ('user-1', 'source', ${SOURCE_ID}, 'r')`;
 
       await tx`DELETE FROM users WHERE id = 'user-1'`;
 
       const [counts] = await tx`
-        SELECT (SELECT count(*) FROM sources WHERE id = ${SOURCE_ID})::int                AS sources,
-               (SELECT count(*) FROM clips WHERE id = ${clipId})::int                     AS clips,
-               (SELECT count(*) FROM labels WHERE clip_id = ${clipId})::int               AS labels,
-               (SELECT count(*) FROM data_quarantine WHERE source_id = ${SOURCE_ID})::int AS quarantine`;
-      expect(counts).toEqual({ sources: 0, clips: 0, labels: 0, quarantine: 0 });
+        SELECT (SELECT count(*) FROM sessions WHERE user_id = 'user-1')::int                 AS sessions,
+               (SELECT count(*) FROM source_attribution WHERE user_id = 'user-1')::int       AS attribution,
+               (SELECT count(*) FROM reports WHERE reporter_user_id = 'user-1')::int         AS reports,
+               (SELECT count(*) FROM sources WHERE id = ${SOURCE_ID})::int                   AS sources`;
+      expect(counts).toEqual({ sessions: 0, attribution: 0, reports: 0, sources: 1 });
     });
   });
 });

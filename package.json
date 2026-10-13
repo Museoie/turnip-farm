@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "db:migrate": "dbmate --no-dump-schema migrate",
+    "db:rollback": "dbmate --no-dump-schema rollback",
     "db:status": "dbmate status",
     "db:new": "dbmate new"
   },
@@ -18,5 +19,8 @@
     "@types/bun": "^1.4.2",
     "dbmate": "2.36.0",
     "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "jose": "^6.2.12"
   }
 }

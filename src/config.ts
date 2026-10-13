@@ -11,8 +11,17 @@ export interface Config {
     secretAccessKey: string;
     bucket: string;
   };
-  // Sign in with Apple `aud` claim (BACKEND_DESIGN.md §7.1).
+  // Sign in with Apple `aud` claim and client_id (BACKEND_DESIGN.md §7.1).
   appBundleId: string;
+  // The farm's Sign in with Apple credentials (BACKEND_DESIGN.md §7.1).
+  apple: {
+    teamId: string;
+    keyId: string;
+    // PKCS#8 PEM of the .p8 key; imported (and fully validated) at startup.
+    privateKeyPem: string;
+    // AES-256-GCM key for users.apple_refresh_token: exactly 32 bytes.
+    refreshTokenKey: Uint8Array<ArrayBuffer>;
+  };
   // Service key for the pipeline endpoints (BACKEND_DESIGN.md §7.1).
   pipelineKey: string;
 }
@@ -24,6 +33,10 @@ export const REQUIRED_ENV = [
   "R2_SECRET_ACCESS_KEY",
   "R2_BUCKET",
   "APP_BUNDLE_ID",
+  "APPLE_TEAM_ID",
+  "APPLE_KEY_ID",
+  "APPLE_PRIVATE_KEY",
+  "APPLE_REFRESH_TOKEN_KEY",
   "TURNIP_PIPELINE_KEY",
 ] as const;
 
@@ -56,7 +69,20 @@ export function loadConfig(env: Env): Config {
     problems.push(`PORT must be an integer between 1 and 65535 (got "${env.PORT}")`);
   }
 
-  if (problems.length > 0 || port === null) throw new ConfigError(problems);
+  // .env files often carry the PEM on one line with literal \n escapes.
+  const privateKeyPem = required.APPLE_PRIVATE_KEY?.replaceAll("\\n", "\n").trim();
+  if (privateKeyPem !== undefined && !privateKeyPem.startsWith("-----BEGIN PRIVATE KEY-----")) {
+    problems.push("APPLE_PRIVATE_KEY must be the PKCS#8 PEM contents of the .p8 key");
+  }
+
+  const refreshTokenKey = parseKey(required.APPLE_REFRESH_TOKEN_KEY);
+  if (required.APPLE_REFRESH_TOKEN_KEY !== undefined && refreshTokenKey === null) {
+    problems.push("APPLE_REFRESH_TOKEN_KEY must be 32 random bytes, base64-encoded");
+  }
+
+  if (problems.length > 0 || port === null || privateKeyPem === undefined || refreshTokenKey === null) {
+    throw new ConfigError(problems);
+  }
 
   return {
     port,
@@ -68,8 +94,20 @@ export function loadConfig(env: Env): Config {
       bucket: required.R2_BUCKET,
     },
     appBundleId: required.APP_BUNDLE_ID,
+    apple: {
+      teamId: required.APPLE_TEAM_ID,
+      keyId: required.APPLE_KEY_ID,
+      privateKeyPem,
+      refreshTokenKey,
+    },
     pipelineKey: required.TURNIP_PIPELINE_KEY,
   };
+}
+
+function parseKey(raw: string | undefined): Uint8Array<ArrayBuffer> | null {
+  if (raw === undefined || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw.trim())) return null;
+  const bytes = Buffer.from(raw.trim(), "base64");
+  return bytes.length === 32 ? new Uint8Array(bytes) : null;
 }
 
 function parsePort(raw: string | undefined): number | null {
