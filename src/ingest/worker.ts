@@ -12,7 +12,7 @@
 //   4. Delete the staged object (best-effort; a failed delete is retried by
 //      the next poll — re-ingest is byte-identical, hence idempotent).
 //
-// Failure promise (issue #17): a failed ingest leaves `sources.sha256`
+// Failure promise: a failed ingest leaves `sources.sha256`
 // NULL (untouched on re-ingest) and stores no partial blob at `r2_key`.
 // The client keeps polling `blob_present`; clip submission answers
 // `422 BLOB_MISSING` until ingest completes. A digest of the as-sent
@@ -149,7 +149,7 @@ export async function pollStagingOnce(deps: IngestDeps): Promise<PollSummary> {
   return summary;
 }
 
-// The "or poll" trigger (issue #17): runs pollStagingOnce immediately and
+// The "or poll" trigger: runs pollStagingOnce immediately and
 // then every intervalMs. Returns a stop function for tests and shutdown.
 export function startIngestPoller(deps: IngestDeps, intervalMs: number): () => void {
   const tick = async (): Promise<void> => {

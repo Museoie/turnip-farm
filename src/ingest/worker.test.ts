@@ -1,4 +1,4 @@
-// Acceptance tests for the ingest worker (turnip-farm#17): the staged
+// Acceptance tests for the ingest worker: the staged
 // upload becomes the canonical blob, or the ingest fails cleanly.
 import { SQL } from "bun";
 import { describe, expect, test } from "bun:test";
@@ -140,6 +140,28 @@ describe("ingestStagedSource", () => {
     expect(sources.rows.get(ID_A)!.sha256).toBeNull();
     expect(await store.get(canonicalKeyFor(ID_A))).toBeNull();
     // The poisoned staged object is left for inspection / retry.
+    expect(await store.get(stagingKeyFor(ID_A))).not.toBeNull();
+  });
+
+  test("failed R2 PUT → sha256 stays NULL, no partial blob at r2_key", async () => {
+    // Guards the ordering contract: the canonical PUT must commit before
+    // sources.sha256 does. If a future edit commits the digest first, this
+    // test fails on the sha256 assertion below.
+    class FailingPutStore extends InMemoryBlobStore {
+      override async put(_key: string, _bytes: Uint8Array<ArrayBuffer>): Promise<void> {
+        throw new Error("r2 unavailable");
+      }
+    }
+    const store = new FailingPutStore();
+    const sources = new FakeSourceStore();
+    const d: IngestDeps = { store, sources };
+    sources.add(ID_A);
+    stage(store, ID_A, makeBlob(5, 10), true);
+
+    await expect(ingestStagedSource(d, ID_A)).rejects.toThrow(/r2 unavailable/);
+    expect(sources.rows.get(ID_A)!.sha256).toBeNull();
+    expect(await store.get(canonicalKeyFor(ID_A))).toBeNull();
+    // The staged object is left for retry on the next poll.
     expect(await store.get(stagingKeyFor(ID_A))).not.toBeNull();
   });
 
