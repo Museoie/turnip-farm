@@ -3,8 +3,11 @@ import { startServer } from "./app";
 import { createAppleTokenVerifier, createCodeExchanger, importApplePrivateKey } from "./auth/apple";
 import { importRefreshTokenKey } from "./auth/tokens";
 import { type Config, ConfigError, loadConfig } from "./config";
+import { purgeExpiredAttribution } from "./contrib/purge";
 import { R2BlobStore } from "./ingest/store";
 import { createPostgresSourceStore, startIngestPoller } from "./ingest/worker";
+import { createR2Client } from "./r2/client";
+import { TokenBucket } from "./ratelimit";
 
 function loadConfigOrExit(): Config {
   try {
@@ -31,6 +34,15 @@ const config = loadConfigOrExit();
 const privateKey = await importApplePrivateKeyOrExit(config.apple.privateKeyPem);
 const sql = new SQL(config.databaseUrl);
 
+// 30-day attribution/report purge (§1.2.17, §4): at startup and hourly.
+// Failures are logged, never fatal: a late purge never extends the link
+// because every attribution read also filters the 30-day window.
+const purge = () =>
+  purgeExpiredAttribution(sql).catch((err) => console.error("attribution purge failed:", err));
+await purge();
+const purgeTimer = setInterval(purge, 60 * 60 * 1000);
+purgeTimer.unref?.();
+
 const server = startServer(config.port, {
   sql,
   verifyIdentityToken: createAppleTokenVerifier({ audience: config.appBundleId }),
@@ -43,6 +55,12 @@ const server = startServer(config.port, {
     },
   }),
   refreshTokenKey: await importRefreshTokenKey(config.apple.refreshTokenKey),
+  r2: createR2Client(config.r2),
+  limits: {
+    // §7.2 suggestions: 60/min per user on POSTs, 10/min per IP on sign-in.
+    user: new TokenBucket(60, 60),
+    ip: new TokenBucket(10, 10),
+  },
 });
 console.log(`turnip-farm listening on ${server.url}`);
 
