@@ -1,6 +1,6 @@
 import { SQL } from "bun";
 import { startServer } from "./app";
-import { createAppleTokenVerifier, createCodeExchanger, importApplePrivateKey } from "./auth/apple";
+import { createAppleJwtVerifier, createAppleRevoker, createAppleTokenVerifier, createCodeExchanger, importApplePrivateKey } from "./auth/apple";
 import { importRefreshTokenKey } from "./auth/tokens";
 import { type Config, ConfigError, loadConfig } from "./config";
 import { purgeExpiredAttribution } from "./contrib/purge";
@@ -34,6 +34,15 @@ const config = loadConfigOrExit();
 const privateKey = await importApplePrivateKeyOrExit(config.apple.privateKeyPem);
 const sql = new SQL(config.databaseUrl);
 
+// The farm's Sign in with Apple credentials: the code exchange and the
+// token revocation authenticate with the same client secret (§7.1).
+const appleCredentials = {
+  teamId: config.apple.teamId,
+  keyId: config.apple.keyId,
+  clientId: config.appBundleId,
+  privateKey,
+};
+
 // 30-day attribution/report purge (§1.2.17, §4): at startup and hourly.
 // Failures are logged, never fatal: a late purge never extends the link
 // because every attribution read also filters the 30-day window.
@@ -46,14 +55,10 @@ purgeTimer.unref?.();
 const server = startServer(config.port, {
   sql,
   verifyIdentityToken: createAppleTokenVerifier({ audience: config.appBundleId }),
-  exchangeCode: createCodeExchanger({
-    credentials: {
-      teamId: config.apple.teamId,
-      keyId: config.apple.keyId,
-      clientId: config.appBundleId,
-      privateKey,
-    },
-  }),
+  exchangeCode: createCodeExchanger({ credentials: appleCredentials }),
+  // Server-to-server notifications carry no `exp` (§7.1).
+  verifyNotificationPayload: createAppleJwtVerifier({ audience: config.appBundleId, requireExp: false }),
+  revokeRefreshToken: createAppleRevoker({ credentials: appleCredentials }),
   refreshTokenKey: await importRefreshTokenKey(config.apple.refreshTokenKey),
   r2: createR2Client(config.r2),
   limits: {

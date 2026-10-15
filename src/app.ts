@@ -3,6 +3,8 @@
 // ephemeral port, without loading config.
 
 import { type SignInDeps, handleSignIn, handleSignOut } from "./auth/sessions";
+import { handleDeleteAccount } from "./auth/account";
+import { handleAppleNotifications } from "./auth/notifications";
 import {
   handleDeleteSource,
   handleGetSource,
@@ -21,9 +23,14 @@ export interface RateLimits {
   ip: TokenBucket;
 }
 
+import { type RevokeRefreshToken, type VerifyAppleJwt } from "./auth/apple";
+
 export type AppDeps = SignInDeps & {
   r2: R2Client;
   limits: RateLimits;
+  /** Apple JWT verifier without the `exp` requirement, for server-to-server notifications (§7.1). */
+  verifyNotificationPayload: VerifyAppleJwt;
+  revokeRefreshToken: RevokeRefreshToken;
 };
 
 export function createHandler(deps: AppDeps): (req: Request) => Promise<Response> {
@@ -38,6 +45,12 @@ export function createHandler(deps: AppDeps): (req: Request) => Promise<Response
       if (method === "POST" && seg.length === 3 && seg[1] === "auth") {
         if (seg[2] === "apple") return handleSignIn(req, deps);
         if (seg[2] === "signout") return handleSignOut(req, deps);
+      }
+      if (method === "POST" && seg.length === 4 && seg[1] === "auth" && seg[2] === "apple" && seg[3] === "notifications") {
+        return handleAppleNotifications(req, deps);
+      }
+      if (method === "DELETE" && seg.length === 2 && seg[1] === "account") {
+        return handleDeleteAccount(req, deps);
       }
       if (seg[1] === "sources") {
         if (method === "POST" && seg.length === 2) return handleRegisterSource(req, deps);

@@ -24,6 +24,8 @@ const deps: AppDeps = {
   sql: noDatabase,
   verifyIdentityToken: () => Promise.reject(new Error("verifier unavailable in this test")),
   exchangeCode: () => Promise.reject(new Error("Apple unavailable in this test")),
+  verifyNotificationPayload: () => Promise.reject(new Error("notification verifier unavailable in this test")),
+  revokeRefreshToken: () => Promise.reject(new Error("revoker unavailable in this test")),
   refreshTokenKey: {} as CryptoKey,
   r2: noR2,
   limits: { user: new TokenBucket(1000, 60000), ip: new TokenBucket(1000, 60000) },
@@ -85,10 +87,38 @@ describe("createHandler routing", () => {
       ["GET", "/api/clips"],
       ["GET", "/api/clips/abc/labels"],
       ["DELETE", "/api/clips/abc/labels"],
+      ["GET", "/api/account"],
+      ["POST", "/api/account"],
+      ["GET", "/api/auth/apple/notifications"],
     ] as const) {
       const res = await handle(request(method, path));
       expect(res.status).toBe(404);
     }
+  });
+
+  test("DELETE /api/account reaches the session-guarded handler (401 before any DB touch)", async () => {
+    const res = await handle(request("DELETE", "/api/account"));
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("UNAUTHENTICATED");
+  });
+
+  test("POST /api/auth/apple/notifications reaches the notification handler", async () => {
+    // A rejecting verifier becomes a 401 in the handler — the point is the
+    // route dispatched past 404.
+    const { InvalidTokenError } = await import("./auth/apple");
+    const handleHere = createHandler({
+      ...deps,
+      verifyNotificationPayload: () => Promise.reject(new InvalidTokenError()),
+    });
+    const res = await handleHere(
+      new Request("http://farm.test/api/auth/apple/notifications", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ payload: "x" }),
+      }),
+    );
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("UNAUTHENTICATED");
   });
 });
 

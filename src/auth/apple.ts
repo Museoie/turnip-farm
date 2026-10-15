@@ -1,7 +1,7 @@
 // Talking to Sign in with Apple (BACKEND_DESIGN.md §7.1): verifying Apple's
 // JWTs, and exchanging an authorization code for Apple's tokens.
 
-import { SignJWT, createRemoteJWKSet, errors, importPKCS8, jwtVerify } from "jose";
+import { SignJWT, createRemoteJWKSet, errors, importPKCS8, jwtVerify, type JWTPayload } from "jose";
 
 export const APPLE_ISSUER = "https://appleid.apple.com";
 export const APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys";
@@ -53,34 +53,54 @@ const TOKEN_FAULTS = [
   errors.JOSENotSupported,
 ];
 
-export function createAppleTokenVerifier({
-  audience,
-  jwksUrl = APPLE_JWKS_URL,
-}: {
+export type VerifyAppleJwt = (token: string) => Promise<JWTPayload>;
+
+export interface AppleJwtOptions {
   // The iOS app bundle ID (APP_BUNDLE_ID).
   audience: string;
   jwksUrl?: string | URL;
-}): VerifyIdentityToken {
+  // Identity tokens must carry `exp`; server-to-server notifications carry
+  // `iat`/`jti` but no `exp` (§7.1). A present `exp` is always validated.
+  requireExp?: boolean;
+}
+
+// Verifies an Apple JWT the §7.1 way — RS256 against Apple's JWKS, iss, aud —
+// and returns its payload. A malformed, forged, or expired token throws
+// InvalidTokenError; anything else, such as the JWKS being unreachable,
+// throws, so callers can answer 500 instead of blaming the token.
+export function createAppleJwtVerifier({
+  audience,
+  jwksUrl = APPLE_JWKS_URL,
+  requireExp = true,
+}: AppleJwtOptions): VerifyAppleJwt {
   // Fetched on first use and cached; refetched (rate-limited) when a token
   // names a `kid` the cache doesn't have, so Apple's key rotation is picked up.
   const keys = createRemoteJWKSet(new URL(jwksUrl));
 
   return async (token) => {
-    let claims: { sub?: unknown; nonce?: unknown };
+    let payload: JWTPayload;
     try {
-      ({ payload: claims } = await jwtVerify(token, keys, {
+      ({ payload } = await jwtVerify(token, keys, {
         issuer: APPLE_ISSUER,
         audience,
         algorithms: ["RS256"],
         clockTolerance: CLOCK_TOLERANCE_SECONDS,
-        requiredClaims: ["sub", "exp"],
+        requiredClaims: requireExp ? ["sub", "exp"] : ["sub"],
       }));
     } catch (err) {
       if (TOKEN_FAULTS.some((fault) => err instanceof fault)) throw new InvalidTokenError();
       throw err;
     }
-    if (typeof claims.sub !== "string" || claims.sub === "") throw new InvalidTokenError();
-    return { sub: claims.sub, nonce: typeof claims.nonce === "string" ? claims.nonce : undefined };
+    if (typeof payload.sub !== "string" || payload.sub === "") throw new InvalidTokenError();
+    return payload;
+  };
+}
+
+export function createAppleTokenVerifier(opts: AppleJwtOptions): VerifyIdentityToken {
+  const verify = createAppleJwtVerifier(opts);
+  return async (token) => {
+    const payload = await verify(token);
+    return { sub: payload.sub as string, nonce: typeof payload.nonce === "string" ? payload.nonce : undefined };
   };
 }
 
@@ -155,5 +175,45 @@ export function createCodeExchanger({
       throw new Error("Apple's token response lacks id_token or refresh_token");
     }
     return { idToken: body.id_token, refreshToken: body.refresh_token };
+  };
+}
+
+export const APPLE_REVOKE_URL = "https://appleid.apple.com/auth/revoke";
+
+// Revokes an Apple refresh token (BACKEND_DESIGN.md §1.2.15, §7.3): the
+// farm's ES256 client secret goes with the token. Apple answers 200 both
+// when it revokes the token and when the token was already invalid.
+// Unreachable, timeout, or 5xx throws AppleUnavailableError — the caller
+// answers 503 with nothing deleted. Any other answer throws Error: the
+// caller logs it and deletes the account anyway, since the user's right
+// to delete does not depend on Apple's answer.
+export type RevokeRefreshToken = (refreshToken: string) => Promise<void>;
+
+export function createAppleRevoker({
+  credentials,
+  revokeUrl = APPLE_REVOKE_URL,
+  timeoutMs = 10_000,
+}: {
+  credentials: AppleCredentials;
+  revokeUrl?: string | URL;
+  timeoutMs?: number;
+}): RevokeRefreshToken {
+  return async (refreshToken) => {
+    const form = new URLSearchParams({
+      client_id: credentials.clientId,
+      client_secret: await mintClientSecret(credentials),
+      token: refreshToken,
+      token_type_hint: "refresh_token",
+    });
+
+    let res: Response;
+    try {
+      res = await fetch(revokeUrl, { method: "POST", body: form, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (err) {
+      throw new AppleUnavailableError("Apple's revoke endpoint is unreachable", { cause: err });
+    }
+    if (res.status >= 500) throw new AppleUnavailableError(`Apple's revoke endpoint answered ${res.status}`);
+    if (!res.ok) throw new Error(`Apple's revoke endpoint answered ${res.status}`);
+    await res.arrayBuffer().catch(() => {});
   };
 }
