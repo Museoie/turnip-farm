@@ -103,7 +103,7 @@ export async function handleRegisterSource(req: Request, deps: SourcesDeps): Pro
     return errorResponse(409, "SOURCE_ALREADY_CLAIMED", "This source is already claimed under another key");
   }
 
-  // Cross-PR contract with the ingest worker (#17): the presigned upload
+  // Cross-PR contract with the ingest worker: the presigned upload
   // URL MUST target the staging key it polls.
   const upload = deps.r2.presignPut(stagingKeyFor(videoId));
   return Response.json(
@@ -222,9 +222,10 @@ export async function handleDeleteSource(
   const keyHash = sourceKeyHash(req);
   if (keyHash === null) return notFound();
 
-  // R2 first, then the row (§7.3 DELETE /api/account order): a failed blob
-  // delete leaves everything intact for retry, never a row pointing at a
-  // deleted blob.
+  // R2 first, then the row (§7.3 DELETE /api/account order): if either
+  // delete throws, the source row survives so the client can retry the
+  // whole delete — DELETE is idempotent, so the retry deletes both blobs
+  // and then the row.
   const [source] = await deps.sql`
     SELECT r2_key FROM sources
     WHERE id = ${sourceId} AND source_key_hash = ${keyHash}`;

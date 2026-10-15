@@ -2,15 +2,23 @@
 // Batch and single-clip writes converge on one primitive: replace the
 // label set of a clip, inside the same transaction as the clip upserts,
 // so a batch is all-or-nothing (§5). Blob verification is per distinct
-// source in the batch (§1.2.10): NULL digest → 422 BLOB_MISSING, digest
-// mismatch against the stored bytes → 422 BLOB_DIGEST_MISMATCH.
+// source in the batch (§1.2.10) and runs BEFORE the transaction: the R2
+// fetch is network I/O that must not hold a DB connection, and it is
+// hard-capped at MAX_CANONICAL_BLOB_BYTES so one hostile blob can't
+// exhaust the farm process's memory. NULL digest → 422 BLOB_MISSING, digest
+// mismatch against the stored bytes → 422 BLOB_DIGEST_MISMATCH, blob over
+// the cap → 422 BLOB_TOO_LARGE.
 
 import type { SQL } from "bun";
 import { sha256Hex } from "../auth/tokens";
 import { authenticateClient } from "../auth/sessions";
 import { transaction } from "../db";
 import { errorResponse } from "../errors";
-import type { R2Client } from "../r2/client";
+import {
+  BlobTooLargeError,
+  MAX_CANONICAL_BLOB_BYTES,
+  type R2Client,
+} from "../r2/client";
 import type { RateLimits } from "../app";
 import { dedupeLabelNames, isSourceKey, isUuid, isVideoId, readJsonObject } from "./validate";
 
@@ -116,52 +124,81 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
     inputs.push(clip!);
   }
 
+  // 1. Sources exist and keys match; existing clips stay on their source.
+  //    Read-only and outside any transaction: step 3 fetches blob bytes over
+  //    the network, and that I/O must not hold a DB connection.
+  const sources = new Map<string, { frame_count: number; sha256: string | null; r2_key: string }>();
+  for (const clip of inputs) {
+    let s = sources.get(clip.source_id);
+    if (!s) {
+      const [row] = await deps.sql`
+        SELECT frame_count, sha256, r2_key, source_key_hash FROM sources
+        WHERE id = ${clip.source_id}`;
+      if (!row || row.source_key_hash !== sha256Hex(clip.source_key)) {
+        return notFound();
+      }
+      s = { frame_count: row.frame_count as number, sha256: row.sha256 as string | null, r2_key: row.r2_key as string };
+      sources.set(clip.source_id, s);
+    }
+    const [existing] = await deps.sql`SELECT source_id FROM clips WHERE id = ${clip.clip_id}`;
+    if (existing && existing.source_id !== clip.source_id) {
+      return notFound();
+    }
+  }
+
+  // 2. Frame windows are validated against the source's canonical count.
+  for (let i = 0; i < inputs.length; i++) {
+    const clip = inputs[i]!;
+    const frameCount = sources.get(clip.source_id)!.frame_count;
+    if (!(clip.start_frame < clip.end_frame && clip.end_frame <= frameCount)) {
+      return errorResponse(422, "VALIDATION_ERROR", `clips[${i}]: end_frame must be > start_frame and <= source frame_count (${frameCount})`, {
+        details: { index: i, field: "end_frame" },
+      });
+    }
+  }
+
+  // 3. Blob verification, once per distinct source (§1.2.10), still outside
+  //    the transaction. The fetch is bounded at MAX_CANONICAL_BLOB_BYTES
+  //    (POSE_FORMAT.md §8 sizing): a key-holding contributor can PUT an
+  //    arbitrarily large blob to their presigned staging URL, so an
+  //    unbounded buffer here would let one hostile blob exhaust the farm
+  //    process's memory while holding a DB connection.
+  for (const [sourceId, s] of sources) {
+    if (s.sha256 === null) {
+      return errorResponse(422, "BLOB_MISSING", `source ${sourceId}: blob not ingested yet`, { details: {} });
+    }
+    let bytes: Uint8Array | null;
+    try {
+      bytes = await deps.r2.getBytes(s.r2_key);
+    } catch (e) {
+      if (e instanceof BlobTooLargeError) {
+        return errorResponse(422, "BLOB_TOO_LARGE", `source ${sourceId}: blob exceeds ${MAX_CANONICAL_BLOB_BYTES} bytes`, { details: {} });
+      }
+      throw e;
+    }
+    if (bytes === null) {
+      return errorResponse(422, "BLOB_MISSING", `source ${sourceId}: blob not found at ${s.r2_key}`, { details: {} });
+    }
+    if (sha256HexBytes(bytes) !== s.sha256) {
+      return errorResponse(422, "BLOB_DIGEST_MISMATCH", `source ${sourceId}: stored blob digest mismatch`, { details: {} });
+    }
+  }
+
+  // 4–6. All-or-nothing writes in one transaction. The source rows are
+  //    re-read inside the transaction: the loads above race a concurrent
+  //    source delete, so the row must still exist under the same key hash
+  //    for the writes below to be valid.
   const out = await transaction(deps.sql, async (tx) => {
-    // 1. Sources exist and keys match; existing clips stay on their source.
-    const sources = new Map<string, { frame_count: number; sha256: string | null; r2_key: string }>();
     for (const clip of inputs) {
-      let s = sources.get(clip.source_id);
-      if (!s) {
-        const [row] = await tx`
-          SELECT frame_count, sha256, r2_key, source_key_hash FROM sources
-          WHERE id = ${clip.source_id}`;
-        if (!row || row.source_key_hash !== sha256Hex(clip.source_key)) {
-          return { status: 404 as const };
-        }
-        s = { frame_count: row.frame_count as number, sha256: row.sha256 as string | null, r2_key: row.r2_key as string };
-        sources.set(clip.source_id, s);
+      const [row] = await tx`
+        SELECT frame_count FROM sources
+        WHERE id = ${clip.source_id} AND source_key_hash = ${sha256Hex(clip.source_key)}`;
+      if (!row) {
+        return { status: 404 as const };
       }
       const [existing] = await tx`SELECT source_id FROM clips WHERE id = ${clip.clip_id}`;
       if (existing && existing.source_id !== clip.source_id) {
         return { status: 404 as const };
-      }
-    }
-
-    // 2. Frame windows are validated against the source's canonical count.
-    for (let i = 0; i < inputs.length; i++) {
-      const clip = inputs[i]!;
-      const frameCount = sources.get(clip.source_id)!.frame_count;
-      if (!(clip.start_frame < clip.end_frame && clip.end_frame <= frameCount)) {
-        return {
-          status: 422 as const,
-          code: "VALIDATION_ERROR" as const,
-          message: `clips[${i}]: end_frame must be > start_frame and <= source frame_count (${frameCount})`,
-          details: { index: i, field: "end_frame" },
-        };
-      }
-    }
-
-    // 3. Blob verification, once per distinct source (§1.2.10).
-    for (const [sourceId, s] of sources) {
-      if (s.sha256 === null) {
-        return { status: 422 as const, code: "BLOB_MISSING" as const, message: `source ${sourceId}: blob not ingested yet` };
-      }
-      const bytes = await deps.r2.getBytes(s.r2_key);
-      if (bytes === null) {
-        return { status: 422 as const, code: "BLOB_MISSING" as const, message: `source ${sourceId}: blob not found at ${s.r2_key}` };
-      }
-      if (sha256HexBytes(bytes) !== s.sha256) {
-        return { status: 422 as const, code: "BLOB_DIGEST_MISMATCH" as const, message: `source ${sourceId}: stored blob digest mismatch` };
       }
     }
 
@@ -192,9 +229,6 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
   });
 
   if (out.status === 404) return notFound();
-  if (out.status === 422) {
-    return errorResponse(422, out.code, out.message, { details: (out as { details?: Record<string, unknown> }).details ?? {} });
-  }
   return Response.json({ clips: out.clips });
 }
 

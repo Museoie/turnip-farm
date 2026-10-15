@@ -9,6 +9,7 @@ import { TEST_DATABASE_URL, inRollback } from "../../db/testing";
 import { sha256Hex } from "../auth/tokens";
 import { TokenBucket } from "../ratelimit";
 import type { R2Client } from "../r2/client";
+import { BlobTooLargeError } from "../r2/client";
 import { purgeExpiredAttribution } from "./purge";
 import {
   handleDeleteSource,
@@ -33,7 +34,7 @@ const OTHER_KEY = "xxx".repeat(13) + "Xxxx"; // 43-char fixture, not a secret
 const CLIP_ID = "123e4567-e89b-42d3-a456-426614174000";
 const CLIP_ID_2 = "123e4567-e89b-42d3-a456-426614174001";
 
-function fakeR2(opts: { bytes?: Uint8Array | null; failDelete?: boolean } = {}): R2Client & {
+function fakeR2(opts: { bytes?: Uint8Array | null; failDelete?: boolean; tooLarge?: boolean } = {}): R2Client & {
   deleted: string[];
 } {
   const deleted: string[] = [];
@@ -47,7 +48,10 @@ function fakeR2(opts: { bytes?: Uint8Array | null; failDelete?: boolean } = {}):
       url: `https://r2.test/get/${key}?sig=get`,
       expiresAt: new Date("2026-10-14T08:15:00.000Z"),
     }),
-    getBytes: async () => opts.bytes ?? null,
+    getBytes: async () => {
+      if (opts.tooLarge) throw new BlobTooLargeError("poses/test.tkp1.gz", 10);
+      return opts.bytes ?? null;
+    },
     deleteObject: async (key: string) => {
       if (opts.failDelete) throw new Error("r2 down");
       deleted.push(key);
@@ -330,6 +334,19 @@ describeDb("POST /api/clips", () => {
         await handlePostClips(post("/api/clips", clipBody(), authed(token)), dMismatch),
         422,
         "BLOB_DIGEST_MISMATCH",
+      );
+    });
+  });
+
+  test("422 BLOB_TOO_LARGE when the blob exceeds the cap", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      const d = deps(tx, fakeR2({ tooLarge: true }));
+      await seedIngestedSource(tx, token, createHash("sha256").update("b").digest("hex"));
+      await expectError(
+        await handlePostClips(post("/api/clips", clipBody(), authed(token)), d),
+        422,
+        "BLOB_TOO_LARGE",
       );
     });
   });
