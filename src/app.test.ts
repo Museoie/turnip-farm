@@ -24,6 +24,8 @@ const deps: AppDeps = {
   sql: noDatabase,
   verifyIdentityToken: () => Promise.reject(new Error("verifier unavailable in this test")),
   exchangeCode: () => Promise.reject(new Error("Apple unavailable in this test")),
+  verifyNotificationPayload: () => Promise.reject(new Error("notification verifier unavailable in this test")),
+  revokeRefreshToken: () => Promise.reject(new Error("revoker unavailable in this test")),
   refreshTokenKey: {} as CryptoKey,
   r2: noR2,
   limits: { user: new TokenBucket(1000, 60000), ip: new TokenBucket(1000, 60000) },
@@ -85,10 +87,38 @@ describe("createHandler routing", () => {
       ["GET", "/api/clips"],
       ["GET", "/api/clips/abc/labels"],
       ["DELETE", "/api/clips/abc/labels"],
+      ["GET", "/api/account"],
+      ["POST", "/api/account"],
+      ["GET", "/api/auth/apple/notifications"],
     ] as const) {
       const res = await handle(request(method, path));
       expect(res.status).toBe(404);
     }
+  });
+
+  test("DELETE /api/account reaches the session-guarded handler (401 before any DB touch)", async () => {
+    const res = await handle(request("DELETE", "/api/account"));
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("UNAUTHENTICATED");
+  });
+
+  test("POST /api/auth/apple/notifications reaches the notification handler", async () => {
+    // A rejecting verifier becomes a 401 in the handler — the point is the
+    // route dispatched past 404.
+    const { InvalidTokenError } = await import("./auth/apple");
+    const handleHere = createHandler({
+      ...deps,
+      verifyNotificationPayload: () => Promise.reject(new InvalidTokenError()),
+    });
+    const res = await handleHere(
+      new Request("http://farm.test/api/auth/apple/notifications", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ payload: "x" }),
+      }),
+    );
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("UNAUTHENTICATED");
   });
 });
 
@@ -100,6 +130,32 @@ describe("startServer", () => {
     const res = await fetch(new URL("/healthz", server.url));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ status: "ok" });
+  });
+
+  test("POST /api/auth/apple/notifications is per-IP rate limited like sign-in", async () => {
+    const limited = startServer(0, {
+      ...deps,
+      limits: { user: new TokenBucket(1000, 60000), ip: new TokenBucket(2, 1) },
+    });
+    try {
+      const url = new URL("/api/auth/apple/notifications", limited.url);
+      const post = () =>
+        fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ payload: "x" }),
+        });
+      // The first two pass the limiter and reach the handler (the stand-in
+      // verifier rejects loudly here, so 500 — the point is "not 429").
+      expect((await post()).status).toBe(500);
+      expect((await post()).status).toBe(500);
+      const res = await post();
+      expect(res.status).toBe(429);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("RATE_LIMITED");
+      expect(res.headers.get("Retry-After")).not.toBeNull();
+    } finally {
+      limited.stop(true);
+    }
   });
 
   test("turns an unexpected error into 500 INTERNAL, logging the error but not the request", async () => {

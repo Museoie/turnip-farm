@@ -4,6 +4,7 @@ import {
   APPLE_ISSUER,
   AppleUnavailableError,
   InvalidTokenError,
+  createAppleJwtVerifier,
   createAppleTokenVerifier,
   createCodeExchanger,
   mintClientSecret,
@@ -80,6 +81,32 @@ describe("createAppleTokenVerifier", () => {
   test("does not blame the token when the JWKS answers 500", async () => {
     const err = await verifyAgainst(() => new Response("unavailable", { status: 500 }));
     expect(err).not.toBeInstanceOf(InvalidTokenError);
+  });
+});
+
+describe("createAppleJwtVerifier in notification mode (requireExp: false)", () => {
+  const verifyNotification = createAppleJwtVerifier({ audience: AUDIENCE, jwksUrl: apple.jwksUrl, requireExp: false });
+
+  test("accepts Apple's notification shape: no exp, subject inside events only", async () => {
+    const payload = await verifyNotification(
+      await apple.notificationPayload({ claims: { events: { type: "consent-revoked", sub: SUB } } }),
+    );
+    expect(payload.iss).toBe(APPLE_ISSUER);
+    expect(payload.aud).toBe(AUDIENCE);
+    expect(payload.sub).toBeUndefined();
+    expect(payload.events).toEqual({ type: "consent-revoked", sub: SUB });
+  });
+
+  test.each([
+    ["wrong issuer", () => apple.notificationPayload({ claims: { iss: "https://example.com" } })],
+    ["wrong audience", () => apple.notificationPayload({ claims: { aud: "com.example.other" } })],
+    [
+      "known kid, signed by another key",
+      async () => apple.notificationPayload({ key: (await generateKeyPair("RS256")).privateKey }),
+    ],
+    ["not a JWT", async () => "not.a.jwt"],
+  ])("still rejects a bad payload: %s", async (_, makeToken) => {
+    expect(await rejection(verifyNotification(await makeToken()))).toBeInstanceOf(InvalidTokenError);
   });
 });
 

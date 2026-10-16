@@ -63,6 +63,23 @@ export async function startMockApple() {
       id_token: await identityToken(),
     });
 
+  // Shaped like Apple's server-to-server notification payload (§7.3): signed
+  // like an identity token but with no `exp` (§7.1), carrying `iss`, `aud`,
+  // `iat`, `jti`, and the `events` claim (an object, or a JSON string — see
+  // parseEvent). Like Apple's real payloads, there is no top-level `sub`:
+  // the subject lives inside `events`.
+  function notificationPayload({ kid = "k1", key = apple.privateKey, claims = {} }: IdentityTokenOptions = {}) {
+    return new SignJWT({
+      iss: APPLE_ISSUER,
+      aud: AUDIENCE,
+      iat: now(),
+      jti: "mock-jti-123",
+      ...claims,
+    })
+      .setProtectedHeader({ alg: key instanceof Uint8Array ? "HS256" : "RS256", kid })
+      .sign(key);
+  }
+
   let tokenEndpoint = succeed;
   const tokenRequests: URLSearchParams[] = [];
 
@@ -86,6 +103,7 @@ export async function startMockApple() {
     credentials,
     farmPublicKey: farmKey.publicKey,
     identityToken,
+    notificationPayload,
     // Every form posted to the token endpoint, oldest first.
     tokenRequests,
     respondWith(endpoint: TokenEndpoint) {

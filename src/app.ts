@@ -3,6 +3,8 @@
 // ephemeral port, without loading config.
 
 import { type SignInDeps, handleSignIn, handleSignOut } from "./auth/sessions";
+import { handleDeleteAccount } from "./auth/account";
+import { handleAppleNotifications } from "./auth/notifications";
 import {
   handleDeleteSource,
   handleGetSource,
@@ -17,13 +19,18 @@ import { TokenBucket } from "./ratelimit";
 export interface RateLimits {
   /** Per-user token bucket for the contribution POSTs (§7.2). */
   user: TokenBucket;
-  /** Per-IP token bucket for POST /api/auth/apple (§7.2). */
+  /** Per-IP token bucket for POST /api/auth/apple and POST /api/auth/apple/notifications (§7.2). */
   ip: TokenBucket;
 }
+
+import { type RevokeRefreshToken, type VerifyAppleJwt } from "./auth/apple";
 
 export type AppDeps = SignInDeps & {
   r2: R2Client;
   limits: RateLimits;
+  /** Apple JWT verifier without the `exp` requirement, for server-to-server notifications (§7.1). */
+  verifyNotificationPayload: VerifyAppleJwt;
+  revokeRefreshToken: RevokeRefreshToken;
 };
 
 export function createHandler(deps: AppDeps): (req: Request) => Promise<Response> {
@@ -38,6 +45,12 @@ export function createHandler(deps: AppDeps): (req: Request) => Promise<Response
       if (method === "POST" && seg.length === 3 && seg[1] === "auth") {
         if (seg[2] === "apple") return handleSignIn(req, deps);
         if (seg[2] === "signout") return handleSignOut(req, deps);
+      }
+      if (method === "POST" && seg.length === 4 && seg[1] === "auth" && seg[2] === "apple" && seg[3] === "notifications") {
+        return handleAppleNotifications(req, deps);
+      }
+      if (method === "DELETE" && seg.length === 2 && seg[1] === "account") {
+        return handleDeleteAccount(req, deps);
       }
       if (seg[1] === "sources") {
         if (method === "POST" && seg.length === 2) return handleRegisterSource(req, deps);
@@ -65,8 +78,14 @@ export function startServer(port: number, deps: AppDeps) {
   return Bun.serve({
     port,
     fetch(req, server) {
-      // Per-IP limit on sign-in attempts (§7.2); there is no user yet.
-      if (req.method === "POST" && new URL(req.url).pathname === "/api/auth/apple") {
+      // Per-IP limit on sign-in and notification attempts (§7.2); there is
+      // no user yet on either. The only legitimate notification sender is
+      // Apple, but the URL is public and the bucket caps its abuse.
+      const pathname = new URL(req.url).pathname;
+      if (
+        req.method === "POST" &&
+        (pathname === "/api/auth/apple" || pathname === "/api/auth/apple/notifications")
+      ) {
         const ip = server.requestIP(req)?.address ?? "unknown";
         if (!deps.limits.ip.take(ip)) {
           return errorResponse(429, "RATE_LIMITED", "Too many requests", {
