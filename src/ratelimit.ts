@@ -1,7 +1,8 @@
 // Per-key token buckets (BACKEND_DESIGN.md §7.2): per-user on the
 // contribution POSTs (suggested 60 requests/minute), per-IP on
-// POST /api/auth/apple (suggested 10/minute). In-process and per-instance;
-// the farm runs as one process. Answered 429 carries Retry-After.
+// POST /api/auth/apple and POST /api/auth/apple/notifications (suggested
+// 10/minute). In-process and per-instance; the farm runs as one process.
+// Answered 429 carries Retry-After.
 
 export class TokenBucket {
   private state = new Map<string, { tokens: number; updatedAtMs: number }>();

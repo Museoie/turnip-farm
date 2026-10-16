@@ -132,6 +132,32 @@ describe("startServer", () => {
     expect(await res.json()).toEqual({ status: "ok" });
   });
 
+  test("POST /api/auth/apple/notifications is per-IP rate limited like sign-in", async () => {
+    const limited = startServer(0, {
+      ...deps,
+      limits: { user: new TokenBucket(1000, 60000), ip: new TokenBucket(2, 1) },
+    });
+    try {
+      const url = new URL("/api/auth/apple/notifications", limited.url);
+      const post = () =>
+        fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ payload: "x" }),
+        });
+      // The first two pass the limiter and reach the handler (the stand-in
+      // verifier rejects loudly here, so 500 — the point is "not 429").
+      expect((await post()).status).toBe(500);
+      expect((await post()).status).toBe(500);
+      const res = await post();
+      expect(res.status).toBe(429);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("RATE_LIMITED");
+      expect(res.headers.get("Retry-After")).not.toBeNull();
+    } finally {
+      limited.stop(true);
+    }
+  });
+
   test("turns an unexpected error into 500 INTERNAL, logging the error but not the request", async () => {
     const logged = spyOn(console, "error").mockImplementation(() => {});
     try {

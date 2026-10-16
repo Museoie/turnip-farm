@@ -59,15 +59,20 @@ export interface AppleJwtOptions {
   // The iOS app bundle ID (APP_BUNDLE_ID).
   audience: string;
   jwksUrl?: string | URL;
-  // Identity tokens must carry `exp`; server-to-server notifications carry
-  // `iat`/`jti` but no `exp` (§7.1). A present `exp` is always validated.
+  // Identity tokens must carry `exp` and a top-level `sub`; server-to-server
+  // notifications carry `iat`/`jti` but no `exp` (§7.1), and their subject
+  // lives inside `events` (§7.3) — no top-level `sub` is required there.
+  // A present `exp` is always validated.
   requireExp?: boolean;
 }
 
 // Verifies an Apple JWT the §7.1 way — RS256 against Apple's JWKS, iss, aud —
-// and returns its payload. A malformed, forged, or expired token throws
-// InvalidTokenError; anything else, such as the JWKS being unreachable,
-// throws, so callers can answer 500 instead of blaming the token.
+// and returns its payload. In notification mode (`requireExp: false`) the
+// subject is not required at the top level: Apple's notification JWTs carry
+// `iss`/`aud`/`iat`/`jti` with the subject inside `events` only (§7.3).
+// A malformed, forged, or expired token throws InvalidTokenError; anything
+// else, such as the JWKS being unreachable, throws, so callers can answer
+// 500 instead of blaming the token.
 export function createAppleJwtVerifier({
   audience,
   jwksUrl = APPLE_JWKS_URL,
@@ -85,13 +90,16 @@ export function createAppleJwtVerifier({
         audience,
         algorithms: ["RS256"],
         clockTolerance: CLOCK_TOLERANCE_SECONDS,
-        requiredClaims: requireExp ? ["sub", "exp"] : ["sub"],
+        requiredClaims: requireExp ? ["sub", "exp"] : [],
       }));
     } catch (err) {
       if (TOKEN_FAULTS.some((fault) => err instanceof fault)) throw new InvalidTokenError();
       throw err;
     }
-    if (typeof payload.sub !== "string" || payload.sub === "") throw new InvalidTokenError();
+    // Identity tokens carry the subject at the top level; notification
+    // payloads carry it inside `events`, so a missing top-level `sub` is
+    // only the token's fault for identity tokens.
+    if (requireExp && (typeof payload.sub !== "string" || payload.sub === "")) throw new InvalidTokenError();
     return payload;
   };
 }

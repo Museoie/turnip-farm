@@ -62,7 +62,7 @@ const server = startServer(config.port, {
   refreshTokenKey: await importRefreshTokenKey(config.apple.refreshTokenKey),
   r2: createR2Client(config.r2),
   limits: {
-    // §7.2 suggestions: 60/min per user on POSTs, 10/min per IP on sign-in.
+    // §7.2 suggestions: 60/min per user on POSTs, 10/min per IP on sign-in and notifications.
     user: new TokenBucket(60, 60),
     ip: new TokenBucket(10, 10),
   },
