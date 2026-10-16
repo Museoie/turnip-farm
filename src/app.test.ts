@@ -28,6 +28,7 @@ const deps: AppDeps = {
   revokeRefreshToken: () => Promise.reject(new Error("revoker unavailable in this test")),
   refreshTokenKey: {} as CryptoKey,
   r2: noR2,
+  pipelineKey: "test-pipeline-key",
   limits: { user: new TokenBucket(1000, 60000), ip: new TokenBucket(1000, 60000) },
 };
 
@@ -90,9 +91,34 @@ describe("createHandler routing", () => {
       ["GET", "/api/account"],
       ["POST", "/api/account"],
       ["GET", "/api/auth/apple/notifications"],
+      ["POST", "/api/labels/export"],
+      ["GET", "/api/quarantine"],
+      ["GET", "/api/quarantine/abc/release"],
     ] as const) {
       const res = await handle(request(method, path));
       expect(res.status).toBe(404);
+    }
+  });
+
+  test("pipeline routes reach their handlers (401 before any DB touch)", async () => {
+    // noDatabase throws if a handler reaches the database; 401 proves the
+    // route dispatched to a pipeline-key-guarded handler.
+    const vid = "a".repeat(64);
+    for (const [method, path, body] of [
+      ["GET", "/api/labels/export", undefined],
+      ["POST", "/api/quarantine", JSON.stringify({ source_ids: [vid], reason: "r" })],
+      ["POST", `/api/quarantine/${vid}/release`, undefined],
+      ["POST", `/api/quarantine/${vid}/purge`, undefined],
+    ] as const) {
+      const res = await handle(
+        new Request(`http://farm.test${path}`, {
+          method,
+          headers: body ? { "content-type": "application/json" } : {},
+          body: body ?? undefined,
+        }),
+      );
+      expect(res.status).toBe(401);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("UNAUTHENTICATED");
     }
   });
 
