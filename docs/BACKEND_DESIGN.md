@@ -212,6 +212,18 @@ Two departures from the master plan's label draft follow from this:
     achievement, score, or leaderboard table, and adding one needs the
     master plan's reopen condition first: it would have to know whose
     contributions are whose, which §1.2.17 removes.
+22. **Quarantine review transitions are pipeline-key endpoints.**
+    `POST /api/quarantine/:source_id/release` and `/purge` authenticate
+    with the pipeline service key — the only non-user credential in the
+    system; the maintainer operates the pipeline, so no separate admin
+    auth exists yet. Purge hard-deletes the source (§1.2.3), so a
+    `resolution='purged'` row never survives on its own: the quarantine
+    row cascades with the source it condemned.
+23. **The export page size is a deployment constant, not a parameter.**
+    `GET /api/labels/export` pages at a fixed 10000 rows; the pipeline
+    never asks for a different size, and a client-controlled limit is a
+    memory-exhaustion knob on a joined query. Tests override it through
+    the handler's deps to cross the `LIMIT` boundary cheaply.
 
 ## 2. Conventions
 
@@ -689,6 +701,7 @@ JOIN labels l ON l.clip_id   = c.id
 LEFT JOIN data_quarantine q
        ON q.source_id = s.id AND q.resolved_at IS NULL
 WHERE q.id IS NULL
+  AND s.sha256 IS NOT NULL
   AND (GREATEST(s.updated_at, c.updated_at, l.updated_at), c.id, l.trick_name)
       > ($1, $2, $3)  -- since cursor: (row_cursor, clip_id, trick_name)
 ORDER BY row_cursor ASC, clip_id ASC, trick_name ASC
@@ -707,8 +720,17 @@ Notes:
   touches shares the exact same `updated_at`. Keying on `row_cursor`
   alone with `next_cursor = max(row_cursor)` would silently skip rows
   sharing the max cursor value past the `LIMIT` boundary.
-- `next_cursor` = `(row_cursor, clip_id, trick_name)` of the last
-  returned row; the training job passes all three back as `since`.
+- `next_cursor` is the opaque encoding of the last returned row's
+  `(row_cursor, clip_id, trick_name)`; the training job passes it back
+  as `since`. It is non-null whenever `rows` is non-empty and null only
+  on an empty page, so the pipeline gets an exact watermark for the cost
+  of one extra empty request per pull (maintainer decision 2026-10-14
+  on #19).
+- `blob_sha256` is never null in export rows: the query filters
+  `s.sha256 IS NOT NULL` explicitly. Label submission already requires
+  an ingested blob (`BLOB_MISSING`), so this only states it; the
+  pipeline fails the run if it ever sees a null rather than training on
+  a row it can't fetch (maintainer decision 2026-10-14 on #19).
 - **The export carries no deletions.** A source deleted by its owner,
   by account deletion, or by a quarantine purge, and a label dropped
   when a clip's label set is replaced, simply stop appearing. An
@@ -1364,14 +1386,71 @@ sources excluded, ordered by cursor ascending, `limit` 10000:
   "taxonomy": [
     {"raw": "corkscrew", "canonical": "cork", "taxonomy_version": 3}
   ],
-  "next_cursor": "<opaque>"  // null when exhausted
+  "next_cursor": "<opaque>"  // non-null when rows is non-empty; null only on an empty page
 }
 ```
 
-`taxonomy` carries the `(raw → canonical)` mappings for the versions
-present in `rows`, so the training job canonicalizes without a second
-call. The training job resolves each row's `r2_key` to pose bytes itself
-(R2 access, verifying `blob_sha256`).
+`taxonomy` carries the whole `label_taxonomy` table (`raw → canonical`
+per version), so the training job canonicalizes without a second call.
+Shipping only "the versions present in `rows`" would silently unmap a
+raw string whose labels all sit at an old version (versions are
+append-only: a bump adds only new or changed mappings, which the
+`(raw, taxonomy_version DESC)` lookup assumes). The table is small; it
+ships on every page. The training job pins to the greatest version in
+it, so curation applies at the next run (maintainer decision 2026-10-14
+on #19). The training job resolves each row's `r2_key` to pose bytes
+itself (R2 access, verifying `blob_sha256`).
+
+#### `POST /api/quarantine` — pipeline reports regressing sources (service key)
+
+Request:
+
+```json
+{
+  "source_ids": ["<64-char hex>", "..."],
+  "reason": "fixture regression: challenger 0.61 < champion 0.66",
+  "metrics": {"challenger": 0.61, "champion": 0.66}
+}
+```
+
+Inserts one `data_quarantine` row per id (`reason`, `metrics` JSONB
+snapshot; the farm assigns `id` and `quarantined_at`). Ids that already
+have an open quarantine are skipped — the `data_quarantine_open_uniq`
+partial index makes resubmission a no-op, not an error
+(`ON CONFLICT ... DO NOTHING`). Unknown source ids are reported, not
+fatal: a source can be owner-deleted between the pipeline's export pull
+and this call, and quarantining a deleted source is meaningless.
+Response `200`:
+
+```json
+{"quarantined": ["<id>", "..."], "already_open": ["<id>"], "unknown": ["<id>"]}
+```
+
+The id list is explicit, not a farm-side time window: the pipeline
+builds it from a `since=<watermark>` export pull taken after the
+dataset pull (every source with a label row changed since the
+watermark, including relabels of old sources — `TRAINING_DESIGN.md`
+§7). The farm doesn't know the pipeline's watermark, and the Discord
+alert and the quarantine list must be the same list (maintainer
+decision 2026-10-14 on #19).
+
+#### `POST /api/quarantine/:source_id/release` — maintainer releases (service key)
+
+The review queue marks a row released (good data): sets `resolved_at =
+now()`, `resolution = 'released'` on the open quarantine row, and the
+source rejoins the export on the next pull. `404` when no open
+quarantine row exists for the source. Response `200`:
+`{"source_id": "<id>", "resolution": "released"}`.
+
+#### `POST /api/quarantine/:source_id/purge` — maintainer purges (service key)
+
+The review queue marks a row purged (bad data): sets `resolved_at =
+now()`, `resolution = 'purged'`, then hard-deletes the source row —
+cascades to clips/labels, and the R2 blob is deleted too (§1.2.3), so
+poisoned data is gone entirely rather than merely excluded. R2 is
+deleted before the row (the `DELETE /api/sources/:id` order); if
+either delete throws, the source row survives so the call can be
+retried. `404` when no open quarantine row exists. Response `204`.
 
 #### `POST /api/reports` — report a bad label/clip
 

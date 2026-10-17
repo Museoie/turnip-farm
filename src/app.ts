@@ -12,7 +12,14 @@ import {
   handleRegisterSource,
 } from "./contrib/sources";
 import { handlePostClipLabels, handlePostClips } from "./contrib/clips";
+import { handleGetLabelsExport } from "./export";
+import {
+  handlePostQuarantine,
+  handlePurgeQuarantine,
+  handleReleaseQuarantine,
+} from "./quarantine";
 import { errorResponse } from "./errors";
+import { isVideoId } from "./contrib/validate";
 import type { R2Client } from "./r2/client";
 import { TokenBucket } from "./ratelimit";
 
@@ -27,6 +34,8 @@ import { type RevokeRefreshToken, type VerifyAppleJwt } from "./auth/apple";
 
 export type AppDeps = SignInDeps & {
   r2: R2Client;
+  /** Pre-shared key for the pipeline endpoints (BACKEND_DESIGN.md §7.1). */
+  pipelineKey: string;
   limits: RateLimits;
   /** Apple JWT verifier without the `exp` requirement, for server-to-server notifications (§7.1). */
   verifyNotificationPayload: VerifyAppleJwt;
@@ -66,6 +75,18 @@ export function createHandler(deps: AppDeps): (req: Request) => Promise<Response
         if (method === "POST" && seg.length === 2) return handlePostClips(req, deps);
         if (method === "POST" && seg.length === 4 && seg[3] === "labels") {
           return handlePostClipLabels(req, deps, seg[2]!);
+        }
+      }
+      if (seg[1] === "labels") {
+        if (method === "GET" && seg.length === 3 && seg[2] === "export") {
+          return handleGetLabelsExport(req, deps);
+        }
+      }
+      if (seg[1] === "quarantine") {
+        if (method === "POST" && seg.length === 2) return handlePostQuarantine(req, deps);
+        if (method === "POST" && seg.length === 4 && isVideoId(seg[2])) {
+          if (seg[3] === "release") return handleReleaseQuarantine(req, deps, seg[2]!);
+          if (seg[3] === "purge") return handlePurgeQuarantine(req, deps, seg[2]!);
         }
       }
     }
