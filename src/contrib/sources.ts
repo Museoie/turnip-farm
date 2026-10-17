@@ -173,6 +173,16 @@ export async function handleGetSource(
     }
   }
 
+  // The impact read (§7.3, §1.2.20): promoted model versions whose training
+  // set held this source, oldest first; [] until a model trains on it.
+  // Promoted = non-null promoted_at (the greatest one is the current model).
+  const trained = await deps.sql`
+    SELECT m.version
+    FROM model_training_sources mts
+    JOIN models m ON m.version = mts.model_version
+    WHERE mts.source_id = ${sourceId} AND m.promoted_at IS NOT NULL
+    ORDER BY m.promoted_at ASC`;
+
   return Response.json({
     source: {
       id: source.id,
@@ -180,6 +190,7 @@ export async function handleGetSource(
       sample_rate: source.sample_rate,
       keypoint_format: source.keypoint_format,
       sha256: source.sha256,
+      trained_in: trained.map((r: { version: string }) => r.version),
       created_at: (source.created_at as Date).toISOString(),
       updated_at: (source.updated_at as Date).toISOString(),
     },

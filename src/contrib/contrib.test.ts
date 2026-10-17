@@ -428,6 +428,36 @@ describeDb("GET /api/sources/:id", () => {
       );
     });
   });
+  test("trained_in: [] until a model trains on it; promoted versions oldest first", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      const d = deps(tx, fakeR2());
+      const reg = await registerSource(tx, d, token);
+      expect(reg.status).toBe(201);
+      const key = { "source-key": SOURCE_KEY };
+      const trainedIn = async () => {
+        const res = await handleGetSource(
+          get(`/api/sources/${VIDEO_ID}`, authed(token, key)),
+          d,
+          VIDEO_ID,
+        );
+        expect(res.status).toBe(200);
+        return (await bodyJson(res)).source.trained_in;
+      };
+      expect(await trainedIn()).toEqual([]);
+
+      // v1.3 promoted first, v1.4 second, v1.5 trained but never promoted.
+      await tx`INSERT INTO models (version, taxonomy_version, r2_key, sha256)
+        VALUES ('trick-v1.3', 1, 'models/trick-v1.3', ${"c".repeat(64)}),
+               ('trick-v1.4', 1, 'models/trick-v1.4', ${"d".repeat(64)}),
+               ('trick-v1.5', 1, 'models/trick-v1.5', ${"e".repeat(64)})`;
+      await tx`UPDATE models SET promoted_at = now() - interval '2 days' WHERE version = 'trick-v1.3'`;
+      await tx`UPDATE models SET promoted_at = now() - interval '1 day' WHERE version = 'trick-v1.4'`;
+      await tx`INSERT INTO model_training_sources (model_version, source_id)
+        VALUES ('trick-v1.3', ${VIDEO_ID}), ('trick-v1.4', ${VIDEO_ID}), ('trick-v1.5', ${VIDEO_ID})`;
+      expect(await trainedIn()).toEqual(["trick-v1.3", "trick-v1.4"]);
+    });
+  });
 });
 
 describeDb("GET /api/sources/:id/pose", () => {
