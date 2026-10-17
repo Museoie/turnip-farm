@@ -268,8 +268,9 @@ on the server as training data; the client simply cannot relink them.
   quarantined sources. This is the anti-poisoning work queue (§6).
 - `reports` — retargeted at labels/clips (was: videos).
 - `follows` / feed — **deferred**. A server video feed cannot exist
-  without server video. Social sharing stays where DESIGN.md put it:
-  the iOS Share Sheet, zero server involvement.
+  without server video. Sharing is out of scope for the plan; the iOS
+  Share Sheet already covers sharing as a platform feature, with zero
+  server involvement.
 - Profile, achievement, score, and leaderboard tables — **none, by
   decision** (§1). The Profile is on-device state.
 
