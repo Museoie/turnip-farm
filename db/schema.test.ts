@@ -52,6 +52,7 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       "data_quarantine",
       "label_taxonomy",
       "labels",
+      "model_training_sources",
       "models",
       "reports",
       "schema_migrations", // dbmate's applied-version ledger
@@ -78,6 +79,7 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       "CREATE UNIQUE INDEX label_taxonomy_raw_version_uniq ON public.label_taxonomy USING btree (raw, taxonomy_version)",
       "CREATE UNIQUE INDEX labels_clip_trick_uniq ON public.labels USING btree (clip_id, lower(trick_name))",
       "CREATE UNIQUE INDEX labels_pkey ON public.labels USING btree (id)",
+      "CREATE UNIQUE INDEX model_training_sources_pkey ON public.model_training_sources USING btree (source_id, model_version)",
       "CREATE UNIQUE INDEX models_pkey ON public.models USING btree (id)",
       "CREATE UNIQUE INDEX models_version_key ON public.models USING btree (version)",
       "CREATE UNIQUE INDEX reports_pkey ON public.reports USING btree (id)",
@@ -253,6 +255,36 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
                (SELECT count(*) FROM reports WHERE reporter_user_id = 'user-1')::int         AS reports,
                (SELECT count(*) FROM sources WHERE id = ${SOURCE_ID})::int                   AS sources`;
       expect(counts).toEqual({ sessions: 0, attribution: 0, reports: 0, sources: 1 });
+    });
+  });
+
+  test("model_training_sources: source-level membership, no account column (§1.2.20)", async () => {
+    await inRollback(sql, async (tx) => {
+      await insertClip(tx);
+      await tx`INSERT INTO models (version, taxonomy_version, r2_key, sha256)
+        VALUES ('trick-v1.3', 1, 'models/trick-v1.3', ${DIGEST})`;
+      const member = (version: string, sourceId: string) => (sp: SavepointSQL) =>
+        sp`INSERT INTO model_training_sources (model_version, source_id)
+           VALUES (${version}, ${sourceId})`;
+      // Unknown model version and unknown source both rejected.
+      expect(await violation(tx, member("trick-v9.9", SOURCE_ID))).toBe(
+        "model_training_sources_model_version_fkey",
+      );
+      expect(await violation(tx, member("trick-v1.3", "c".repeat(64)))).toBe(
+        "model_training_sources_source_id_fkey",
+      );
+      expect(await violation(tx, member("trick-v1.3", SOURCE_ID))).toBeUndefined();
+      // Same (source, version) pair recorded twice is one row.
+      expect(await violation(tx, member("trick-v1.3", SOURCE_ID))).toBe(
+        "model_training_sources_pkey",
+      );
+      // Deleting the source cascades the membership rows; deleting nothing
+      // else does.
+      await tx`DELETE FROM sources WHERE id = ${SOURCE_ID}`;
+      const [{ count }] = await tx`SELECT count(*)::int AS count FROM model_training_sources`;
+      expect(count).toBe(0);
+      const [{ models }] = await tx`SELECT count(*)::int AS models FROM models`;
+      expect(models).toBe(1);
     });
   });
 });
