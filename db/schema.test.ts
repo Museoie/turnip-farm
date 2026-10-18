@@ -168,8 +168,8 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       expect(await violation(tx, insert("trick-v1.1", "z".repeat(64)))).toBe("models_sha256_check");
       expect(await violation(tx, insert("trick-v1.1", DIGEST, "pose"))).toBe("models_model_type_check");
 
-      const [model] = await tx`SELECT val_metrics, promoted_at FROM models WHERE version = 'trick-v1.0'`;
-      expect(model).toEqual({ val_metrics: {}, promoted_at: null });
+      const [model] = await tx`SELECT val_metrics, name_metrics, promoted_at FROM models WHERE version = 'trick-v1.0'`;
+      expect(model).toEqual({ val_metrics: {}, name_metrics: {}, promoted_at: null });
     });
   });
 
