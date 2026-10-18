@@ -13,6 +13,7 @@ import {
 } from "./contrib/sources";
 import { handlePostClipLabels, handlePostClips } from "./contrib/clips";
 import { handleGetLabelsExport } from "./export";
+import { handleGetTaxonomyCurrent } from "./taxonomy";
 import {
   handlePostQuarantine,
   handlePurgeQuarantine,
@@ -28,6 +29,8 @@ export interface RateLimits {
   user: TokenBucket;
   /** Per-IP token bucket for POST /api/auth/apple and POST /api/auth/apple/notifications (§7.2). */
   ip: TokenBucket;
+  /** Per-IP token bucket for the public GET endpoints (§7.2). */
+  publicIp: TokenBucket;
 }
 
 import { type RevokeRefreshToken, type VerifyAppleJwt } from "./auth/apple";
@@ -82,6 +85,11 @@ export function createHandler(deps: AppDeps): (req: Request) => Promise<Response
           return handleGetLabelsExport(req, deps);
         }
       }
+      if (seg[1] === "taxonomy") {
+        if (method === "GET" && seg.length === 3 && seg[2] === "current") {
+          return handleGetTaxonomyCurrent(req, deps);
+        }
+      }
       if (seg[1] === "quarantine") {
         if (method === "POST" && seg.length === 2) return handlePostQuarantine(req, deps);
         if (method === "POST" && seg.length === 4 && isVideoId(seg[2])) {
@@ -111,6 +119,16 @@ export function startServer(port: number, deps: AppDeps) {
         if (!deps.limits.ip.take(ip)) {
           return errorResponse(429, "RATE_LIMITED", "Too many requests", {
             headers: { "Retry-After": String(deps.limits.ip.retryAfterSec(ip)) },
+          });
+        }
+      }
+      // Per-IP limit on the public GET endpoints (§7.2); they are
+      // cacheable, so legitimate clients rarely touch the bucket.
+      if (req.method === "GET" && pathname === "/api/taxonomy/current") {
+        const ip = server.requestIP(req)?.address ?? "unknown";
+        if (!deps.limits.publicIp.take(ip)) {
+          return errorResponse(429, "RATE_LIMITED", "Too many requests", {
+            headers: { "Retry-After": String(deps.limits.publicIp.retryAfterSec(ip)) },
           });
         }
       }
