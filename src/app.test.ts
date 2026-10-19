@@ -3,6 +3,7 @@ import { type AppDeps, createHandler, startServer } from "./app";
 import { noDatabase } from "./auth/testing";
 import type { R2Client } from "./r2/client";
 import { TokenBucket } from "./ratelimit";
+import type { SQL } from "bun";
 
 const noR2: R2Client = {
   presignPut: () => {
@@ -29,7 +30,11 @@ const deps: AppDeps = {
   refreshTokenKey: {} as CryptoKey,
   r2: noR2,
   pipelineKey: "test-pipeline-key",
-  limits: { user: new TokenBucket(1000, 60000), ip: new TokenBucket(1000, 60000) },
+  limits: {
+    user: new TokenBucket(1000, 60000),
+    ip: new TokenBucket(1000, 60000),
+    publicIp: new TokenBucket(1000, 60000),
+  },
 };
 
 const NOT_FOUND = { error: { code: "NOT_FOUND", message: "Not found", details: {} } };
@@ -93,6 +98,7 @@ describe("createHandler routing", () => {
       ["GET", "/api/auth/apple/notifications"],
       ["POST", "/api/labels/export"],
       ["GET", "/api/quarantine"],
+      ["POST", "/api/taxonomy/current"],
       ["GET", "/api/quarantine/abc/release"],
     ] as const) {
       const res = await handle(request(method, path));
@@ -146,6 +152,27 @@ describe("createHandler routing", () => {
     expect(res.status).toBe(401);
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe("UNAUTHENTICATED");
   });
+
+  test("GET /api/taxonomy/current reaches the taxonomy handler", async () => {
+    // A stub sql returning the v1 seed rows; the handler is public, so a
+    // session-bearing request must be served too, not tied to an account.
+    const stubSql = (async () => [
+      { raw: "cork", canonical: "cork", taxonomy_version: 1 },
+      { raw: "corkscrew", canonical: "cork", taxonomy_version: 1 },
+    ]) as unknown as SQL;
+    const handleHere = createHandler({ ...deps, sql: stubSql });
+    const headerCases: Record<string, string>[] = [{}, { authorization: "Bearer <redacted>" }];
+    for (const headers of headerCases) {
+      const res = await handleHere(new Request("http://farm.test/api/taxonomy/current", { headers }));
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        taxonomy_version: 1,
+        vocabulary: [{ canonical: "cork", aliases: ["cork", "corkscrew"] }],
+      });
+      expect(res.headers.get("ETag")).toBe('"1"');
+      expect(res.headers.get("Cache-Control")).toBe("max-age=3600");
+    }
+  });
 });
 
 describe("startServer", () => {
@@ -161,7 +188,11 @@ describe("startServer", () => {
   test("POST /api/auth/apple/notifications is per-IP rate limited like sign-in", async () => {
     const limited = startServer(0, {
       ...deps,
-      limits: { user: new TokenBucket(1000, 60000), ip: new TokenBucket(2, 1) },
+      limits: {
+        user: new TokenBucket(1000, 60000),
+        ip: new TokenBucket(2, 1),
+        publicIp: new TokenBucket(1000, 60000),
+      },
     });
     try {
       const url = new URL("/api/auth/apple/notifications", limited.url);
@@ -176,6 +207,30 @@ describe("startServer", () => {
       expect((await post()).status).toBe(500);
       expect((await post()).status).toBe(500);
       const res = await post();
+      expect(res.status).toBe(429);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("RATE_LIMITED");
+      expect(res.headers.get("Retry-After")).not.toBeNull();
+    } finally {
+      limited.stop(true);
+    }
+  });
+
+  test("GET /api/taxonomy/current is per-IP rate limited", async () => {
+    const limited = startServer(0, {
+      ...deps,
+      limits: {
+        user: new TokenBucket(1000, 60000),
+        ip: new TokenBucket(1000, 60000),
+        publicIp: new TokenBucket(2, 1),
+      },
+    });
+    try {
+      const url = new URL("/api/taxonomy/current", limited.url);
+      // The first two pass the limiter and reach the handler (noDatabase
+      // throws on the taxonomy query, so 500 — the point is "not 429").
+      expect((await fetch(url)).status).toBe(500);
+      expect((await fetch(url)).status).toBe(500);
+      const res = await fetch(url);
       expect(res.status).toBe(429);
       expect(((await res.json()) as { error: { code: string } }).error.code).toBe("RATE_LIMITED");
       expect(res.headers.get("Retry-After")).not.toBeNull();

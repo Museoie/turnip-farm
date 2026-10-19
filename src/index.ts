@@ -63,9 +63,11 @@ const server = startServer(config.port, {
   r2: createR2Client(config.r2),
   pipelineKey: config.pipelineKey,
   limits: {
-    // §7.2 suggestions: 60/min per user on POSTs, 10/min per IP on sign-in and notifications.
+    // §7.2 suggestions: 60/min per user on POSTs, 10/min per IP on sign-in
+    // and notifications, 30/min per IP on the public GET endpoints.
     user: new TokenBucket(60, 60),
     ip: new TokenBucket(10, 10),
+    publicIp: new TokenBucket(30, 30),
   },
 });
 console.log(`turnip-farm listening on ${server.url}`);
