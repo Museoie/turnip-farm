@@ -177,10 +177,16 @@ export async function handlePostModels(req: Request, deps: ModelsDeps): Promise<
     if (!row) return null;
     // §1.2.20: ids of sources deleted between the training run and the
     // publish match no row and are skipped, not rejected (§4's shape).
+    // Bun's SQL driver serializes a JS array as bare comma-joined text, so
+    // interpolating the array directly is not a valid Postgres array literal
+    // ("malformed array literal" 500s every publish). The literal is built in
+    // JS instead: every id here passed isVideoId (64-char lowercase hex) in
+    // validatePublishInput, so the joined literal cannot inject.
+    const idLiteral = `{${input.trainingSourceIds.join(",")}}`;
     const recorded = await tx`
       INSERT INTO model_training_sources (model_version, source_id)
       SELECT ${input.version}, s.id FROM sources s
-      WHERE s.id = ANY(${input.trainingSourceIds}::char(64)[])
+      WHERE s.id = ANY(${idLiteral}::char(64)[])
       ON CONFLICT DO NOTHING
       RETURNING source_id`;
     return {

@@ -306,4 +306,16 @@ describe.skipIf(!TEST_DATABASE_URL)("model registry, DB-backed", () => {
       expect(current.headers.get("ETag")).toBe('"trick-v1.2"');
     });
   });
+
+  test("publish with no training_source_ids records no membership", async () => {
+    await inRollback(sql, async (tx) => {
+      const d: ModelsDeps = { sql: tx, pipelineKey: PIPELINE_KEY, r2: stubR2 };
+      const res = await handlePostModels(
+        postReq({ ...validBody(), version: "trick-v1.3", training_source_ids: [] }),
+        d,
+      );
+      expect(res.status).toBe(201);
+      expect(((await res.json()) as Record<string, unknown>).training_sources_recorded).toBe(0);
+    });
+  });
 });
