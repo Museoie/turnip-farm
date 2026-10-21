@@ -314,6 +314,58 @@ describe("startServer", () => {
     }
   });
 
+  // The tests below dial 127.0.0.1, as Caddy does in production, so the
+  // peer is loopback and X-Forwarded-For is honored.
+  test("behind a loopback proxy, the public-GET bucket keys on X-Forwarded-For", async () => {
+    const limited = startServer(0, {
+      ...deps,
+      limits: {
+        user: new TokenBucket(1000, 60000),
+        ip: new TokenBucket(1000, 60000),
+        publicIp: new TokenBucket(2, 1),
+      },
+    });
+    try {
+      const url = `http://127.0.0.1:${limited.port}/api/taxonomy/current`;
+      const get = (client: string) => fetch(url, { headers: { "X-Forwarded-For": client } });
+      // 500 means the request passed the limiter (noDatabase throws).
+      expect((await get("203.0.113.7")).status).toBe(500);
+      expect((await get("203.0.113.7")).status).toBe(500);
+      expect((await get("203.0.113.7")).status).toBe(429);
+      // Another client behind the same proxy has its own bucket.
+      expect((await get("198.51.100.2")).status).toBe(500);
+    } finally {
+      limited.stop(true);
+    }
+  });
+
+  test("behind a loopback proxy, the sign-in bucket keys on X-Forwarded-For", async () => {
+    const limited = startServer(0, {
+      ...deps,
+      limits: {
+        user: new TokenBucket(1000, 60000),
+        ip: new TokenBucket(2, 1),
+        publicIp: new TokenBucket(1000, 60000),
+      },
+    });
+    try {
+      const url = `http://127.0.0.1:${limited.port}/api/auth/apple/notifications`;
+      const post = (client: string) =>
+        fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Forwarded-For": client },
+          body: JSON.stringify({ payload: "x" }),
+        });
+      // 500 means the request passed the limiter (the verifier rejects).
+      expect((await post("203.0.113.7")).status).toBe(500);
+      expect((await post("203.0.113.7")).status).toBe(500);
+      expect((await post("203.0.113.7")).status).toBe(429);
+      expect((await post("198.51.100.2")).status).toBe(500);
+    } finally {
+      limited.stop(true);
+    }
+  });
+
   test("turns an unexpected error into 500 INTERNAL, logging the error but not the request", async () => {
     const logged = spyOn(console, "error").mockImplementation(() => {});
     try {

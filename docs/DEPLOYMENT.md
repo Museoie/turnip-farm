@@ -78,7 +78,8 @@ flowchart LR
   automatic certificates work with no extra setup. The cost is no
   Cloudflare DDoS shielding and a public origin address. Proxying can be
   turned on later (SSL mode *Full (strict)*, Caddy `trusted_proxies`
-  set to Cloudflare's ranges).
+  set to Cloudflare's ranges, and a farm change so per-IP rate limits
+  look past Cloudflare's hop, §3 item 1).
 - **Cloudflare R2** holds pose blobs and model artifacts, never video
   (master plan §1). A second, private bucket holds encrypted database
   backups (§7.3); the farm process never sees it.
@@ -109,19 +110,21 @@ size works with swap (§4.2).
 
 ## 3. Code gaps this runbook depends on
 
-Found while writing this runbook. None is fixed here; each needs its own
-issue (and a design change first where it touches the schema or API).
+Found while writing this runbook, which fixes none of them; each needs
+its own issue (and a design change first where it touches the schema or
+API). Items fixed since are marked.
 
-1. **Per-IP rate limits become global behind Caddy.** `src/app.ts` keys
-   the sign-in, notification and public-GET buckets
-   (`BACKEND_DESIGN.md` §7.2) on `server.requestIP(req)`. Behind Caddy
-   on loopback that is `127.0.0.1` for every request, so on day one the
-   whole user base shares one bucket: 10 sign-ins a minute and 30
-   vocabulary fetches a minute, total. Caddy's `reverse_proxy` already
-   sets `X-Forwarded-For` to the real client address and discards
-   client-supplied values unless `trusted_proxies` is configured, so the
-   fix is small: when the peer is loopback, take the client address from
-   `X-Forwarded-For`. **Recommended before first deployment.**
+1. **Per-IP rate limits behind Caddy (fixed).** The sign-in,
+   notification and public-GET buckets (`BACKEND_DESIGN.md` §7.2) keyed
+   on the socket peer, which behind Caddy on loopback is `127.0.0.1` for
+   every request, so the whole user base would have shared one bucket.
+   When the peer is loopback, the farm now takes the client address from
+   the last `X-Forwarded-For` entry, the one Caddy appended, which a
+   client can't forge (`clientAddress` in `src/ratelimit.ts`); IPv6
+   clients are limited per /64. Behind Cloudflare proxying (§2), with or
+   without `trusted_proxies`, that entry is Cloudflare's edge, so every
+   client behind one edge would share a bucket until the farm learns to
+   skip that hop.
 2. **The farm listens on every interface.** `Bun.serve` is started with
    a port and no hostname, so port 3000 is reachable from the internet
    unless a firewall stops it. §4.2 denies it in two places. An optional
@@ -396,6 +399,8 @@ documentation; Ubuntu's own package lags). Then:
 
 farm.example.com {
 	encode zstd gzip
+	# The farm keys per-IP rate limits on the last X-Forwarded-For
+	# entry, the client address this proxy saw (§3 item 1).
 	reverse_proxy 127.0.0.1:3000
 
 	# Access log to stderr, so journald holds it (§7.1). Caddy redacts
