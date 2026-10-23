@@ -3,7 +3,7 @@
 # the environment only (README, Configuration); no .env file is copied in.
 
 # The Bun version pinned by `packageManager` in package.json.
-FROM oven/bun:1.3.14 AS builder
+FROM oven/bun:1.4.4 AS builder
 
 WORKDIR /app
 
@@ -25,7 +25,7 @@ RUN bun run build
 # dbmate's npm package ships one native binary per platform.
 RUN cp node_modules/@dbmate/linux-*/bin/dbmate /usr/local/bin/dbmate
 
-FROM oven/bun:1.3.14-slim
+FROM oven/bun:1.4.4-slim
 
 WORKDIR /app
 

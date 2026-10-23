@@ -56,7 +56,7 @@ flowchart LR
     ML["turnip-ml (nightly)"] -->|"HTTPS + pipeline key"| Caddy
     Apple["Apple server-to-server<br/>notifications"] -->|"HTTPS"| Caddy
     subgraph Droplet["DigitalOcean droplet · Ubuntu 24.04"]
-        Caddy["Caddy<br/>TLS · access log"] -->|"127.0.0.1:3000"| Farm["turnip-farm<br/>Bun 1.3.14 · systemd"]
+        Caddy["Caddy<br/>TLS · access log"] -->|"127.0.0.1:3000"| Farm["turnip-farm<br/>Bun 1.4.4 · systemd"]
         Farm --> PG[("Postgres 16<br/>localhost")]
         Backup["nightly pg_dump + age"] --> PG
     end
@@ -257,20 +257,20 @@ logrotate rule, which keeps weeks of history: cap it per §7.1.
 
 ### 4.4 Bun
 
-Install the version CI uses, 1.3.14 (`packageManager` in
+Install the version CI uses, 1.4.4 (`packageManager` in
 `package.json`), system-wide from the GitHub release, checking it
 against the release's `SHASUMS256.txt`. If `grep -c avx2 /proc/cpuinfo`
 prints `0`, use the `bun-linux-x64-baseline` build instead.
 
 ```sh
 cd "$(mktemp -d)"
-v=bun-v1.3.14; f=bun-linux-x64.zip
+v=bun-v1.4.4; f=bun-linux-x64.zip
 curl -fsSLO "https://github.com/oven-sh/bun/releases/download/$v/$f"
 curl -fsSLO "https://github.com/oven-sh/bun/releases/download/$v/SHASUMS256.txt"
 grep " $f\$" SHASUMS256.txt | sha256sum -c -
 apt install -y unzip && unzip "$f"
 install -m 0755 bun-linux-x64/bun /usr/local/bin/bun
-bun --version                              # 1.3.14
+bun --version                              # 1.4.4
 ```
 
 ### 4.5 Service user and layout
