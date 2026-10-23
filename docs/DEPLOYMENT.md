@@ -31,8 +31,17 @@ These are decisions, not tasks. They land **before** the first deploy:
    is a placeholder.
 3. Create a non-root deploy user, lock down SSH (key-only), enable
    `ufw` allowing 22, 80, 443.
-4. Install the runtime dependencies:
-   - Bun (see `packageManager: bun@1.3.14` in `package.json`).
+4. Create the service user and its layout (as root) — the systemd unit
+   in §4 runs as this user:
+   `useradd --system --shell /usr/sbin/nologin turnip-farm`
+   `mkdir -p /opt/turnip-farm /etc/turnip-farm`
+   `chown turnip-farm:turnip-farm /opt/turnip-farm /etc/turnip-farm`
+5. Install the runtime dependencies:
+   - Bun, installed system-wide: `BUN_INSTALL=/usr/local bash` on the
+     bun.sh installer gives `/usr/local/bin/bun` (see `packageManager`
+     in `package.json` for the pinned version). Do NOT install as root into
+     `/root/.bun` — `/root` is mode `0700`, so the service user gets
+     EACCES on the binary itself.
    - Postgres 16 (`postgresql-16`), `postgresql-client-16` for `pg_dump`.
    - Caddy.
    - `dbmate` is a devDependency (`bun run db:migrate`); no separate
@@ -51,11 +60,12 @@ Keep them in a systemd `EnvironmentFile` (e.g.
 | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET` | Cloudflare R2; one bucket for pose blobs and model artifacts |
 | `APP_BUNDLE_ID` | The iOS app's bundle id — the Sign in with Apple `aud` claim (`BACKEND_DESIGN.md` §7.1) |
 | `APPLE_TEAM_ID`, `APPLE_KEY_ID` | Apple Developer account |
-| `APPLE_PRIVATE_KEY` | PKCS#8 PEM of the `.p8` key; multiline — `EnvironmentFile` handles it, and startup validates the key shape before anything else runs |
+| `APPLE_PRIVATE_KEY` | PKCS#8 PEM of the `.p8` key, on one line with newlines as `\n` (`src/config.ts` decodes them). A literal multiline PEM does NOT work: systemd's `EnvironmentFile` ignores lines without `=`, so only the first line would load — it passes the PKCS#8-header shape check, then `importApplePrivateKey` fails at startup and the service exits 1 |
 | `APPLE_REFRESH_TOKEN_KEY` | 32 random bytes (base64) — the AES-256-GCM key for `users.apple_refresh_token`. Generate with `openssl rand -base64 32` |
 | `TURNIP_PIPELINE_KEY` | Random service key for the pipeline endpoints (`BACKEND_DESIGN.md` §7.1). See §9 for rotation |
 | `PORT` | Optional; defaults to `3000` |
 | `INGEST_POLL_INTERVAL_MS` | Optional; ingest poll interval, defaults to `30000`. `0` disables the poller (e.g. when R2 event notifications drive ingest instead) |
+| `TRUSTED_PROXIES` | Optional; trusted proxy addresses and CIDRs, comma-separated (`src/config.ts` validates the entries, `src/index.ts` feeds them to the rate-limit client-address walk). Set it to the proxy's subnet when the service sits behind a proxy on a non-loopback network (e.g. the Docker/CD image path) — otherwise every client looks like the proxy's address. Harmless to omit behind Caddy on loopback (`BACKEND_DESIGN.md` §7.2) |
 
 ## 3. Postgres
 
@@ -87,7 +97,7 @@ After=network.target postgresql.service
 User=turnip-farm
 WorkingDirectory=/opt/turnip-farm
 EnvironmentFile=/etc/turnip-farm/env
-ExecStart=/root/.bun/bin/bun dist/index.js
+ExecStart=/usr/local/bin/bun dist/index.js
 Restart=always
 RestartSec=5
 
@@ -137,8 +147,9 @@ log line ever does, that's a code bug, not a log-config problem.
   and model artifacts. Keys contain only the opaque source ID; nothing
   in a key identifies a person or a device (§8).
 - Presigned URLs are per-request, single-blob, short-lived. The design
-  doc assumes 15-minute TTLs (`BACKEND_DESIGN.md` §9 Q4); the runbook
-  recommends **15 minutes** until the maintainer decides otherwise.
+  doc assumes 15-minute TTLs (`BACKEND_DESIGN.md` §9 Q4); the TTL is
+  fixed in code at `PRESIGN_TTL_SEC = 15 * 60` (`src/r2/presign.ts`) —
+  changing it is a code change, not an operator knob.
 - The client uploads staged blobs (`staging/<video_id>.tkp1.gz`) with a
   presigned PUT; the ingest worker canonicalizes them (see §8 below).
 
