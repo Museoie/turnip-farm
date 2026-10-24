@@ -107,7 +107,7 @@ Dockerfile         the production image (see Deployment)
 
 ## Development
 
-Requires [Bun](https://bun.sh) 1.3.14, the version pinned by `packageManager`
+Requires [Bun](https://bun.sh) 1.4.4, the version pinned by `packageManager`
 in `package.json` and installed by CI.
 
 ```sh
