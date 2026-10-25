@@ -111,7 +111,10 @@ load-balancer / smoke-test probe.
 
 ## 5. Deploy and rollback
 
-Deploy (from the droplet, as the deploy user):
+Deploy (from the droplet). Steps 1–3 run **as the `turnip-farm` service
+user** (e.g. `sudo -u turnip-farm -s` from the deploy user): §1 step 4
+chowns `/opt/turnip-farm` to `turnip-farm:turnip-farm`, so running them
+as the deploy user fails with EACCES. Step 4 needs root/sudo (systemd).
 
 1. `git pull` the release ref.
 2. `bun install --frozen-lockfile && bun run build`.
