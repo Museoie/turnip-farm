@@ -4,6 +4,7 @@ import {
   isUuid,
   isVideoId,
   provenanceProblem,
+  readJsonObject,
   readLabels,
   readProvenance,
 } from "./validate";
@@ -128,5 +129,40 @@ describe("provenanceProblem", () => {
 
   test("a blind sample showed nothing to keep", () => {
     expect(provenanceProblem({ ...model, suggestions_withheld: true }, kept)).toMatchObject({ field: "labels" });
+  });
+});
+
+describe("readJsonObject", () => {
+  const post = (body?: string) =>
+    new Request("http://localhost/contrib", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+
+  test("valid JSON object passes through", async () => {
+    expect(await readJsonObject(post(JSON.stringify({ video_id: "a".repeat(64), n: 1 })))).toEqual({
+      video_id: "a".repeat(64),
+      n: 1,
+    });
+  });
+
+  test("non-JSON body returns null", async () => {
+    expect(await readJsonObject(post("not json {"))).toBeNull();
+  });
+
+  test("JSON array returns null", async () => {
+    expect(await readJsonObject(post(JSON.stringify([1, 2])))).toBeNull();
+  });
+
+  test("JSON scalars return null", async () => {
+    expect(await readJsonObject(post("42"))).toBeNull();
+    expect(await readJsonObject(post(JSON.stringify("cork")))).toBeNull();
+    expect(await readJsonObject(post("true"))).toBeNull();
+    expect(await readJsonObject(post("null"))).toBeNull();
+  });
+
+  test("empty body returns null", async () => {
+    expect(await readJsonObject(post())).toBeNull();
   });
 });
