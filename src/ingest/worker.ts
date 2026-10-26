@@ -19,6 +19,7 @@
 // bytes is never stored.
 
 import type { SQL } from "bun";
+import { BlobTooLargeError } from "../r2/client";
 import { type BlobStore } from "./store";
 import {
   decodeTkp1,
@@ -87,7 +88,18 @@ export async function ingestStagedSource(deps: IngestDeps, sourceId: string): Pr
   const row = await deps.sources.get(sourceId);
   if (!row) throw new IngestError("unknown-source", sourceId);
 
-  const staged = await deps.store.get(stagingKeyFor(sourceId));
+  let staged;
+  try {
+    staged = await deps.store.get(stagingKeyFor(sourceId));
+  } catch (err) {
+    // An oversized staged upload is a failed ingest, not a crash: keep it
+    // in the worker's failure contract so pollStagingOnce records it and
+    // moves on to the next source instead of stalling the poll.
+    if (err instanceof BlobTooLargeError) {
+      throw new IngestError("staged-too-large", `${stagingKeyFor(sourceId)} exceeds ${err.maxBytes} bytes`);
+    }
+    throw err;
+  }
   if (staged === null) return { status: "nothing-staged" };
 
   if (staged.checksumSha256 !== null) {
@@ -99,7 +111,7 @@ export async function ingestStagedSource(deps: IngestDeps, sourceId: string): Pr
 
   let canonical: Uint8Array<ArrayBuffer>;
   try {
-    canonical = gzipCanonical(encodeTkp1(resampleToCanonical10Hz(decodeTkp1(gunzipStaged(staged.bytes)))));
+    canonical = gzipCanonical(encodeTkp1(resampleToCanonical10Hz(decodeTkp1(await gunzipStaged(staged.bytes)))));
   } catch (err) {
     if (err instanceof Tkp1Error) throw new IngestError("invalid-staged-blob", err.reason);
     throw err;

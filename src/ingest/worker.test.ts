@@ -2,6 +2,7 @@
 // upload becomes the canonical blob, or the ingest fails cleanly.
 import { SQL } from "bun";
 import { describe, expect, test } from "bun:test";
+import { BlobTooLargeError } from "../r2/client";
 import { TEST_DATABASE_URL, inRollback } from "../../db/testing";
 import { type BlobStore, type StoredObject } from "./store";
 import { decodeTkp1, encodeTkp1, gunzipStaged } from "./tkp1";
@@ -100,9 +101,9 @@ describe("ingestStagedSource", () => {
 
     const stored = await store.get(canonicalKeyFor(ID_A));
     expect(stored).not.toBeNull();
-    const decoded = decodeTkp1(gunzipStaged(stored!.bytes));
+    const decoded = decodeTkp1(await gunzipStaged(stored!.bytes));
     expect(decoded.frameCount).toBe(11); // floor(30/30*10)+1
-    const view = new DataView(gunzipStaged(stored!.bytes).buffer);
+    const view = new DataView((await gunzipStaged(stored!.bytes)).buffer);
     expect(view.getFloat32(12, true)).toBe(10);
 
     // sources.sha256 is the digest of the stored bytes.
@@ -187,6 +188,25 @@ describe("ingestStagedSource", () => {
     await expect(ingestStagedSource(d, ID_A)).rejects.toThrow(/unknown-source/);
   });
 
+  test("oversized staged download → staged-too-large IngestError, nothing stored", async () => {
+    const { sources } = deps();
+    sources.add(ID_A);
+    const throwingStore: BlobStore = {
+      async get() {
+        throw new BlobTooLargeError(stagingKeyFor(ID_A), 64 * 1024 * 1024);
+      },
+      async put() {},
+      async delete() {},
+      async list() {
+        return [];
+      },
+    };
+    await expect(ingestStagedSource({ store: throwingStore, sources }, ID_A)).rejects.toThrow(
+      /staged-too-large/,
+    );
+    expect(sources.rows.get(ID_A)!.sha256).toBeNull();
+  });
+
   test("gaps break interpolation through the worker", async () => {
     const { store, sources, d } = deps();
     sources.add(ID_A);
@@ -194,7 +214,7 @@ describe("ingestStagedSource", () => {
     stage(store, ID_A, makeBlob(5, 24, 3), true);
     await ingestStagedSource(d, ID_A);
     const stored = await store.get(canonicalKeyFor(ID_A));
-    const decoded = decodeTkp1(gunzipStaged(stored!.bytes));
+    const decoded = decodeTkp1(await gunzipStaged(stored!.bytes));
     expect(decoded.frameCount).toBe(2);
     const v1 = new DataView(decoded.frames[1]!.buffer, decoded.frames[1]!.byteOffset);
     const allZeroConf = Array.from({ length: 17 }, (_, k) => v1.getFloat32(k * 12 + 8, true)).every((c) => c === 0);

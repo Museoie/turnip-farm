@@ -2,6 +2,8 @@
 // implementation. The ingest worker only depends on BlobStore, so tests
 // substitute an in-memory fake.
 
+import { BlobTooLargeError, MAX_CANONICAL_BLOB_BYTES } from "../r2/client";
+
 export interface StoredObject {
   bytes: Uint8Array<ArrayBuffer>;
   // Base64 SHA-256 the object was stored with (x-amz-checksum-sha256),
@@ -116,15 +118,62 @@ async function signRequest(
 }
 
 export class R2BlobStore implements BlobStore {
-  constructor(private readonly cfg: R2Config) {}
+  private readonly doFetch: typeof fetch;
+  private readonly maxBytes: number;
+
+  constructor(
+    private readonly cfg: R2Config,
+    opts: { fetch?: typeof fetch; maxBytes?: number } = {},
+  ) {
+    this.doFetch = opts.fetch ?? fetch;
+    this.maxBytes = opts.maxBytes ?? MAX_CANONICAL_BLOB_BYTES;
+  }
 
   async get(key: string): Promise<StoredObject | null> {
     const { url, headers } = await signRequest(this.cfg, "GET", key, {}, {}, null);
-    const res = await fetch(url, { method: "GET", headers });
+    const res = await this.doFetch(url, { method: "GET", headers });
     if (res.status === 404) return null;
     if (!res.ok) throw new R2Error(res.status, "GET", await res.text());
+    // Stream with a running total instead of res.arrayBuffer(): the staged
+    // object is the uploader-controlled blob the threat model names
+    // (presigned PUTs cannot enforce content-length), so an unbounded read
+    // lets one oversized upload exhaust the farm process's memory. The cap
+    // reuses MAX_CANONICAL_BLOB_BYTES — a staged upload is at most 3x the
+    // canonical rate, so 64 MiB still covers ~3 hours of footage — and
+    // mirrors the canonical path's getBytes, including its content-length
+    // fast path (headers can lie, so the stream is still counted).
+    const declared = res.headers.get("content-length");
+    if (declared !== null && Number(declared) > this.maxBytes) {
+      await res.body?.cancel().catch(() => {});
+      throw new BlobTooLargeError(key, this.maxBytes);
+    }
+    const reader = res.body?.getReader();
+    if (!reader) {
+      return {
+        bytes: new Uint8Array(await res.arrayBuffer()),
+        checksumSha256: res.headers.get("x-amz-checksum-sha256"),
+      };
+    }
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > this.maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new BlobTooLargeError(key, this.maxBytes);
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let off = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, off);
+      off += chunk.byteLength;
+    }
     return {
-      bytes: new Uint8Array(await res.arrayBuffer()),
+      bytes,
       checksumSha256: res.headers.get("x-amz-checksum-sha256"),
     };
   }
