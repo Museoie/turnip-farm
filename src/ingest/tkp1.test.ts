@@ -83,8 +83,21 @@ describe("TKP1 codec", () => {
     expect(() => decodeTkp1(mutate(section111()))).toThrow(Tkp1Error);
   });
 
-  test("gunzip rejects non-gzip", () => {
-    expect(() => gunzipStaged(new TextEncoder().encode("not gzip"))).toThrow(Tkp1Error);
+  test("gunzip rejects non-gzip", async () => {
+    await expect(gunzipStaged(new TextEncoder().encode("not gzip"))).rejects.toThrow(Tkp1Error);
+  });
+
+  test("gunzip rejects output over maxBytes without expanding it", async () => {
+    // 1,000 zero bytes gzip to ~30 bytes: a zip bomb in miniature. With a
+    // 10-byte cap the stream must fail once the expansion passes the cap,
+    // not after buffering the whole expansion.
+    const bomb = Bun.gzipSync(new Uint8Array(1000));
+    await expect(gunzipStaged(bomb, { maxBytes: 10 })).rejects.toThrow(/exceeds 10 bytes/);
+  });
+
+  test("gunzip passes output under maxBytes through", async () => {
+    const blob = section111();
+    await expect(gunzipStaged(Bun.gzipSync(blob), { maxBytes: blob.length })).resolves.toEqual(blob);
   });
 
   test("gzip is deterministic (mtime = 0), so re-ingest is idempotent", () => {

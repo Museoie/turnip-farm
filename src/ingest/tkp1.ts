@@ -1,6 +1,10 @@
+import { MAX_CANONICAL_BLOB_BYTES } from "../r2/client";
+
 // TKP1 pose-blob codec and canonical 10 Hz resampling (POSE_FORMAT.md).
-// Pure functions: no I/O, no clock. The ingest worker (worker.ts) wires
-// these to R2 and Postgres.
+// Pure functions: no I/O, no clock, except gunzipStaged, which streams
+// its decompression so a hostile staged blob cannot exhaust memory
+// before the size check. The ingest worker (worker.ts) wires these to
+// R2 and Postgres.
 
 export const TKP1_MAGIC = "TKP1";
 export const TKP1_VERSION = 1;
@@ -160,10 +164,42 @@ export function gzipCanonical(uncompressed: Uint8Array<ArrayBuffer>): Uint8Array
   return Bun.gzipSync(uncompressed);
 }
 
-export function gunzipStaged(gzipped: Uint8Array<ArrayBuffer>): Uint8Array<ArrayBuffer> {
+// Decompress a staged blob with a hard output cap. A bare gunzipSync
+// buffers the entire expansion, so a zip bomb exhausts the farm process
+// before decodeTkp1's size check ever runs. The cap reuses
+// MAX_CANONICAL_BLOB_BYTES: a staged blob decompresses to at most 3x
+// the canonical rate (30 Hz vs 10 Hz), so 64 MiB is still ~3 hours of
+// footage — orders of magnitude above any legit session — while the
+// farm never buffers more than the cap for one staged object.
+export async function gunzipStaged(
+  gzipped: Uint8Array<ArrayBuffer>,
+  opts: { maxBytes?: number } = {},
+): Promise<Uint8Array<ArrayBuffer>> {
+  const maxBytes = opts.maxBytes ?? MAX_CANONICAL_BLOB_BYTES;
   try {
-    return Bun.gunzipSync(gzipped);
-  } catch {
+    const stream = new Blob([gzipped]).stream().pipeThrough(new DecompressionStream("gzip"));
+    const reader = stream.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        throw new Tkp1Error(`staged decompressed size exceeds ${maxBytes} bytes`);
+      }
+      chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, off);
+      off += chunk.byteLength;
+    }
+    return out;
+  } catch (err) {
+    if (err instanceof Tkp1Error) throw err;
     throw new Tkp1Error("staged object is not valid gzip");
   }
 }
