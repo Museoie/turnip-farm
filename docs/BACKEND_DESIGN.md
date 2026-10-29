@@ -805,10 +805,11 @@ service key, `Authorization: Bearer <TURNIP_PIPELINE_KEY>`.
 **Apple** (`POST /api/auth/apple/notifications`): no bearer token; the
 body is a JWT signed by Apple, verified as below.
 
-**Public** (`GET /api/models/current`, `GET /api/taxonomy/current`): no
+**Public** (`GET /api/models/current`, `GET /api/taxonomy/current`,
+`GET /api/stats`): no
 bearer token and no user (§1.2.19). A client that has a session may
-send it; the farm ignores it on these two endpoints, so a request never
-ties a manifest or vocabulary fetch to an account.
+send it; the farm ignores it on these endpoints, so a request never
+ties a manifest, vocabulary, or stats fetch to an account.
 
 **Verifying an Apple JWT.** The identity token at sign-in, the `id_token`
 returned by the code exchange, and server-to-server notifications are
@@ -905,7 +906,7 @@ for `users.apple_refresh_token`).
   (suggested: 60 requests/minute; `429 RATE_LIMITED` with
   `Retry-After`). `POST /api/auth/apple` has no user yet, so it is
   limited per client IP (suggested: 10 requests/minute), and so are
-  the two public endpoints (suggested: 30 requests/minute; both are
+  the three public endpoints (suggested: 30 requests/minute; all are
   cacheable, see §7.3). The client IP is the socket peer's address,
   with IPv6 limited per /64, unless the peer is a trusted proxy:
   loopback (a reverse proxy on the same host), or an address in the
@@ -1340,6 +1341,32 @@ mapping (so a renamed canonical lists its old name as an alias, §3).
 Served with an `ETag` of the `taxonomy_version` and
 `Cache-Control: max-age=3600`. Always `200`: the seed migration defines
 version 1.
+
+#### `GET /api/stats` — community totals and daily series
+
+Public: no session (§7.1). Aggregate-only totals and daily series for
+the public site's stats section: user signups and labeling
+contributions over the last 90 UTC days, including today. Response
+`200`:
+
+```json
+{
+  "totals": {"users": 12, "sources": 48, "clips": 210, "labels": 530},
+  "users_by_day": [{"date": "2026-10-29", "count": 2}],
+  "labels_by_day": [{"date": "2026-10-29", "count": 9}]
+}
+```
+
+Each series has one row per UTC day for the window, including days
+with no rows, so the frontend draws one bar per day. Bucketing is
+UTC-explicit (`(created_at AT TIME ZONE 'UTC')::date`), independent of
+the session timezone. Counts include every row, quarantined or not:
+this is community activity, not the training set (§6's quarantine
+exclusion does not apply). The queries never join
+`source_attribution` or any other per-account link, so no response can
+tie a contribution to an account (§1, §1.2.17). Served with
+`Cache-Control: max-age=60` and no ETag — the payload has no single
+version to hash. Always `200`: an empty farm reports zeros.
 
 #### `POST /api/models` — pipeline publishes the champion (service key)
 

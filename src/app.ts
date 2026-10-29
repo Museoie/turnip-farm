@@ -17,6 +17,7 @@ import { handlePostClipLabels, handlePostClips } from "./contrib/clips";
 import { handleGetLabelsExport } from "./export";
 import { handleGetTaxonomyCurrent } from "./taxonomy";
 import { handleGetModelsCurrent, handlePostModels } from "./models";
+import { handleGetStats } from "./stats";
 import {
   handlePostQuarantine,
   handlePurgeQuarantine,
@@ -150,6 +151,11 @@ export function createHandler(deps: AppDeps, opts: HandlerOptions = {}): (req: R
           return handleGetModelsCurrent(req, deps);
         }
       }
+      if (seg[1] === "stats") {
+        if (method === "GET" && seg.length === 2) {
+          return handleGetStats(req, deps);
+        }
+      }
       if (seg[1] === "quarantine") {
         if (method === "POST" && seg.length === 2) return handlePostQuarantine(req, deps);
         if (method === "POST" && seg.length === 4 && isVideoId(seg[2])) {
@@ -203,7 +209,9 @@ export function startServer(port: number, deps: AppDeps, opts: HandlerOptions = 
       // cacheable, so legitimate clients rarely touch the bucket.
       if (
         req.method === "GET" &&
-        (pathname === "/api/taxonomy/current" || pathname === "/api/models/current")
+        (pathname === "/api/taxonomy/current" ||
+          pathname === "/api/models/current" ||
+          pathname === "/api/stats")
       ) {
         const ip = clientIp();
         if (!deps.limits.publicIp.take(ip)) {
