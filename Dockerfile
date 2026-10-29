@@ -12,6 +12,7 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 
 COPY tsconfig.json ./
+COPY vite.config.ts ./
 COPY src src
 COPY db db
 COPY scripts scripts
@@ -30,7 +31,7 @@ FROM oven/bun:1.4.4-slim
 WORKDIR /app
 
 COPY --from=builder /usr/local/bin/dbmate /usr/local/bin/dbmate
-COPY --chown=bun:bun --from=builder /app/dist ./dist
+COPY --chown=bun:bun --from=builder /app/build ./build
 COPY --chown=bun:bun db/migrations ./db/migrations
 # The maintainer scripts run from source and need no node_modules:
 #   docker exec <container> bun run moderation:block <account_id>
@@ -49,4 +50,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
 # Migrations are additive and re-runnable (BACKEND_DESIGN.md §2), so applying
 # them on every start is safe. --wait rides out a database that is still
 # starting.
-CMD ["sh", "-c", "dbmate --wait --no-dump-schema migrate && exec bun dist/index.js"]
+CMD ["sh", "-c", "dbmate --wait --no-dump-schema migrate && exec bun build/server/bundle.js"]

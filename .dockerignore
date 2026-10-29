@@ -2,7 +2,7 @@
 .*
 
 # Ignore build outputs and dependencies; the builder installs and builds
-dist
+build
 node_modules
 
 # Not needed to build or run

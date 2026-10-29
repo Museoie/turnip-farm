@@ -1,12 +1,13 @@
 {
   "compilerOptions": {
     "target": "ESNext",
-    "lib": ["ESNext"],
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
     "module": "Preserve",
     "moduleDetection": "force",
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
+    "jsx": "react-jsx",
     "noEmit": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
@@ -15,5 +16,5 @@
     "skipLibCheck": true,
     "types": ["bun"]
   },
-  "include": ["src", "db", "scripts"]
+  "include": ["src", "db", "scripts", "vite.config.ts"]
 }

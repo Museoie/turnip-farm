@@ -84,7 +84,9 @@ Keep them in a systemd `EnvironmentFile` (e.g.
 ## 4. The Bun service
 
 Build once per deploy: `bun install --frozen-lockfile && bun run build`
-produces `dist/`. Start with `bun run start` (`bun dist/index.js`).
+produces `build/` (the server bundle in `build/server/` and the web
+client in `build/client/`). Start with `bun run start`
+(`bun build/server/bundle.js`).
 
 systemd unit (`/etc/systemd/system/turnip-farm.service`):
 
@@ -97,7 +99,7 @@ After=network.target postgresql.service
 User=turnip-farm
 WorkingDirectory=/opt/turnip-farm
 EnvironmentFile=/etc/turnip-farm/env
-ExecStart=/usr/local/bin/bun dist/index.js
+ExecStart=/usr/local/bin/bun build/server/bundle.js
 Restart=always
 RestartSec=5
 
@@ -121,8 +123,8 @@ as the deploy user fails with EACCES. Step 4 needs root/sudo (systemd).
 3. `bun run db:migrate` (with `DATABASE_URL` set).
 4. `systemctl restart turnip-farm`, then `curl localhost:3000/healthz`.
 
-Rollback: keep the previous `dist/` as `dist.prev` before step 2
-(`cp -r dist dist.prev`). To roll back, restore it and restart; run
+Rollback: keep the previous `build/` as `build.prev` before step 2
+(`cp -r build build.prev`). To roll back, restore it and restart; run
 `bun run db:rollback` only if the deploy migrated — migrations are
 written additive, so most rollbacks don't touch the database.
 

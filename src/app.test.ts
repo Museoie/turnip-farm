@@ -1,4 +1,7 @@
 import { afterAll, describe, expect, spyOn, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type AppDeps, createHandler, startServer } from "./app";
 import { noDatabase } from "./auth/testing";
 import type { R2Client } from "./r2/client";
@@ -223,6 +226,86 @@ describe("createHandler routing", () => {
       expect(res.headers.get("ETag")).toBe('"trick-v1.2"');
       expect(res.headers.get("Cache-Control")).toBe("max-age=300");
     }
+  });
+});
+
+describe("createHandler static client serving", () => {
+  let dir: string;
+  let noIndexDir: string;
+
+  const setup = async () => {
+    dir = await mkdtemp(join(tmpdir(), "farm-client-"));
+    await mkdir(join(dir, "assets"));
+    await writeFile(join(dir, "index.html"), "<h1>farm</h1>");
+    await writeFile(join(dir, "assets", "app.js"), "console.log(1);");
+    noIndexDir = await mkdtemp(join(tmpdir(), "farm-client-noindex-"));
+    await writeFile(join(noIndexDir, "app.js"), "console.log(1);");
+  };
+  const cleanup = async () => {
+    await rm(dir, { recursive: true, force: true });
+    await rm(noIndexDir, { recursive: true, force: true });
+  };
+
+  test("serves the client shell, assets, and the SPA fallback", async () => {
+    await setup();
+    try {
+      const handle = createHandler(deps, { clientDir: dir });
+      const request = (path: string) => new Request(`http://farm.test${path}`);
+
+      const root = await handle(request("/"));
+      expect(root.status).toBe(200);
+      expect(await root.text()).toBe("<h1>farm</h1>");
+      expect(root.headers.get("Content-Type")).toContain("text/html");
+
+      const asset = await handle(request("/assets/app.js"));
+      expect(asset.status).toBe(200);
+      expect(await asset.text()).toBe("console.log(1);");
+
+      const route = await handle(request("/some/client/route"));
+      expect(route.status).toBe(200);
+      expect(await route.text()).toBe("<h1>farm</h1>");
+
+      const health = await handle(request("/healthz"));
+      expect(health.status).toBe(200);
+      expect(await health.json()).toEqual({ status: "ok" });
+
+      // Unknown /api/* paths 404 in the API shape; they never serve the SPA.
+      const unknownApi = await handle(request("/api/nope"));
+      expect(unknownApi.status).toBe(404);
+      expect(await unknownApi.json()).toEqual(NOT_FOUND);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("does not serve outside the client directory, and only serves GET", async () => {
+    await setup();
+    try {
+      const handle = createHandler(deps, { clientDir: dir });
+      // %2F survives URL parsing, so the handler itself must stop the escape.
+      expect((await handle(new Request("http://farm.test/..%2Fsecret"))).status).toBe(404);
+      expect(
+        (await handle(new Request("http://farm.test/", { method: "POST" }))).status,
+      ).toBe(404);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("404s when the client directory has no index.html", async () => {
+    await setup();
+    try {
+      const handle = createHandler(deps, { clientDir: noIndexDir });
+      expect((await handle(new Request("http://farm.test/"))).status).toBe(404);
+      expect((await handle(new Request("http://farm.test/app.js"))).status).toBe(200);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("without a client directory, non-API paths stay 404", async () => {
+    const handle = createHandler(deps);
+    expect((await handle(new Request("http://farm.test/"))).status).toBe(404);
   });
 });
 

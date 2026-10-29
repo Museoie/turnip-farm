@@ -60,12 +60,29 @@ in place as dbmate migrations.
   attribution 30 days after a source's last write and reports 30 days
   after they are filed.
 
+The server also serves a public website at `/`, built from `src/client`
+(Vite + React) with the same build split as the budget repo — `vite build`
+into `build/client`, the server bundled into `build/server/bundle.js`.
+The site is the marketing home page, the support and privacy pages
+(ported from the turnip-ios repo's `site/`), and the read-only status
+page at `/status`, showing service health, the current champion model,
+and the vocabulary. The status page reads only the public endpoints
+above; it never authenticates and never shows the model's presigned R2
+URL.
+
 ## Layout
 
 ```
 src/
   index.ts         entry point: loads config; starts the server, purge, and ingest poller;
                    shuts them down gracefully on SIGTERM
+  pack.ts          server bundler (bun build): src/index.ts → build/server/bundle.js
+  client/          the web client (Vite + React): the public site — the
+                   marketing home at `/`, support and privacy pages, and
+                   the read-only status page at `/status`; builds into
+                   build/client
+    pages/         Home, Support, Privacy, Status; App.tsx is the shell
+                   (header/footer) and pathname router
   app.ts           HTTP routing
   errors.ts        the API error shape (BACKEND_DESIGN.md §7.2)
   ratelimit.ts     per-user and per-IP token buckets, and the client address they key on (§7.2)
@@ -113,16 +130,23 @@ in `package.json` and installed by CI.
 ```sh
 bun install
 cp .env.example .env   # then fill in the values
-bun run dev            # watch mode on http://localhost:3000
+bun run dev            # API in watch mode on :3000 + Vite dev server on :5173
 curl -i localhost:3000/healthz
 ```
+
+`bun run dev` runs the API and the Vite dev server together; Vite proxies
+`/api` to the API, and the site is at http://localhost:5173 (the status
+page at /status). In
+production `bun run build` produces `build/server/bundle.js` and
+`build/client/`, and the server serves the built client at `/` itself.
 
 | Command               | What it does                                  |
 | --------------------- | --------------------------------------------- |
 | `bun test`            | Run the test suite                            |
 | `bun run typecheck`   | Type-check with `tsc --noEmit`                |
-| `bun run build`       | Bundle `src/index.ts` into `dist/`            |
-| `bun run start`       | Run the bundle in `dist/` (build first)       |
+| `bun run build`       | Build the server bundle and the web client into `build/` |
+| `bun run start`       | Build, then run `build/server/bundle.js` (serves the client at `/`) |
+| `bun run dev`         | API in watch mode + Vite dev server on :5173 (proxies `/api`) |
 | `bun run db:migrate`  | Apply pending migrations to `DATABASE_URL`    |
 | `bun run db:rollback` | Unrecord the newest migration (down is empty) |
 | `bun run db:status`   | List applied and pending migrations           |

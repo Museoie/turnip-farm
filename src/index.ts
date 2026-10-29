@@ -1,4 +1,5 @@
 import { SQL } from "bun";
+import { join, resolve } from "node:path";
 import { startServer } from "./app";
 import { createAppleJwtVerifier, createAppleRevoker, createAppleTokenVerifier, createCodeExchanger, importApplePrivateKey } from "./auth/apple";
 import { importRefreshTokenKey } from "./auth/tokens";
@@ -52,6 +53,14 @@ await purge();
 const purgeTimer = setInterval(purge, 60 * 60 * 1000);
 purgeTimer.unref?.();
 
+// The built web client lives next to the server bundle (build/client).
+// Run from source there is no build, so the API runs without file serving
+// and Vite serves the client in development (bun run dev).
+const clientCandidate = resolve(import.meta.dir, "..", "client");
+const clientDir = (await Bun.file(join(clientCandidate, "index.html")).exists())
+  ? clientCandidate
+  : undefined;
+
 const server = startServer(config.port, {
   sql,
   verifyIdentityToken: createAppleTokenVerifier({ audience: config.appBundleId }),
@@ -70,7 +79,7 @@ const server = startServer(config.port, {
     publicIp: new TokenBucket(30, 30),
     trustedProxies: config.trustedProxies,
   },
-});
+}, { clientDir });
 console.log(`turnip-farm listening on ${server.url}`);
 
 // The ingest worker's "or poll" trigger (BACKEND_DESIGN.md §1.2.10):
