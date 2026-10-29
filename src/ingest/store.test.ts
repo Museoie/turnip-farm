@@ -3,6 +3,10 @@
 // The signer was previously untestable: it used the global fetch and
 // `new Date()` directly, while the worker tests substitute a fake.
 //
+// The bounded-download tests below pin the cap on `get` (chunked bodies
+// exceeding it, a declared content-length over it) against the same
+// capturing fetch, with the cap set explicitly small.
+//
 // The expected signature below is recomputed in this file from the SigV4
 // spec (canonical request + HMAC key chain via node:crypto), independently
 // of the store's WebCrypto implementation — a canonicalization slip in
@@ -11,6 +15,7 @@
 
 import { createHash, createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
+import { BlobTooLargeError } from "../r2/client";
 import { R2BlobStore, R2Error } from "./store";
 
 const CFG = {
@@ -94,6 +99,69 @@ function capturingFetch(
 }
 
 const EMPTY_HASH = sha256Hex(new Uint8Array(0));
+
+const KEY = "staging/abcd.tkp1.gz";
+
+function streamOf(chunks: number[]): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const n of chunks) controller.enqueue(new Uint8Array(n));
+      controller.close();
+    },
+  });
+}
+
+describe("R2BlobStore.get bounded download", () => {
+  // The staged object is the uploader-controlled blob, so `get` must cap
+  // the download like the canonical path's getBytes: a declared
+  // content-length over the cap rejects before reading, and a chunked
+  // stream rejects once the running total passes the cap. The cap is set
+  // explicitly small here (10 bytes) so removing it from `get` fails
+  // these tests instead of passing silently at the 64 MiB default.
+  test("returns bytes and checksum when under the explicit cap", async () => {
+    const data = new Uint8Array([1, 2, 3, 4]);
+    const { fetch } = capturingFetch(
+      () =>
+        new Response(data, {
+          status: 200,
+          headers: { "x-amz-checksum-sha256": "abc==" },
+        }),
+    );
+    const store = new R2BlobStore(CFG, { fetch, now: () => NOW, maxBytes: 10 });
+    const got = await store.get(KEY);
+    expect(got?.bytes).toEqual(data);
+    expect(got?.checksumSha256).toBe("abc==");
+  });
+
+  test("streams chunked bodies without a content-length", async () => {
+    const { fetch } = capturingFetch(() => new Response(streamOf([3, 4]), { status: 200 }));
+    const store = new R2BlobStore(CFG, { fetch, now: () => NOW, maxBytes: 10 });
+    const got = await store.get(KEY);
+    expect(got?.bytes).toEqual(new Uint8Array(7));
+  });
+
+  test("rejects once streamed chunks exceed the cap", async () => {
+    // A fresh stub per call: a consumed stream cannot be re-read.
+    const makeStore = () => {
+      const { fetch } = capturingFetch(() => new Response(streamOf([6, 6]), { status: 200 }));
+      return new R2BlobStore(CFG, { fetch, now: () => NOW, maxBytes: 10 });
+    };
+    await expect(makeStore().get(KEY)).rejects.toBeInstanceOf(BlobTooLargeError);
+    await expect(makeStore().get(KEY)).rejects.toThrow(/exceeds 10 bytes/);
+  });
+
+  test("rejects on a declared content-length over the cap", async () => {
+    const { fetch } = capturingFetch(
+      () =>
+        new Response(new Uint8Array([1]), {
+          status: 200,
+          headers: { "content-length": "999" },
+        }),
+    );
+    const store = new R2BlobStore(CFG, { fetch, now: () => NOW, maxBytes: 10 });
+    await expect(store.get(KEY)).rejects.toBeInstanceOf(BlobTooLargeError);
+  });
+});
 
 describe("R2BlobStore signing", () => {
   test("GET signs the canonical request for a fixed date", async () => {
