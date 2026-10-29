@@ -2,6 +2,8 @@
 // build the handler with stand-in dependencies, or start a real server on an
 // ephemeral port, without loading config.
 
+import { stat } from "node:fs/promises";
+import { join, resolve, sep } from "node:path";
 import { type SignInDeps, handleSignIn, handleSignOut } from "./auth/sessions";
 import { handleDeleteAccount } from "./auth/account";
 import { handleAppleNotifications } from "./auth/notifications";
@@ -49,9 +51,57 @@ export type AppDeps = SignInDeps & {
   revokeRefreshToken: RevokeRefreshToken;
 };
 
-export function createHandler(deps: AppDeps): (req: Request) => Promise<Response> {
+export interface HandlerOptions {
+  /**
+   * Directory holding the built web client (vite build output). When set,
+   * non-API GETs serve files from it, with an SPA fallback to index.html.
+   * When unset, those paths 404 as before — tests, and a server run from
+   * source without a client build, never serve files.
+   */
+  clientDir?: string;
+}
+
+/** Serves one file from the built client, or the SPA shell, or null. */
+async function serveClientFile(clientDir: string, pathname: string): Promise<Response | null> {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  if (decoded.includes("\0")) return null;
+  const base = resolve(clientDir);
+  const candidate = resolve(base, `.${decoded === "/" ? "/index.html" : decoded}`);
+  if (candidate !== base && !candidate.startsWith(base + sep)) return null;
+  if (await isFile(candidate)) return fileResponse(candidate);
+  // SPA fallback: unknown paths serve the shell so client-side routes load.
+  const index = join(base, "index.html");
+  if (index !== candidate && (await isFile(index))) {
+    return fileResponse(index);
+  }
+  return null;
+}
+
+/** A file response with the content type Bun detects for the extension. */
+function fileResponse(path: string): Response {
+  const file = Bun.file(path);
+  return new Response(file, {
+    headers: { "Content-Type": file.type || "application/octet-stream" },
+  });
+}
+
+async function isFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+export function createHandler(deps: AppDeps, opts: HandlerOptions = {}): (req: Request) => Promise<Response> {
   return async (req) => {
-    const seg = new URL(req.url).pathname.split("/").filter(Boolean);
+    const pathname = new URL(req.url).pathname;
+    const seg = pathname.split("/").filter(Boolean);
     const method = req.method;
 
     if (method === "GET" && seg.length === 1 && seg[0] === "healthz") {
@@ -111,12 +161,20 @@ export function createHandler(deps: AppDeps): (req: Request) => Promise<Response
         return handlePostReport(req, deps);
       }
     }
+    // The built web client: any non-API GET serves a file from it, with
+    // the SPA fallback to index.html (see serveClientFile). /healthz and
+    // /api/* matched above — or 404 in the API shape below — and never
+    // reach here, so an unknown /api/* path never serves the SPA shell.
+    if (method === "GET" && seg[0] !== "api" && opts.clientDir !== undefined) {
+      const served = await serveClientFile(opts.clientDir, pathname);
+      if (served) return served;
+    }
     return errorResponse(404, "NOT_FOUND", "Not found");
   };
 }
 
-export function startServer(port: number, deps: AppDeps) {
-  const handle = createHandler(deps);
+export function startServer(port: number, deps: AppDeps, opts: HandlerOptions = {}) {
+  const handle = createHandler(deps, opts);
   return Bun.serve({
     port,
     fetch(req, server) {

@@ -1,0 +1,71 @@
+:root {
+  font-family: system-ui, -apple-system, sans-serif;
+  color: #1a1a1a;
+  background: #fff;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+header {
+  border-bottom: 1px solid #ddd;
+  padding-bottom: 16px;
+  margin-bottom: 24px;
+}
+
+h1 {
+  margin: 0 0 8px;
+}
+
+header p {
+  margin: 0 0 12px;
+}
+
+button {
+  cursor: pointer;
+}
+
+section {
+  margin-bottom: 32px;
+}
+
+dl div {
+  display: flex;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+dt {
+  font-weight: 600;
+  min-width: 180px;
+}
+
+dd {
+  margin: 0;
+}
+
+details {
+  margin-top: 12px;
+}
+
+pre {
+  overflow-x: auto;
+  background: #f6f6f6;
+  padding: 12px;
+  border-radius: 6px;
+}
+
+ul {
+  padding-left: 20px;
+}
+
+li {
+  padding: 2px 0;
+}
