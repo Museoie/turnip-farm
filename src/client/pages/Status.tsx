@@ -2,8 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 // Read-only status page for the farm, at /status. It reads only the
 // public GET endpoints (BACKEND_DESIGN.md §7.3, §1.2.19): the health
-// check, the current vocabulary, and the current champion model. Nothing
-// here authenticates, and the page never renders the model's presigned
+// check, the current vocabulary, the current champion model, and the
+// community stats. Nothing here authenticates, and the page never renders the model's presigned
 // R2 URL or object key — those stay out of the visible page even though
 // the endpoint returns them.
 
@@ -26,6 +26,17 @@ interface ModelResponse {
   promoted_at: string;
   val_metrics: Record<string, unknown>;
   name_metrics: Record<string, unknown>;
+}
+
+interface DayCount {
+  date: string;
+  count: number;
+}
+
+interface StatsResponse {
+  totals: { users: number; sources: number; clips: number; labels: number };
+  users_by_day: DayCount[];
+  labels_by_day: DayCount[];
 }
 
 type Section<T> =
@@ -78,6 +89,26 @@ function isModel(body: unknown): body is ModelResponse {
   return typeof m.version === "string" && typeof m.model_type === "string";
 }
 
+function isStats(body: unknown): body is StatsResponse {
+  if (typeof body !== "object" || body === null) return false;
+  const b = body as { totals?: unknown; users_by_day?: unknown; labels_by_day?: unknown };
+  if (typeof b.totals !== "object" || b.totals === null) return false;
+  const totals = b.totals as Record<string, unknown>;
+  const totalsOk = ["users", "sources", "clips", "labels"].every(
+    (key) => typeof totals[key] === "number" && Number.isFinite(totals[key]),
+  );
+  const seriesOk = (value: unknown): value is DayCount[] =>
+    Array.isArray(value) &&
+    value.every(
+      (point) =>
+        typeof point === "object" &&
+        point !== null &&
+        typeof (point as { date?: unknown }).date === "string" &&
+        typeof (point as { count?: unknown }).count === "number",
+    );
+  return totalsOk && seriesOk(b.users_by_day) && seriesOk(b.labels_by_day);
+}
+
 function humanBytes(bytes: number | null): string {
   if (bytes === null) return "unknown size";
   if (bytes < 1024) return `${bytes} B`;
@@ -85,10 +116,59 @@ function humanBytes(bytes: number | null): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
+// One bar per day, scaled to the series peak. The caller renders the
+// empty message instead when every count is zero.
+function BarChart({
+  label,
+  points,
+  className,
+}: {
+  label: string;
+  points: DayCount[];
+  className: string;
+}) {
+  const max = Math.max(0, ...points.map((p) => p.count));
+  const peak = points.find((p) => p.count === max);
+  const height = 48;
+  const barWidth = 100 / points.length;
+  return (
+    <div className="chart-block">
+      <p className="chart-title">{label}</p>
+      <svg
+        className={`chart ${className}`}
+        viewBox="0 0 100 48"
+        preserveAspectRatio="none"
+        role="img"
+        aria-label={label}
+      >
+        {points.map((point, i) => {
+          const barHeight = max === 0 ? 0 : (point.count / max) * 44;
+          return (
+            <rect
+              key={point.date}
+              x={i * barWidth}
+              y={height - 2 - barHeight}
+              width={barWidth * 0.7}
+              height={barHeight}
+            >
+              <title>{`${point.date}: ${point.count}`}</title>
+            </rect>
+          );
+        })}
+      </svg>
+      <p className="chart-caption">
+        Last {points.length} days
+        {peak && max > 0 ? ` · peak ${max} on ${peak.date}` : ""}
+      </p>
+    </div>
+  );
+}
+
 export function StatusPage() {
   const [health, setHealth] = useState<Section<{ status: string }>>({ state: "loading" });
   const [taxonomy, setTaxonomy] = useState<Section<TaxonomyResponse>>({ state: "loading" });
   const [model, setModel] = useState<Section<ModelResponse>>({ state: "loading" });
+  const [stats, setStats] = useState<Section<StatsResponse>>({ state: "loading" });
   // A refresh supersedes the load in flight; stale responses are ignored.
   const requestRef = useRef(0);
 
@@ -97,11 +177,13 @@ export function StatusPage() {
     setHealth({ state: "loading" });
     setTaxonomy({ state: "loading" });
     setModel({ state: "loading" });
+    setStats({ state: "loading" });
 
-    const [healthRes, taxonomyRes, modelRes] = await Promise.allSettled([
+    const [healthRes, taxonomyRes, modelRes, statsRes] = await Promise.allSettled([
       fetchJson("/healthz"),
       fetchJson("/api/taxonomy/current"),
       fetchJson("/api/models/current"),
+      fetchJson("/api/stats"),
     ]);
     if (requestRef.current !== requestId) return;
 
@@ -133,6 +215,17 @@ export function StatusPage() {
       }
     } else {
       setModel({ state: "error", message: "Model request failed." });
+    }
+
+    if (statsRes.status === "fulfilled") {
+      const { status, body } = statsRes.value;
+      if (status === 200 && isStats(body)) {
+        setStats({ state: "ready", data: body });
+      } else {
+        setStats({ state: "error", message: `Stats request failed (HTTP ${status}).` });
+      }
+    } else {
+      setStats({ state: "error", message: "Stats request failed." });
     }
   }, []);
 
@@ -224,6 +317,52 @@ export function StatusPage() {
                   </li>
                 ))}
               </ul>
+            </>
+          )}
+        </section>
+
+        <section>
+          <h2>Community</h2>
+          {stats.state === "loading" && <p>Loading…</p>}
+          {stats.state === "error" && <p>{stats.message}</p>}
+          {stats.state === "ready" && (
+            <>
+              <div className="stat-grid">
+                <div className="stat">
+                  <p className="stat-value">{stats.data.totals.users}</p>
+                  <p className="stat-label">Users</p>
+                </div>
+                <div className="stat">
+                  <p className="stat-value">{stats.data.totals.sources}</p>
+                  <p className="stat-label">Sources</p>
+                </div>
+                <div className="stat">
+                  <p className="stat-value">{stats.data.totals.clips}</p>
+                  <p className="stat-label">Clips</p>
+                </div>
+                <div className="stat">
+                  <p className="stat-value">{stats.data.totals.labels}</p>
+                  <p className="stat-label">Labels</p>
+                </div>
+              </div>
+              {stats.data.users_by_day.every((point) => point.count === 0) ? (
+                <p>No signups yet.</p>
+              ) : (
+                <BarChart
+                  label="New users per day"
+                  points={stats.data.users_by_day}
+                  className="chart-users"
+                />
+              )}
+              {stats.data.labels_by_day.every((point) => point.count === 0) ? (
+                <p>No labels yet.</p>
+              ) : (
+                <BarChart
+                  label="Labels per day"
+                  points={stats.data.labels_by_day}
+                  className="chart-labels"
+                />
+              )}
             </>
           )}
         </section>

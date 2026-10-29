@@ -66,7 +66,9 @@ into `build/client`, the server bundled into `build/server/bundle.js`.
 The site is the marketing home page, the support and privacy pages
 (ported from the turnip-ios repo's `site/`), and the read-only status
 page at `/status`, showing service health, the current champion model,
-and the vocabulary. The status page reads only the public endpoints
+the vocabulary, and community stats (user signups and labeling
+contributions over the last 90 days, from the public `GET /api/stats`
+endpoint). The status page reads only the public endpoints
 above; it never authenticates and never shows the model's presigned R2
 URL.
 

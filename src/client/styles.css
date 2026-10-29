@@ -333,6 +333,10 @@ footer.site .links a:first-child {
     grid-template-columns: 1fr;
   }
 
+  .stat-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
   nav.site a {
     margin-left: 16px;
     font-size: 14px;
@@ -398,4 +402,59 @@ main.page section li {
 
 main.page section li strong {
   color: var(--text);
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 28px;
+}
+
+.stat {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 20px;
+}
+
+.stat-value {
+  font-size: 28px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.stat-label {
+  color: var(--text-dim);
+  font-size: 14px;
+  margin: 4px 0 0;
+}
+
+.chart-block {
+  margin: 0 0 28px;
+}
+
+.chart-title {
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+
+.chart {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.chart-users rect {
+  fill: var(--green);
+}
+
+.chart-labels rect {
+  fill: var(--pink);
+}
+
+.chart-caption {
+  color: var(--text-dim);
+  font-size: 14px;
+  margin: 8px 0 0;
 }
