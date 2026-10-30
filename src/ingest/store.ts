@@ -64,7 +64,9 @@ interface SignedRequest {
   headers: Record<string, string>;
 }
 
-// Minimal SigV4 signer for R2's S3-compatible API.
+// Minimal SigV4 signer for R2's S3-compatible API. `now` is injected so
+// tests can pin the signature against a fixed date; production passes the
+// current time (see R2BlobStore).
 async function signRequest(
   cfg: R2Config,
   method: string,
@@ -72,8 +74,9 @@ async function signRequest(
   query: Record<string, string>,
   extraHeaders: Record<string, string>,
   payload: Uint8Array<ArrayBuffer> | null,
+  now: Date,
 ): Promise<SignedRequest> {
-  const { amzDate, dateStamp } = amzDates(new Date());
+  const { amzDate, dateStamp } = amzDates(now);
   const host = `${cfg.accountId}.r2.cloudflarestorage.com`;
   const payloadHash = payload ? await sha256HexBytes(payload) : await sha256HexBytes(new Uint8Array(0));
 
@@ -120,17 +123,19 @@ async function signRequest(
 export class R2BlobStore implements BlobStore {
   private readonly doFetch: typeof fetch;
   private readonly maxBytes: number;
+  private readonly now: () => Date;
 
   constructor(
     private readonly cfg: R2Config,
-    opts: { fetch?: typeof fetch; maxBytes?: number } = {},
+    opts: { fetch?: typeof fetch; maxBytes?: number; now?: () => Date } = {},
   ) {
     this.doFetch = opts.fetch ?? fetch;
     this.maxBytes = opts.maxBytes ?? MAX_CANONICAL_BLOB_BYTES;
+    this.now = opts.now ?? (() => new Date());
   }
 
   async get(key: string): Promise<StoredObject | null> {
-    const { url, headers } = await signRequest(this.cfg, "GET", key, {}, {}, null);
+    const { url, headers } = await signRequest(this.cfg, "GET", key, {}, {}, null, this.now());
     const res = await this.doFetch(url, { method: "GET", headers });
     if (res.status === 404) return null;
     if (!res.ok) throw new R2Error(res.status, "GET", await res.text());
@@ -185,14 +190,14 @@ export class R2BlobStore implements BlobStore {
     const { url, headers } = await signRequest(this.cfg, "PUT", key, {}, {
       "content-type": contentType,
       "x-amz-checksum-sha256": checksum,
-    }, bytes);
-    const res = await fetch(url, { method: "PUT", headers, body: bytes });
+    }, bytes, this.now());
+    const res = await this.doFetch(url, { method: "PUT", headers, body: bytes });
     if (!res.ok) throw new R2Error(res.status, "PUT", await res.text());
   }
 
   async delete(key: string): Promise<void> {
-    const { url, headers } = await signRequest(this.cfg, "DELETE", key, {}, {}, null);
-    const res = await fetch(url, { method: "DELETE", headers });
+    const { url, headers } = await signRequest(this.cfg, "DELETE", key, {}, {}, null, this.now());
+    const res = await this.doFetch(url, { method: "DELETE", headers });
     if (res.status !== 404 && !res.ok) throw new R2Error(res.status, "DELETE", await res.text());
   }
 
@@ -202,8 +207,8 @@ export class R2BlobStore implements BlobStore {
     for (;;) {
       const query: Record<string, string> = { "list-type": "2", prefix, "max-keys": "1000" };
       if (continuation !== undefined) query["continuation-token"] = continuation;
-      const { url, headers } = await signRequest(this.cfg, "GET", null, query, {}, null);
-      const res = await fetch(url, { method: "GET", headers });
+      const { url, headers } = await signRequest(this.cfg, "GET", null, query, {}, null, this.now());
+      const res = await this.doFetch(url, { method: "GET", headers });
       if (!res.ok) throw new R2Error(res.status, "LIST", await res.text());
       const xml = await res.text();
       for (const m of xml.matchAll(/<Key>([^<]*)<\/Key>/g)) keys.push(m[1]!);

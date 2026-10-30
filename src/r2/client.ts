@@ -2,8 +2,9 @@
 // §7.3): presigned upload/download URLs plus the two farm-side object
 // operations the endpoints need — blob fetch for the §1.2.10 digest
 // re-verification on clip submission, and blob delete on source delete.
-// Reads/writes go through presigned URLs so there is a single SigV4 code
-// path (presign.ts).
+// Reads/writes on the contribution endpoints go through presigned URLs
+// (presign.ts). The ingest worker signs header-authenticated requests
+// separately, in ingest/store.ts — that is the second SigV4 path.
 
 import { presignGet, presignPut, presignUrl, type PresignedUrl, type R2Config } from "./presign";
 
