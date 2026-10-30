@@ -15,7 +15,14 @@ export interface BlobStore {
   get(key: string): Promise<StoredObject | null>;
   put(key: string, bytes: Uint8Array<ArrayBuffer>, contentType: string): Promise<void>;
   delete(key: string): Promise<void>;
-  list(prefix: string): Promise<string[]>;
+  /**
+   * List keys under `prefix`, one listing page at a time. Callers must
+   * process each page as it arrives and must not accumulate pages: the
+   * staging prefix is unbounded, so holding the whole listing in memory
+   * grows with every object no poll will ever touch. A page holds at
+   * most 1000 keys (the listing's `max-keys`).
+   */
+  listPages(prefix: string): AsyncIterable<string[]>;
 }
 
 export interface R2Config {
@@ -201,8 +208,13 @@ export class R2BlobStore implements BlobStore {
     if (res.status !== 404 && !res.ok) throw new R2Error(res.status, "DELETE", await res.text());
   }
 
-  async list(prefix: string): Promise<string[]> {
-    const keys: string[] = [];
+  /**
+   * Yield one listing page at a time instead of accumulating the whole
+   * prefix: each page is fetched, yielded, and released before the next
+   * is requested, so a poll holds at most one page (1000 keys) in
+   * memory no matter how many objects sit under the prefix.
+   */
+  async *listPages(prefix: string): AsyncIterable<string[]> {
     let continuation: string | undefined;
     for (;;) {
       const query: Record<string, string> = { "list-type": "2", prefix, "max-keys": "1000" };
@@ -211,13 +223,12 @@ export class R2BlobStore implements BlobStore {
       const res = await this.doFetch(url, { method: "GET", headers });
       if (!res.ok) throw new R2Error(res.status, "LIST", await res.text());
       const xml = await res.text();
-      for (const m of xml.matchAll(/<Key>([^<]*)<\/Key>/g)) keys.push(m[1]!);
+      yield [...xml.matchAll(/<Key>([^<]*)<\/Key>/g)].map((m) => m[1]!);
       if (/<IsTruncated>true<\/IsTruncated>/.test(xml)) {
         const token = xml.match(/<NextContinuationToken>([^<]*)<\/NextContinuationToken>/);
         if (!token) break;
         continuation = token[1];
       } else break;
     }
-    return keys;
   }
 }
