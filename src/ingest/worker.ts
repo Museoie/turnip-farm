@@ -141,21 +141,25 @@ export interface PollSummary {
 }
 
 // One poll pass over the staging prefix. Per-source failures are collected,
-// never thrown: one poisoned upload must not stall the rest.
+// never thrown: one poisoned upload must not stall the rest. The listing
+// is consumed one page at a time (listPages): a page is ingested before
+// the next is fetched, so memory per poll is bounded by one page, not
+// by the whole prefix.
 export async function pollStagingOnce(deps: IngestDeps): Promise<PollSummary> {
   const summary: PollSummary = { checked: 0, ingested: 0, failed: 0, failures: [] };
-  const keys = await deps.store.list(STAGING_PREFIX);
-  for (const key of keys) {
-    const m = /^staging\/([0-9a-f]{64})\.tkp1\.gz$/.exec(key);
-    if (!m) continue; // not a staged upload — leave it alone
-    const sourceId = m[1]!;
-    summary.checked++;
-    try {
-      const result = await ingestStagedSource(deps, sourceId);
-      if (result.status === "ingested") summary.ingested++;
-    } catch (err) {
-      summary.failed++;
-      summary.failures.push({ sourceId, error: err instanceof Error ? err.message : String(err) });
+  for await (const keys of deps.store.listPages(STAGING_PREFIX)) {
+    for (const key of keys) {
+      const m = /^staging\/([0-9a-f]{64})\.tkp1\.gz$/.exec(key);
+      if (!m) continue; // not a staged upload — leave it alone
+      const sourceId = m[1]!;
+      summary.checked++;
+      try {
+        const result = await ingestStagedSource(deps, sourceId);
+        if (result.status === "ingested") summary.ingested++;
+      } catch (err) {
+        summary.failed++;
+        summary.failures.push({ sourceId, error: err instanceof Error ? err.message : String(err) });
+      }
     }
   }
   return summary;

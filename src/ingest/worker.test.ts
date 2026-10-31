@@ -30,8 +30,11 @@ class InMemoryBlobStore implements BlobStore {
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
   }
-  async list(prefix: string): Promise<string[]> {
-    return [...this.objects.keys()].filter((k) => k.startsWith(prefix)).sort();
+  async *listPages(prefix: string): AsyncIterable<string[]> {
+    // Two keys per page: small enough that the streaming probe below can
+    // tell page-at-a-time processing apart from whole-listing accumulation.
+    const keys = [...this.objects.keys()].filter((k) => k.startsWith(prefix)).sort();
+    for (let i = 0; i < keys.length; i += 2) yield keys.slice(i, i + 2);
   }
 }
 
@@ -197,9 +200,7 @@ describe("ingestStagedSource", () => {
       },
       async put() {},
       async delete() {},
-      async list() {
-        return [];
-      },
+      async *listPages() {},
     };
     await expect(ingestStagedSource({ store: throwingStore, sources }, ID_A)).rejects.toThrow(
       /staged-too-large/,
@@ -254,6 +255,30 @@ describe("pollStagingOnce", () => {
     expect(sources.rows.get(ID_A)!.sha256).not.toBeNull();
     expect(sources.rows.get(ID_B)!.sha256).toBeNull();
     expect(await store.get("staging/notes.txt")).not.toBeNull();
+  });
+
+  test("processes one listing page at a time — page 1 is ingested before page 2 is listed", async () => {
+    const { store, sources, d } = deps();
+    sources.add(ID_A);
+    sources.add(ID_B);
+    stage(store, ID_A, makeBlob(11, 10), true);
+    stage(store, ID_B, makeBlob(11, 10), true);
+    // The generator asserts, before yielding page 2, that page 1's
+    // source is already ingested. A worker that accumulated the whole
+    // listing first would reach this point with sha256 still null.
+    class StreamingProbeStore extends InMemoryBlobStore {
+      override async *listPages(_prefix: string): AsyncIterable<string[]> {
+        yield [stagingKeyFor(ID_A)];
+        expect(sources.rows.get(ID_A)!.sha256).not.toBeNull();
+        yield [stagingKeyFor(ID_B)];
+      }
+    }
+    const probe = new StreamingProbeStore();
+    probe.objects.set(stagingKeyFor(ID_A), store.objects.get(stagingKeyFor(ID_A))!);
+    probe.objects.set(stagingKeyFor(ID_B), store.objects.get(stagingKeyFor(ID_B))!);
+
+    const summary = await pollStagingOnce({ store: probe, sources });
+    expect(summary).toEqual({ checked: 2, ingested: 2, failed: 0, failures: [] });
   });
 });
 

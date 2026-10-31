@@ -262,46 +262,57 @@ describe("R2BlobStore signing", () => {
   });
 });
 
-describe("R2BlobStore list parsing", () => {
-  const page = (keys: string[], truncated: boolean, token?: string): string =>
-    `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult>` +
+describe("R2BlobStore.listPages", () => {
+  const pageXml = (keys: string[], truncated: boolean, token?: string): string =>
+    `<ListBucketResult>${keys.map((k) => `<Contents><Key>${k}</Key></Contents>`).join("")}` +
     `<IsTruncated>${truncated}</IsTruncated>` +
-    keys.map((k) => `<Contents><Key>${k}</Key></Contents>`).join("") +
     (token ? `<NextContinuationToken>${token}</NextContinuationToken>` : "") +
     `</ListBucketResult>`;
 
-  test("follows pagination with the continuation token", async () => {
-    const { fetch, calls } = capturingFetch((_, i) =>
-      i === 0
-        ? new Response(page(["staging/a.tkp1.gz", "staging/b.tkp1.gz"], true, "tok-1"), { status: 200 })
-        : new Response(page(["staging/c.tkp1.gz"], false), { status: 200 }),
-    );
-    const store = new R2BlobStore(CFG, { fetch, now: () => NOW });
-    const keys = await store.list("staging/");
+  test("yields one page at a time and follows the continuation token", async () => {
+    const urls: string[] = [];
+    const fetchStub = (async (url: unknown) => {
+      urls.push(String(url));
+      const second = String(url).includes("continuation-token");
+      return new Response(
+        second
+          ? pageXml(["staging/c"], false)
+          : pageXml(["staging/a", "staging/b"], true, "tok-2"),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const store = new R2BlobStore(CFG, { fetch: fetchStub });
 
-    expect(keys).toEqual(["staging/a.tkp1.gz", "staging/b.tkp1.gz", "staging/c.tkp1.gz"]);
-    expect(calls).toHaveLength(2);
-    const first = new URL(calls[0]!.url);
-    expect(first.searchParams.get("list-type")).toBe("2");
-    expect(first.searchParams.get("prefix")).toBe("staging/");
-    expect(first.searchParams.get("max-keys")).toBe("1000");
-    expect(first.searchParams.get("continuation-token")).toBeNull();
-    expect(new URL(calls[1]!.url).searchParams.get("continuation-token")).toBe("tok-1");
+    const pages: string[][] = [];
+    for await (const page of store.listPages("staging/")) pages.push(page);
+
+    expect(pages).toEqual([["staging/a", "staging/b"], ["staging/c"]]);
+    expect(urls).toHaveLength(2);
+    expect(urls[1]).toContain("continuation-token=tok-2");
   });
 
-  test("a truncated page with no token stops instead of looping", async () => {
-    const { fetch, calls } = capturingFetch(
-      () => new Response(page(["staging/a.tkp1.gz"], true), { status: 200 }),
-    );
-    const store = new R2BlobStore(CFG, { fetch, now: () => NOW });
-    await expect(store.list("staging/")).resolves.toEqual(["staging/a.tkp1.gz"]);
-    expect(calls).toHaveLength(1);
+  test("stops fetching once the consumer stops iterating", async () => {
+    let calls = 0;
+    const fetchStub = (async () => {
+      calls++;
+      return new Response(pageXml(["staging/a"], true, "tok-2"), { status: 200 });
+    }) as unknown as typeof fetch;
+    const store = new R2BlobStore(CFG, { fetch: fetchStub });
+
+    for await (const _page of store.listPages("staging/")) break;
+
+    expect(calls).toBe(1);
   });
 
-  test("a failed list throws R2Error", async () => {
-    const { fetch } = capturingFetch(() => new Response("denied", { status: 403 }));
-    const store = new R2BlobStore(CFG, { fetch, now: () => NOW });
-    await expect(store.list("staging/")).rejects.toBeInstanceOf(R2Error);
-    await expect(store.list("staging/")).rejects.toThrow(/R2 LIST failed: HTTP 403/);
+  test("a failed listing page throws R2Error", async () => {
+    const { fetch } = capturingFetch(() => new Response(null, { status: 500 }));
+    const store = new R2BlobStore(CFG, { fetch });
+    await expect(
+      (async () => {
+        for await (const _page of store.listPages("staging/")) {
+          // consume
+        }
+      })(),
+    ).rejects.toThrow(/R2 LIST failed: HTTP 500/);
   });
 });
