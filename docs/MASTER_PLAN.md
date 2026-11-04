@@ -263,7 +263,7 @@ on the server as training data; the client simply cannot relink them.
   write. The only link between a contribution and an account, kept as
   the "basic level of identification" for bad data (§6).
 - `data_quarantine` — `id`, `source_id` FK, `reason`,
-  `metrics` (JSONB snapshot), `quarantined_at`, `reviewed_at`,
+  `metrics` (JSONB snapshot), `quarantined_at`, `resolved_at`,
   `resolution` (`released` | `purged`). The training export excludes
   quarantined sources. This is the anti-poisoning work queue (§6).
 - `reports` — retargeted at labels/clips (was: videos).
