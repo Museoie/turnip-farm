@@ -5,6 +5,7 @@ import {
   AppleUnavailableError,
   InvalidTokenError,
   createAppleJwtVerifier,
+  createAppleRevoker,
   createAppleTokenVerifier,
   createCodeExchanger,
   mintClientSecret,
@@ -120,6 +121,45 @@ describe("mintClientSecret", () => {
     });
     expect(protectedHeader).toEqual({ alg: "ES256", kid: "KEY1234567" });
     expect((payload.exp ?? 0) - (payload.iat ?? 0)).toBe(300);
+  });
+});
+
+describe("createAppleRevoker", () => {
+  const revoke = createAppleRevoker({ credentials: apple.credentials, revokeUrl: apple.revokeUrl });
+
+  test("resolves on Apple's 200 and posts the token with a valid client secret", async () => {
+    // Apple answers 200 both when it revokes the token and when the token
+    // was already invalid, so a 200 resolves either way.
+    await revoke(APPLE_REFRESH_TOKEN);
+
+    const [form] = apple.revokeRequests;
+    expect(form?.get("client_id")).toBe(AUDIENCE);
+    expect(form?.get("token")).toBe(APPLE_REFRESH_TOKEN);
+    expect(form?.get("token_type_hint")).toBe("refresh_token");
+    await jwtVerify(form?.get("client_secret") ?? "", apple.farmPublicKey, { issuer: "TEAM123456" });
+  });
+
+  test("throws a plain Error, not AppleUnavailableError, on a 400", async () => {
+    apple.respondWithRevoke(() => new Response("invalid", { status: 400 }));
+    const err = await rejection(revoke(APPLE_REFRESH_TOKEN));
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(AppleUnavailableError);
+  });
+
+  test.each([
+    ["answers 500", () => apple.respondWithRevoke(() => new Response("down", { status: 500 }))],
+    ["times out", () => apple.respondWithRevoke(() => Bun.sleep(200).then(() => new Response()))],
+  ])("reports Apple as unavailable when the revoke endpoint %s", async (_, arrange) => {
+    arrange();
+    const quick = createAppleRevoker({ credentials: apple.credentials, revokeUrl: apple.revokeUrl, timeoutMs: 50 });
+    expect(await rejection(quick(APPLE_REFRESH_TOKEN))).toBeInstanceOf(AppleUnavailableError);
+  });
+
+  test("reports Apple as unavailable when the revoke endpoint is unreachable", async () => {
+    const down = Bun.serve({ port: 0, fetch: () => new Response() });
+    down.stop(true);
+    const unreachable = createAppleRevoker({ credentials: apple.credentials, revokeUrl: down.url });
+    expect(await rejection(unreachable(APPLE_REFRESH_TOKEN))).toBeInstanceOf(AppleUnavailableError);
   });
 });
 

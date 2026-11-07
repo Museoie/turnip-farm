@@ -83,6 +83,11 @@ export async function startMockApple() {
   let tokenEndpoint = succeed;
   const tokenRequests: URLSearchParams[] = [];
 
+  // The revoke endpoint answers 200 with an empty body, as Apple does —
+  // both when it revokes the token and when the token was already invalid.
+  let revokeEndpoint: TokenEndpoint = () => new Response(null, { status: 200 });
+  const revokeRequests: URLSearchParams[] = [];
+
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -93,6 +98,11 @@ export async function startMockApple() {
         tokenRequests.push(form);
         return tokenEndpoint(form);
       }
+      if (pathname === "/auth/revoke" && req.method === "POST") {
+        const form = new URLSearchParams(await req.text());
+        revokeRequests.push(form);
+        return revokeEndpoint(form);
+      }
       return new Response(null, { status: 404 });
     },
   });
@@ -100,6 +110,7 @@ export async function startMockApple() {
   return {
     jwksUrl: new URL("/auth/keys", server.url),
     tokenUrl: new URL("/auth/token", server.url),
+    revokeUrl: new URL("/auth/revoke", server.url),
     credentials,
     farmPublicKey: farmKey.publicKey,
     identityToken,
@@ -109,9 +120,16 @@ export async function startMockApple() {
     respondWith(endpoint: TokenEndpoint) {
       tokenEndpoint = endpoint;
     },
+    // Every form posted to the revoke endpoint, oldest first.
+    revokeRequests,
+    respondWithRevoke(endpoint: TokenEndpoint) {
+      revokeEndpoint = endpoint;
+    },
     reset() {
       tokenEndpoint = succeed;
       tokenRequests.length = 0;
+      revokeEndpoint = () => new Response(null, { status: 200 });
+      revokeRequests.length = 0;
     },
     stop: () => server.stop(true),
   };
