@@ -18,7 +18,9 @@ carry provenance and a blind sample guards against rubber-stamped model
 suggestions, the vocabulary is served apart from the model, the
 manifest and source reads carry impact feedback, validation leakage
 becomes a measured risk, and Rev 4's unlinking is kept with recorded
-reopen triggers.*
+reopen triggers. Rev 6 (2026-11, the privacy plan) reverses the 30-day
+unlink: the account link lasts until the account is deleted, by the
+user or after 24 months idle, and consent is recorded on the farm.*
 
 This document is the master plan for `turnip-farm` (backend + dataset) and
 `turnip-ml` (training), and the contract they hold with `turnip-ios`.
@@ -30,7 +32,10 @@ and 2026-10-15 (4):
 1. **Community labeling with free-text trick names.** Users label their
    clips; labels are free-text, the UI prompts for the trick name, and a
    clip can carry multiple labels (e.g. a combo: `hook`, `scoot`,
-   `gainer`, `cartfull`).
+   `gainer`, `cartfull`). *Narrowed 2026-11 (privacy plan):* the farm
+   stores only vocabulary names; a typed name the vocabulary lacks
+   becomes a candidate that the maintainer can promote
+   (`BACKEND_DESIGN.md` §1.2.25).
 2. **Privacy-first farm: no video, ever.** Clips are never sent to the farm
    as video data. What leaves the device is an opaque video identifier plus
    the pose keypoint sequence. The iOS client matches server-side label data
@@ -145,10 +150,11 @@ clip shows the user or someone else.
   it.
 - Account subject — the Sign in with Apple `sub` claim, which is already
   per-app opaque. Needed for sign-in, rate limiting, and blocking. It is
-  linked to a contribution only for quarantine attribution (§6), and
-  only until 30 days after the contribution's last write; after that
-  the contribution has no account link. Ownership of a contribution is
-  a per-source key the client holds, not the account.
+  linked to a contribution through `source_attribution` for quarantine
+  attribution (§6) and so account deletion reaches every contribution,
+  until the account is deleted (by the user, or after 24 months idle).
+  Ownership of a contribution is a per-source key the client holds, not
+  the account.
 
 **Why keypoints are safe enough:** a pose sequence contains no biometric
 image data. Residual honesty: gait-from-keypoints is a real (if nascent)
@@ -160,8 +166,8 @@ beyond minimization is warranted at this scale.
 (§5.6) is computed on the device from the device's own clip library.
 Achievements, levels, progress, scores, and highlights are never sent
 to the farm, and the farm has no table for them. A server-side profile
-would have to know which contributions are whose, which is exactly the
-link the 30-day window removes. Leaderboards, public profiles, and any
+would have to read the account link, which exists for anti-poisoning
+and deletion only. Leaderboards, public profiles, and any
 other public view of achievements are out of scope for that reason and
 for a second one: a private log gives nobody a reason to mislabel, and
 an audience would. *Reopen if:* a social feature is put on the roadmap
@@ -184,11 +190,13 @@ data (`BACKEND_DESIGN.md` §9 Q9) — unlinking would then keep its costs
 (the deletion gap, source-level splits, the moving parts) and lose most
 of its benefit — or a social feature is put on the roadmap. A reversal
 lands before the farm's first deployment, while restoring `user_id` is
-still a plain additive migration. *Under review (2026-11):* the
+still a plain additive migration. *Superseded (2026-11):* the
 maintainer's privacy plan, written with an AI legal-risk review rather
-than counsel, treats unlinked pose sequences as personal data that is
-de-linked and hard to re-identify, not anonymous, and proposes keeping
-the link until deletion (`BACKEND_DESIGN.md` §8.1). Not built yet.
+than counsel, treats unlinked pose sequences as personal data, so the
+farm now keeps `source_attribution` until the account is deleted, by
+the user or after 24 months idle (`BACKEND_DESIGN.md` §1.2.17). Ownership
+still lives in the source key, and `sources` still has no account
+column.
 
 **What this kills from DESIGN.md Rev 8:** presigned video upload to R2,
 server-side video storage, server-rendered video feed, and every sentence
@@ -236,7 +244,7 @@ on the server as training data; the client simply cannot relink them.
   (bool: the blind sample, §6), `created_at`, `updated_at`.
   Hierarchy: **Source → Clip → Label**, all one-to-many.
 - `labels` — one row per `(clip_id, trick_name)` (`BACKEND_DESIGN.md`
-  §1.1): `trick_name` (free text, **multiple per clip** as multiple
+  §1.1): `trick_name` (a vocabulary name, **multiple per clip** as multiple
   rows; re-submission replaces the clip's whole set), `origin` (`typed`
   | `vocabulary` | `model`: typed by hand, picked from the vocabulary,
   or kept from the model's suggestion), `taxonomy_version` (vocab in
@@ -246,7 +254,7 @@ on the server as training data; the client simply cannot relink them.
   rendering concern.
 - `label_taxonomy` — `raw` → `canonical` mapping, `taxonomy_version`
   (monotonic int, bumped when canonical names are added/changed),
-  `first_seen`. Free text is preserved forever; training consumes
+  `first_seen`. Raw names are preserved forever; training consumes
   canonical names. Seeded from standard tricking vocabulary. Renaming a
   canonical name remaps, at the new version, every raw string that
   pointed at the old canonical (the old canonical included) to the new
@@ -263,9 +271,12 @@ on the server as training data; the client simply cannot relink them.
   owner reads it through `GET /api/sources/:id` (§4). Deleted with the
   source.
 - `source_attribution` — `source_id` FK, `user_id` FK, `attributed_at`:
-  the account that last wrote the source, deleted 30 days after that
-  write. The only link between a contribution and an account, kept as
-  the "basic level of identification" for bad data (§6).
+  the account that last wrote the source, deleted with the account. The
+  only link between a contribution and an account, kept as the "basic
+  level of identification" for bad data (§6) and for account deletion.
+- `consents` — `user_id` FK, `disclosure_version`, `agreed_at`: each
+  agreement to the app's contribution disclosure; contribution needs
+  the current version (`BACKEND_DESIGN.md` §7.3).
 - `data_quarantine` — `id`, `source_id` FK, `reason`,
   `metrics` (JSONB snapshot), `quarantined_at`, `resolved_at`,
   `resolution` (`released` | `purged`). The training export excludes
@@ -376,9 +387,10 @@ match.
 - `POST /api/models` — training pipeline publishes the champion
   (admin-scoped), with its `name_metrics` and the ids of the sources it
   trained on.
-- `GET /api/labels/export?since=` — training pipeline pull: labels +
-  provenance + pose blob references since a watermark. **Excludes
-  quarantined sources.**
+- `GET /api/labels/export?since=` — training pipeline pull: training
+  segments (short, re-targeted windows around labeled clips, never
+  whole-session pose) with their labels and provenance. **Excludes
+  quarantined sources.** (`BACKEND_DESIGN.md` §1.2.24, §7.3.)
 - `POST /api/reports` — report a bad label/clip.
 
 Dropped from the Rev 1 draft: `GET /api/labels/pending` — there is no
@@ -465,12 +477,22 @@ draft clips).
 - Training target: one segment per confirmed clip window; combo clips
   carry their N canonical names on the single window.
 
-**Data.** `GET /api/labels/export?since=` → (pose blob, clip windows,
-free-text labels). Curation: normalize raw strings to canonical names
+**Data.** `GET /api/labels/export` → training segments
+(`BACKEND_DESIGN.md` §1.2.24, `POSE_FORMAT.md` §12): per labeled clip,
+a short `TKS1` window with context, re-targeted onto a standard body
+(13 joints in torso lengths, one head point, light noise), its clip
+window, a `split_bucket` for leakage-free splits, labels and provenance.
+Whole-session pose is never exported (privacy plan, 2026-11). Two
+consequences for training: background negatives come only from the
+context frames around each clip, and the on-device model must apply the
+same re-targeting (without the noise) to its input, since it no longer
+trains on raw `TKP1`. The export also counts distinct contributors
+per canonical trick, and training holds back a trick with fewer than
+the export's `contributor_minimum` (5), so a model never learns a trick
+from one or two people (`BACKEND_DESIGN.md` §1.2.27). Curation: normalize raw strings to canonical names
 via `label_taxonomy` (a combo string like
 `"hook - scoot - gainer - cartfull (combo)"` splits into four canonical
-labels on one window); raw strings never discarded. Non-labeled regions
-of contributed sources serve as background negatives. The Profile's
+labels on one window); raw strings never discarded. The Profile's
 achievements will pull contributions toward popular tricks, so training
 samples classes in balance rather than in proportion to how often they
 are labeled.
@@ -523,16 +545,15 @@ fixture regression suite (the pose fixture clips on R2 plus
 trick-labeled fixtures — segment IoU + name accuracy vs. champion):
 - On regression: (1) fire a **Discord webhook alert** with the metrics
   delta and affected source IDs (never account IDs: an alert outlives
-  the attribution window); (2) **quarantine that day's ingested
+  an account's deletion); (2) **quarantine that day's ingested
   sources** (`data_quarantine`) and skip them in training; (3) skip
   promotion.
 - The engineer reviews the quarantine queue, cleans (purge bad
   sources, release good ones); the next night retries.
 - Attribution comes from the farm's `source_attribution`, which links
-  a source to the account that last wrote it until 30 days after that
-  write. That is the basic identification of who uploaded the bad
-  data, and enough time for the nightly gate and the review. After the
-  window, nobody can tell who uploaded a source.
+  a source to the account that last wrote it until the account is
+  deleted. That is the basic identification of who uploaded the bad
+  data.
 - Achievements make volume spiky (a popular achievement, a new
   release), and a regression on a spike night quarantines everyone's
   data for that day, not only the bad part. Accepted for now; the
@@ -648,7 +669,7 @@ in DESIGN.md Rev 12:
    Its guarantees are unverified.
 3. **Reputation without video.** *Settled in Rev 4:* labels are not
    scored per account, because contributions keep no lasting account
-   link (§1). Quarantine attribution uses the 30-day link (§6).
+   link (§1). Quarantine attribution uses `source_attribution` (§6).
 4. **Landed or bailed.** The app cannot tell a landed rep from a bail.
    Rep counts mean little to a tricker without it, and attempts and
    landings move differently, which matters to the model. An optional

@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AppDeps, createHandler, startServer } from "./app";
-import { noDatabase } from "./auth/testing";
+import { noDatabase, testCandidateKey } from "./auth/testing";
 import type { R2Client } from "./r2/client";
 import { TokenBucket, parseProxyRange } from "./ratelimit";
 import type { SQL } from "bun";
@@ -33,6 +33,8 @@ const deps: AppDeps = {
   refreshTokenKey: {} as CryptoKey,
   r2: noR2,
   pipelineKey: "test-pipeline-key",
+  currentDisclosureVersion: 3,
+  candidateKey: testCandidateKey,
   limits: {
     user: new TokenBucket(1000, 60000),
     ip: new TokenBucket(1000, 60000),
@@ -76,6 +78,8 @@ describe("createHandler routing", () => {
     // noDatabase throws if a handler reaches the database; 401 proves the
     // route dispatched to a session-guarded handler.
     for (const [method, path] of [
+      ["POST", "/api/consent"],
+      ["POST", "/api/labels/candidates"],
       ["POST", "/api/sources"],
       ["GET", "/api/sources/abc"],
       ["GET", "/api/sources/abc/pose"],
@@ -92,6 +96,8 @@ describe("createHandler routing", () => {
 
   test("wrong-method contribution routes are 404", async () => {
     for (const [method, path] of [
+      ["GET", "/api/consent"],
+      ["GET", "/api/labels/candidates"],
       ["GET", "/api/sources"],
       ["PUT", "/api/sources/abc"],
       ["GET", "/api/clips"],

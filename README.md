@@ -1,7 +1,7 @@
 # turnip-farm
 
 Backend and training dataset for [Turnip](https://github.com/hoiekim/turnip-ios).
-The farm collects confirmed trick clips and free-text trick names from the
+The farm collects confirmed trick clips and vocabulary trick names from the
 iOS app, stores them against on-device pose keypoint sequences, and serves
 that dataset to the training pipeline. It never receives video: what leaves
 the device is an opaque video ID, the pose keypoints, and the user's
@@ -48,17 +48,20 @@ in place as dbmate migrations.
   ownership (§7.2). An ingest worker polls R2 and turns each staged
   upload into the canonical 10 Hz blob (§1.2.10).
 - **Training:** the vocabulary (`GET /api/taxonomy/current`), the
-  label export (`GET /api/labels/export`), the quarantine flow
+  training export of re-targeted segments, never whole-session pose
+  (`GET /api/labels/export`, §1.2.24), the quarantine flow
   (`POST /api/quarantine` with its release and purge calls), and the
   model registry (`POST /api/models`, `GET /api/models/current`).
 - **Moderation:** `POST /api/reports`, and maintainer scripts to resolve
-  a source to its account within the attribution window and to block or
+  a source to the account that last wrote it and to block or
   unblock an account (see [Moderation](#moderation)). Blocked accounts
   get `403 ACCOUNT_BLOCKED` everywhere except sign-out and account
   deletion (§1.2.16).
-- **Unlinking (§1.2.17):** a purge at startup and hourly deletes
-  attribution 30 days after a source's last write and reports 30 days
-  after they are filed.
+- **Consent and retention (§1.2.17):** `POST /api/consent` records
+  agreement to the contribution disclosure, and contribution writes
+  require the current version. Attribution is kept until the account
+  is deleted. Jobs at startup and hourly delete reports 30 days after
+  they are filed, and accounts idle for 24 months.
 
 The server also serves a public website at `/`, built from `src/client`
 (Vite + React) with the same build split as the budget repo — `vite build`
@@ -68,7 +71,7 @@ The site is the marketing home page, the support and privacy pages
 page at `/status`, showing service health, the current champion model,
 the vocabulary, and community stats (user signups and labeling
 contributions over the last 90 days, from the public `GET /api/stats`
-endpoint). The status page reads only the public endpoints
+endpoint, every count rounded down to a multiple of 5). The status page reads only the public endpoints
 above; it never authenticates and never shows the model's presigned R2
 URL.
 
@@ -88,12 +91,13 @@ src/
   app.ts           HTTP routing
   errors.ts        the API error shape (BACKEND_DESIGN.md §7.2)
   ratelimit.ts     per-user and per-IP token buckets, and the client address they key on (§7.2)
+  region.ts        the country backstop on contribution (§7.2)
   db.ts            transaction helper
   config.ts        env-based configuration; fails fast on missing variables
   auth/
     apple.ts         Apple JWT verification, client secret, code exchange, revocation
     sessions.ts      sign-in, sign-out, and session authentication (§7.1)
-    account.ts       DELETE /api/account
+    account.ts       DELETE /api/account and the 24-month idle-account deletion (§1.2.17)
     notifications.ts Apple server-to-server notifications
     tokens.ts        session tokens and refresh-token encryption
     testing.ts       stand-in Apple endpoints for tests
@@ -101,8 +105,9 @@ src/
     sources.ts     source registration, read, pose download, delete
     clips.ts       clip upserts and label-set replacement (§4, §5)
     validate.ts    request validation shared by the contribution endpoints
-    purge.ts       the 30-day attribution and report purge (§1.2.17)
-  ingest/          staged upload → canonical TKP1 blob (POSE_FORMAT.md)
+    purge.ts       the 30-day report purge (and legacy attribution purge) (§1.2.17)
+  ingest/          staged upload → canonical TKP1 blob (POSE_FORMAT.md), and the
+                   segmenter that cuts TKS1 training segments from it (§1.2.24)
   r2/              R2 client, presigned URLs, key conventions
   pipeline.ts      service-key auth for the pipeline endpoints (§7.1)
   export.ts        GET /api/labels/export (§6)
@@ -110,6 +115,8 @@ src/
   taxonomy.ts      GET /api/taxonomy/current
   models.ts        the model registry: POST /api/models, GET /api/models/current
   reports.ts       POST /api/reports
+  consent.ts       POST /api/consent and the consent gate on contribution writes (§7.3)
+  labels.ts        vocabulary-only labels, POST /api/labels/candidates, and the candidate scripts (§1.2.25)
   moderation.ts    attribution lookup and blocking, for the scripts below
   *.test.ts        tests (bun test), next to the code they cover
 scripts/           maintainer scripts, run with bun run (see Moderation)
@@ -187,14 +194,25 @@ bun run moderation:block <account_id>           # block the account
 bun run moderation:block --clear <account_id>   # unblock it
 ```
 
-`moderation:source-account` answers only within the 30-day attribution
-window; past it the source belongs to no account. It prints the account
-ID without the source ID. Keep it that way wherever you copy it: an
-account ID must not sit next to a source ID in anything that outlives the
-window, such as alerts, issues, or notes (§8). Blocking stops new
+`moderation:source-account` answers while the source is attributed:
+until its account is deleted (§1.2.17). It prints the account ID
+without the source ID. Keep it that way wherever you copy it: an
+account ID must not sit next to a source ID in anything that can
+outlive the account, such as alerts, issues, or notes (§8). Blocking stops new
 contributions at once and keeps the account's sessions, so it can still
 sign out and delete itself. To remove what the account already
 contributed, purge the quarantined sources.
+
+### Vocabulary candidates
+
+Label names the vocabulary lacks arrive as candidates
+(`POST /api/labels/candidates`, BACKEND_DESIGN.md §1.2.25) and expire
+after 30 days. Two scripts review and promote them:
+
+```sh
+bun run labels:candidates [--min N]            # names by distinct accounts
+bun run labels:promote <name> [<canonical>]    # add to the taxonomy at a new version
+```
 
 ### Configuration
 
@@ -217,6 +235,7 @@ exits with status 1 and lists every problem at once.
 | `APPLE_REFRESH_TOKEN_KEY` | yes      | 32 random bytes, base64: encrypts stored Apple refresh tokens |
 | `TURNIP_PIPELINE_KEY`     | yes      | Service key for the training pipeline's endpoints             |
 | `TRUSTED_PROXIES`         | no       | Trusted proxy addresses and CIDRs, comma-separated (§7.2)     |
+| `CURRENT_DISCLOSURE_VERSION` | no    | Disclosure version contribution requires (default `3`, §7.3)  |
 
 ## Deployment
 

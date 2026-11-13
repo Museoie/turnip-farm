@@ -1,9 +1,8 @@
 // Contribution: sources (BACKEND_DESIGN.md §7.3).
 // Ownership is a per-source key (§1.2.13); a missing or wrong key is 404,
 // never 403, so source IDs are not an ownership oracle (§7.2). Every write
-// upserts source_attribution in the same transaction (§4); reads of
-// attribution filter the 30-day window (§1.2.17) — this module only writes
-// it. Logs never carry user/session IDs next to source IDs, nor source
+// upserts source_attribution in the same transaction (§4); this module
+// only writes it. Logs never carry user/session IDs next to source IDs, nor source
 // keys (§8).
 
 import type { SQL } from "bun";
@@ -14,12 +13,17 @@ import { authenticateClient } from "../auth/sessions";
 import { canonicalKeyFor, stagingKeyFor } from "../r2/keys";
 import type { R2Client } from "../r2/client";
 import type { RateLimits } from "../app";
+import { requireConsent } from "../consent";
+import { deleteLinkedSegmentRows, linkedSegmentKeys } from "../ingest/segmenter";
+import { refuseBlockedRegion } from "../region";
 import { isSourceKey, isVideoId, readJsonObject } from "./validate";
 
 export interface SourcesDeps {
   sql: SQL;
   r2: R2Client;
   limits: RateLimits;
+  /** The disclosure version registration requires (§7.3 POST /api/consent). */
+  currentDisclosureVersion: number;
 }
 
 type Authed = { userId: string };
@@ -49,10 +53,14 @@ function sourceKeyHash(req: Request): string | null {
 
 // POST /api/sources — register a source, get the blob upload URL (§7.3).
 export async function handleRegisterSource(req: Request, deps: SourcesDeps): Promise<Response> {
+  const region = refuseBlockedRegion(req);
+  if (region) return region;
   const auth = await authed(req, deps);
   if (auth instanceof Response) return auth;
   const limited = rateLimit(deps, auth.userId);
   if (limited) return limited;
+  const unconsented = await requireConsent(deps.sql, auth.userId, deps.currentDisclosureVersion);
+  if (unconsented) return unconsented;
 
   const body = await readJsonObject(req);
   const videoId = body?.video_id;
@@ -249,14 +257,34 @@ export async function handleDeleteSource(
     SELECT r2_key FROM sources
     WHERE id = ${sourceId} AND source_key_hash = ${keyHash}`;
   if (!source) return notFound();
+  // The owner asked for the data to go, so its training segments go too
+  // (§1.2.24).
+  const segmentKeys = await linkedSegmentKeys(deps.sql, sourceId);
   try {
     await deps.r2.deleteObject(source.r2_key as string);
     await deps.r2.deleteObject(stagingKeyFor(sourceId));
+    for (const key of segmentKeys) await deps.r2.deleteObject(key);
   } catch {
     return errorResponse(500, "INTERNAL", "Could not delete the stored blob; retry later");
   }
-  await transaction(deps.sql, async (tx) => {
+  const lateKeys = await transaction(deps.sql, async (tx) => {
+    const keys = await deleteLinkedSegmentRows(tx, sourceId);
     await tx`DELETE FROM sources WHERE id = ${sourceId}`;
+    return keys.filter((k) => !segmentKeys.includes(k));
   });
+  await deleteSegmentBlobsAfterCommit(deps.r2, lateKeys);
   return new Response(null, { status: 204 });
+}
+
+// Segments the segmenter committed between the key read and the row
+// delete: their rows are gone, so delete their blobs too. Best-effort,
+// since the response can't be retried once the source row is gone.
+export async function deleteSegmentBlobsAfterCommit(r2: R2Client, keys: readonly string[]): Promise<void> {
+  for (const key of keys) {
+    try {
+      await r2.deleteObject(key);
+    } catch (err) {
+      console.warn(`could not delete segment blob ${key}:`, err);
+    }
+  }
 }

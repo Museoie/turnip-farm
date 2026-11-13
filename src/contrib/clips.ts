@@ -13,6 +13,8 @@ import type { SQL } from "bun";
 import { sha256Hex } from "../auth/tokens";
 import { authenticateClient } from "../auth/sessions";
 import { transaction } from "../db";
+import { requireConsent } from "../consent";
+import { unknownLabelResponse, unknownNames, vocabulary } from "../labels";
 import { errorResponse } from "../errors";
 import {
   BlobTooLargeError,
@@ -36,6 +38,8 @@ export interface ClipsDeps {
   sql: SQL;
   r2: R2Client;
   limits: RateLimits;
+  /** The disclosure version clip writes require (§7.3 POST /api/consent). */
+  currentDisclosureVersion: number;
 }
 
 const notFound = () => errorResponse(404, "NOT_FOUND", "Not found");
@@ -127,12 +131,19 @@ async function recordAttribution(tx: SQL, sourceId: string, userId: string): Pro
       attributed_at = now()`;
 }
 
+// The source's training segments need cutting again (§1.2.24).
+async function markSegmentsDirty(tx: SQL, sourceId: string): Promise<void> {
+  await tx`UPDATE sources SET segments_dirty_at = now() WHERE id = ${sourceId}`;
+}
+
 // POST /api/clips — batch upsert clips + replace their label sets (§7.3).
 export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Response> {
   const auth = await authenticateClient(req, deps);
   if (auth instanceof Response) return auth;
   const limited = rateLimit(deps, auth.userId);
   if (limited) return limited;
+  const unconsented = await requireConsent(deps.sql, auth.userId, deps.currentDisclosureVersion);
+  if (unconsented) return unconsented;
 
   const body = await readJsonObject(req);
   if (!Array.isArray(body?.clips)) return invalid("clips must be an array");
@@ -141,6 +152,14 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
     const { clip, error } = readClipInput((body!.clips as unknown[])[i], i);
     if (error) return error;
     inputs.push(clip!);
+  }
+
+  // Only vocabulary names (§1.2.25): the first clip with an unknown name
+  // fails the batch, before anything is read or written.
+  const vocab = await vocabulary(deps.sql);
+  for (let i = 0; i < inputs.length; i++) {
+    const unknown = unknownNames(vocab, inputs[i]!.labels.map((l) => l.name));
+    if (unknown.length > 0) return unknownLabelResponse(unknown, { index: i });
   }
 
   // 1. Sources exist and keys match; existing clips stay on their source.
@@ -252,6 +271,7 @@ export async function handlePostClips(req: Request, deps: ClipsDeps): Promise<Re
     // 6. Attribution for each distinct source (§4).
     for (const sourceId of sources.keys()) {
       await recordAttribution(tx, sourceId, auth.userId);
+      await markSegmentsDirty(tx, sourceId);
     }
     return {
       status: 200 as const,
@@ -273,6 +293,8 @@ export async function handlePostClipLabels(
   if (auth instanceof Response) return auth;
   const limited = rateLimit(deps, auth.userId);
   if (limited) return limited;
+  const unconsented = await requireConsent(deps.sql, auth.userId, deps.currentDisclosureVersion);
+  if (unconsented) return unconsented;
   if (!isUuid(clipId)) return notFound();
 
   const body = await readJsonObject(req);
@@ -280,6 +302,8 @@ export async function handlePostClipLabels(
   const read = body!.labels === undefined ? { labels: [] } : readLabels(body!.labels);
   if ("error" in read) return invalid(`labels${read.path}: ${read.error}`, { field: `labels${read.path}` });
   const labels = read.labels;
+  const unknown = unknownNames(await vocabulary(deps.sql), labels.map((l) => l.name));
+  if (unknown.length > 0) return unknownLabelResponse(unknown);
 
   const out = await transaction(deps.sql, async (tx) => {
     const [clip] = await tx`
@@ -294,6 +318,7 @@ export async function handlePostClipLabels(
     const taxonomyVersion = tax.v as number;
     await replaceLabelSet(tx, clipId, labels, taxonomyVersion);
     await recordAttribution(tx, clip.source_id as string, auth.userId);
+    await markSegmentsDirty(tx, clip.source_id as string);
     return { status: 200 as const, clip_id: clipId, labels, taxonomy_version: taxonomyVersion };
   });
 

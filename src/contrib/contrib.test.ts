@@ -65,6 +65,7 @@ function deps(tx: SQL, r2: R2Client, userCapacity = 1000, refillPerMinute = 60):
   return {
     sql: tx,
     r2,
+    currentDisclosureVersion: 3,
     limits: {
       user: new TokenBucket(userCapacity, refillPerMinute),
       ip: new TokenBucket(1000, 60),
@@ -73,8 +74,10 @@ function deps(tx: SQL, r2: R2Client, userCapacity = 1000, refillPerMinute = 60):
   };
 }
 
+// Seeds an account that agreed to disclosure version 3, the version deps() requires.
 async function seedUser(tx: TransactionSQL, userId: string, blocked = false) {
   await tx`INSERT INTO users (id, is_blocked) VALUES (${userId}, ${blocked})`;
+  await tx`INSERT INTO consents (user_id, disclosure_version) VALUES (${userId}, 3)`;
   const token = `session-for-${userId}`;
   await tx`INSERT INTO sessions (user_id, token_hash, expires_at)
     VALUES (${userId}, ${sha256Hex(token)}, now() + interval '1 hour')`;
@@ -139,6 +142,35 @@ describeDb("POST /api/sources", () => {
       const blockedToken = await seedUser(tx, "u2", true);
       await expectError(await registerSource(tx, d, blockedToken), 403, "ACCOUNT_BLOCKED");
       expect(token).toBe("session-for-u1");
+    });
+  });
+
+  test("403 REGION_UNAVAILABLE from a blocked country, before anything is written", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const d = deps(tx, fakeR2());
+      const token = await seedUser(tx, "u1");
+      const body = {
+        video_id: VIDEO_ID,
+        source_key: SOURCE_KEY,
+        frame_count: 600,
+        sample_rate: 10,
+        keypoint_format: "tkp1",
+      };
+      const refused = await handleRegisterSource(
+        post("/api/sources", body, authed(token, { "cf-ipcountry": "GB" })),
+        d,
+      );
+      await expectError(refused, 403, "REGION_UNAVAILABLE");
+      const [count] = await tx`SELECT count(*)::int AS n FROM sources`;
+      expect(count.n).toBe(0);
+      const [attr] = await tx`SELECT count(*)::int AS n FROM source_attribution`;
+      expect(attr.n).toBe(0);
+
+      const allowed = await handleRegisterSource(
+        post("/api/sources", body, authed(token, { "cf-ipcountry": "US" })),
+        d,
+      );
+      expect(allowed.status).toBe(201);
     });
   });
 
@@ -241,9 +273,13 @@ describeDb("POST /api/clips", () => {
       const hex = createHash("sha256").update(blob).digest("hex");
       const d = deps(tx, fakeR2({ bytes: blob }));
       await seedIngestedSource(tx, token, hex);
+      await tx`UPDATE sources SET segments_dirty_at = NULL WHERE id = ${VIDEO_ID}`;
 
       const res = await handlePostClips(post("/api/clips", clipBody(), authed(token)), d);
       expect(res.status).toBe(200);
+      // The source's training segments need cutting again (§1.2.24).
+      const [{ dirty }] = await tx`SELECT segments_dirty_at IS NOT NULL AS dirty FROM sources WHERE id = ${VIDEO_ID}`;
+      expect(dirty).toBe(true);
       const body = await bodyJson(res);
       expect(body.clips).toHaveLength(1);
       expect(body.clips[0].clip_id).toBe(CLIP_ID);
@@ -436,6 +472,7 @@ describeDb("POST /api/clips/:id/labels", () => {
       expect(reg.status).toBe(201);
       await tx`UPDATE sources SET sha256 = ${hex} WHERE id = ${VIDEO_ID}`;
       await tx`INSERT INTO clips (id, source_id, start_frame, end_frame) VALUES (${CLIP_ID}, ${VIDEO_ID}, 1, 2)`;
+      await tx`UPDATE sources SET segments_dirty_at = NULL WHERE id = ${VIDEO_ID}`;
 
       const labels = [
         { name: "hook", origin: "vocabulary" },
@@ -455,6 +492,8 @@ describeDb("POST /api/clips/:id/labels", () => {
       });
       const [stored] = await tx`SELECT trick_name, origin FROM labels WHERE clip_id = ${CLIP_ID}`;
       expect([stored.trick_name, stored.origin]).toEqual(["Hook", "typed"]);
+      const [{ dirty }] = await tx`SELECT segments_dirty_at IS NOT NULL AS dirty FROM sources WHERE id = ${VIDEO_ID}`;
+      expect(dirty).toBe(true);
 
       // Labels answer to the clip's stored provenance: this one has no proposing model.
       const kept = { source_key: SOURCE_KEY, labels: [{ name: "cork", origin: "model" }] };
@@ -473,7 +512,7 @@ describeDb("POST /api/clips/:id/labels", () => {
       const bad = await handlePostClipLabels(
         post(
           `/api/clips/${CLIP_ID}/labels`,
-          { source_key: OTHER_KEY, labels: [{ name: "x", origin: "typed" }] },
+          { source_key: OTHER_KEY, labels: [{ name: "cork", origin: "typed" }] },
           authed(token),
         ),
         d,
@@ -649,7 +688,7 @@ describeDb("DELETE /api/sources/:id", () => {
 });
 
 describeDb("purgeExpiredAttribution", () => {
-  test("deletes 30-day-old attribution and reports, keeps fresh rows", async () => {
+  test("keeps attribution past 30 days for an account that agreed to version 3; deletes 30-day-old reports", async () => {
     await inRollback(sharedSql!, async (tx) => {
       const token = await seedUser(tx, "u1");
       const d = deps(tx, fakeR2());
@@ -662,10 +701,32 @@ describeDb("purgeExpiredAttribution", () => {
 
       await purgeExpiredAttribution(tx);
 
-      expect(await tx`SELECT source_id FROM source_attribution`).toHaveLength(0);
+      const attribution = await tx`SELECT source_id, user_id FROM source_attribution`;
+      expect(attribution).toHaveLength(1);
+      expect(attribution[0]).toEqual({ source_id: VIDEO_ID, user_id: "u1" });
       const reports = await tx`SELECT target_id FROM reports`;
       expect(reports.map((r: Record<string, unknown>) => r.target_id)).toEqual(["y"]);
     });
   });
+
+  test("still deletes 30-day-old attribution of an account that only agreed to the 30-day wording", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      expect((await registerSource(tx, deps(tx, fakeR2()), token)).status).toBe(201);
+      await tx`INSERT INTO sources (id, source_key_hash, frame_count, sample_rate, r2_key)
+        VALUES (${VIDEO_ID_2}, ${sha256Hex(SOURCE_KEY)}, 600, 10, ${`poses/${VIDEO_ID_2}.tkp1.gz`})`;
+      await tx`INSERT INTO users (id) VALUES ('u2')`;
+      await tx`INSERT INTO consents (user_id, disclosure_version) VALUES ('u2', 2)`;
+      await tx`INSERT INTO source_attribution (source_id, user_id, attributed_at)
+        VALUES (${VIDEO_ID_2}, 'u2', now() - interval '31 days')`;
+      await tx`UPDATE source_attribution SET attributed_at = now() - interval '31 days' WHERE source_id = ${VIDEO_ID}`;
+
+      await purgeExpiredAttribution(tx);
+
+      const left = await tx`SELECT source_id FROM source_attribution`;
+      expect(left.map((r: Record<string, unknown>) => r.source_id)).toEqual([VIDEO_ID]);
+    });
+  });
 });
+
 

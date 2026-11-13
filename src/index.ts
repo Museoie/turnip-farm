@@ -4,9 +4,12 @@ import { startServer } from "./app";
 import { createAppleJwtVerifier, createAppleRevoker, createAppleTokenVerifier, createCodeExchanger, importApplePrivateKey } from "./auth/apple";
 import { importRefreshTokenKey } from "./auth/tokens";
 import { type Config, ConfigError, loadConfig } from "./config";
+import { deleteIdleAccounts } from "./auth/account";
 import { purgeExpiredAttribution } from "./contrib/purge";
+import { deriveCandidateKey } from "./labels";
 import { R2BlobStore } from "./ingest/store";
 import { createPostgresSourceStore, startIngestPoller } from "./ingest/worker";
+import { startSegmenter } from "./ingest/segmenter";
 import { createR2Client } from "./r2/client";
 import { TokenBucket } from "./ratelimit";
 
@@ -44,14 +47,26 @@ const appleCredentials = {
   privateKey,
 };
 
-// 30-day attribution/report purge (§1.2.17, §4): at startup and hourly.
-// Failures are logged, never fatal: a late purge never extends the link
-// because every attribution read also filters the 30-day window.
-const purge = () =>
-  purgeExpiredAttribution(sql).catch((err) => console.error("attribution purge failed:", err));
-await purge();
-const purgeTimer = setInterval(purge, 60 * 60 * 1000);
-purgeTimer.unref?.();
+const r2 = createR2Client(config.r2);
+const refreshTokenKey = await importRefreshTokenKey(config.apple.refreshTokenKey);
+const revokeRefreshToken = createAppleRevoker({ credentials: appleCredentials });
+const candidateKey = await deriveCandidateKey(config.apple.refreshTokenKey);
+
+// Retention jobs (§1.2.17, §4), at startup and hourly: the report purge
+// (and the 30-day attribution purge for accounts that only agreed to the
+// 30-day disclosure), then the 24-month idle-account deletion. Failures are
+// logged, never fatal; the next run retries.
+const retention = async () => {
+  await purgeExpiredAttribution(sql).catch((err) => console.error("retention purge failed:", err));
+  await deleteIdleAccounts({ sql, r2, refreshTokenKey, revokeRefreshToken, candidateKey })
+    .then(({ deleted, failed }) => {
+      if (deleted > 0 || failed > 0) console.log(`idle accounts: ${deleted} deleted, ${failed} failed`);
+    })
+    .catch((err) => console.error("idle-account deletion failed:", err));
+};
+await retention();
+const retentionTimer = setInterval(retention, 60 * 60 * 1000);
+retentionTimer.unref?.();
 
 // The built web client lives next to the server bundle (build/client).
 // Run from source there is no build, so the API runs without file serving
@@ -67,10 +82,12 @@ const server = startServer(config.port, {
   exchangeCode: createCodeExchanger({ credentials: appleCredentials }),
   // Server-to-server notifications carry no `exp` (§7.1).
   verifyNotificationPayload: createAppleJwtVerifier({ audience: config.appBundleId, requireExp: false }),
-  revokeRefreshToken: createAppleRevoker({ credentials: appleCredentials }),
-  refreshTokenKey: await importRefreshTokenKey(config.apple.refreshTokenKey),
-  r2: createR2Client(config.r2),
+  revokeRefreshToken,
+  refreshTokenKey,
+  r2,
   pipelineKey: config.pipelineKey,
+  currentDisclosureVersion: config.currentDisclosureVersion,
+  candidateKey,
   limits: {
     // §7.2 suggestions: 60/min per user on POSTs, 10/min per IP on sign-in
     // and notifications, 30/min per IP on the public GET endpoints.
@@ -87,12 +104,14 @@ console.log(`turnip-farm listening on ${server.url}`);
 // 0 disables (e.g. when R2 event notifications drive ingest instead).
 const ingestIntervalMs = parseIngestIntervalMs(process.env.INGEST_POLL_INTERVAL_MS);
 let stopIngest: (() => void) | undefined;
+let stopSegmenter: (() => void) | undefined;
 if (ingestIntervalMs > 0) {
-  stopIngest = startIngestPoller(
-    { store: new R2BlobStore(config.r2), sources: createPostgresSourceStore(sql) },
-    ingestIntervalMs,
-  );
-  console.log(`ingest poller running every ${ingestIntervalMs}ms`);
+  const store = new R2BlobStore(config.r2);
+  stopIngest = startIngestPoller({ store, sources: createPostgresSourceStore(sql) }, ingestIntervalMs);
+  // Training segments are cut from stored blobs once clips arrive
+  // (BACKEND_DESIGN.md §1.2.24), on the same interval.
+  stopSegmenter = startSegmenter({ sql, store }, ingestIntervalMs);
+  console.log(`ingest poller and segmenter running every ${ingestIntervalMs}ms`);
 }
 
 // Graceful shutdown on SIGTERM, which `docker stop` and `systemctl restart`
@@ -104,8 +123,9 @@ process.on("SIGTERM", async () => {
   if (stopping) return;
   stopping = true;
   console.log("turnip-farm shutting down");
-  clearInterval(purgeTimer);
+  clearInterval(retentionTimer);
   stopIngest?.();
+  stopSegmenter?.();
   await server.stop();
   await sql.end();
   process.exit(0);

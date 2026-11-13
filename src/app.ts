@@ -24,6 +24,8 @@ import {
   handleReleaseQuarantine,
 } from "./quarantine";
 import { handlePostReport } from "./reports";
+import { handlePostConsent } from "./consent";
+import { handlePostLabelCandidates } from "./labels";
 import { errorResponse } from "./errors";
 import { isVideoId } from "./contrib/validate";
 import type { R2Client } from "./r2/client";
@@ -50,6 +52,10 @@ export type AppDeps = SignInDeps & {
   /** Apple JWT verifier without the `exp` requirement, for server-to-server notifications (§7.1). */
   verifyNotificationPayload: VerifyAppleJwt;
   revokeRefreshToken: RevokeRefreshToken;
+  /** The disclosure version contribution requires (`CURRENT_DISCLOSURE_VERSION`, §7.3 POST /api/consent). */
+  currentDisclosureVersion: number;
+  /** HMAC key for label-candidate account hashes (§1.2.25). */
+  candidateKey: CryptoKey;
 };
 
 export interface HandlerOptions {
@@ -119,6 +125,9 @@ export function createHandler(deps: AppDeps, opts: HandlerOptions = {}): (req: R
       if (method === "DELETE" && seg.length === 2 && seg[1] === "account") {
         return handleDeleteAccount(req, deps);
       }
+      if (method === "POST" && seg.length === 2 && seg[1] === "consent") {
+        return handlePostConsent(req, deps);
+      }
       if (seg[1] === "sources") {
         if (method === "POST" && seg.length === 2) return handleRegisterSource(req, deps);
         if (seg.length === 3) {
@@ -138,6 +147,9 @@ export function createHandler(deps: AppDeps, opts: HandlerOptions = {}): (req: R
       if (seg[1] === "labels") {
         if (method === "GET" && seg.length === 3 && seg[2] === "export") {
           return handleGetLabelsExport(req, deps);
+        }
+        if (method === "POST" && seg.length === 3 && seg[2] === "candidates") {
+          return handlePostLabelCandidates(req, deps);
         }
       }
       if (seg[1] === "taxonomy") {

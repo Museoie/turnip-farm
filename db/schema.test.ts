@@ -49,16 +49,21 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       ORDER BY table_name`;
     expect(rows.map((r: { table_name: string }) => r.table_name)).toEqual([
       "clips",
+      "consents",
       "data_quarantine",
+      "label_candidates",
       "label_taxonomy",
       "labels",
       "model_training_sources",
       "models",
       "reports",
       "schema_migrations", // dbmate's applied-version ledger
+      "segment_sources",
       "sessions",
       "source_attribution",
       "sources",
+      "training_segment_labels",
+      "training_segments",
       "users",
     ]);
   });
@@ -71,9 +76,13 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
     expect(rows.map((r: { indexdef: string }) => r.indexdef)).toEqual([
       "CREATE UNIQUE INDEX clips_pkey ON public.clips USING btree (id)",
       "CREATE INDEX clips_source_id_idx ON public.clips USING btree (source_id)",
+      "CREATE UNIQUE INDEX consents_pkey ON public.consents USING btree (user_id, disclosure_version)",
       "CREATE INDEX data_quarantine_open_idx ON public.data_quarantine USING btree (quarantined_at) WHERE (resolved_at IS NULL)",
       "CREATE UNIQUE INDEX data_quarantine_open_uniq ON public.data_quarantine USING btree (source_id) WHERE (resolved_at IS NULL)",
       "CREATE UNIQUE INDEX data_quarantine_pkey ON public.data_quarantine USING btree (id)",
+      "CREATE INDEX label_candidates_account_hash_idx ON public.label_candidates USING btree (account_hash)",
+      "CREATE UNIQUE INDEX label_candidates_name_account_uniq ON public.label_candidates USING btree (lower(name), account_hash)",
+      "CREATE INDEX label_candidates_submitted_at_idx ON public.label_candidates USING btree (submitted_at)",
       "CREATE INDEX label_taxonomy_lookup_idx ON public.label_taxonomy USING btree (raw, taxonomy_version DESC)",
       "CREATE UNIQUE INDEX label_taxonomy_pkey ON public.label_taxonomy USING btree (id)",
       "CREATE UNIQUE INDEX label_taxonomy_raw_version_uniq ON public.label_taxonomy USING btree (raw, taxonomy_version)",
@@ -84,6 +93,8 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       "CREATE UNIQUE INDEX models_version_key ON public.models USING btree (version)",
       "CREATE UNIQUE INDEX reports_pkey ON public.reports USING btree (id)",
       "CREATE INDEX reports_status_idx ON public.reports USING btree (status, created_at) WHERE (status = 'open'::text)",
+      "CREATE UNIQUE INDEX segment_sources_pkey ON public.segment_sources USING btree (segment_id)",
+      "CREATE INDEX segment_sources_source_id_idx ON public.segment_sources USING btree (source_id)",
       "CREATE INDEX sessions_expires_at_idx ON public.sessions USING btree (expires_at)",
       "CREATE UNIQUE INDEX sessions_pkey ON public.sessions USING btree (id)",
       "CREATE UNIQUE INDEX sessions_token_hash_key ON public.sessions USING btree (token_hash)",
@@ -92,6 +103,11 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       "CREATE UNIQUE INDEX source_attribution_pkey ON public.source_attribution USING btree (source_id)",
       "CREATE INDEX source_attribution_user_id_idx ON public.source_attribution USING btree (user_id)",
       "CREATE UNIQUE INDEX sources_pkey ON public.sources USING btree (id)",
+      "CREATE INDEX sources_segments_dirty_idx ON public.sources USING btree (segments_dirty_at) WHERE (segments_dirty_at IS NOT NULL)",
+      "CREATE UNIQUE INDEX training_segment_labels_pkey ON public.training_segment_labels USING btree (segment_id, trick_name)",
+      "CREATE UNIQUE INDEX training_segments_pkey ON public.training_segments USING btree (id)",
+      "CREATE UNIQUE INDEX training_segments_r2_key_key ON public.training_segments USING btree (r2_key)",
+      "CREATE INDEX users_last_active_at_idx ON public.users USING btree (last_active_at)",
       "CREATE UNIQUE INDEX users_pkey ON public.users USING btree (id)",
     ]);
   });
