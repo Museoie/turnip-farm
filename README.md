@@ -117,6 +117,7 @@ src/
   consent.ts       POST /api/consent and the consent gate on contribution writes (§7.3)
   labels.ts        vocabulary-only labels, POST /api/labels/candidates, and the candidate scripts (§1.2.25)
   moderation.ts    attribution lookup and blocking, for the scripts below
+  holdout.ts       the curated-holdout flag on sources, for sources:holdout (§1.2.28)
   *.test.ts        tests (bun test), next to the code they cover
 scripts/           maintainer scripts, run with bun run (see Moderation)
 db/
@@ -212,6 +213,20 @@ after 30 days. Two scripts review and promote them:
 bun run labels:candidates [--min N]            # names by distinct accounts
 bun run labels:promote <name> [<canonical>]    # add to the taxonomy at a new version
 ```
+
+### Curated holdout
+
+The maintainer's own footage of people outside the contributor pool is
+the holdout every candidate model is evaluated on (BACKEND_DESIGN.md
+§1.2.28). Flag a source as holdout, or clear the flag, by its video id:
+
+```sh
+bun run sources:holdout <video_id>           # evaluate on it, never train on it
+bun run sources:holdout <video_id> --clear   # back to ordinary training data
+```
+
+The export carries `holdout` on every row, and holdout sources don't
+count toward a trick's contributors.
 
 ### Configuration
 

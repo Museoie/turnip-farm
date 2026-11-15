@@ -521,7 +521,9 @@ contributors that leakage can inflate validation by more than a
 rounding error — one prolific contributor can be a large share of both
 splits — and validation is what the promotion gate reads. So it is a
 measured risk, not a footnote: the admin-curated holdout is built from
-footage of people outside the contributor pool, every run reports the
+footage of people outside the contributor pool, flagged on the farm
+(`sources.holdout`, set by the maintainer; the export carries it on
+every row, `BACKEND_DESIGN.md` §1.2.28), every run reports the
 validation-minus-holdout gap, and a persistent gap reopens how splits
 group sources — e.g. a per-install contributor tag used only for
 grouping (`TRAINING_DESIGN.md` §2.6). That is a narrower question than

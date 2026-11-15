@@ -159,6 +159,7 @@ describeDb("GET /api/labels/export", () => {
           source_id: v,
           r2_key: `poses/${v}.tkp1.gz`,
           blob_sha256: sha256Hex(`blob-${v.slice(0, 8)}`),
+          holdout: false,
           clip_id: clipId(1),
           start_frame: 0,
           end_frame: 100,
@@ -393,6 +394,43 @@ describeDb("GET /api/labels/export", () => {
         { canonical: "cork", contributors: 1 },
         { canonical: "legacy name", contributors: 1 },
         { canonical: "raiz flip", contributors: 1 },
+      ]);
+    });
+  });
+
+  test("holdout rides on every row of a flagged source, and its contributor isn't counted", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      // u1 contributes cork on an ordinary source; u2 only on a holdout source.
+      await seedSource(tx, vid("a"));
+      await attribute(tx, vid("a"), "u1");
+      await seedClip(tx, clipId(1), vid("a"));
+      await seedLabel(tx, clipId(1), "cork");
+      await seedSource(tx, vid("b"));
+      await attribute(tx, vid("b"), "u2");
+      for (const n of [2, 3]) {
+        await seedClip(tx, clipId(n), vid("b"));
+        await seedLabel(tx, clipId(n), "cork");
+      }
+      await seedLabel(tx, clipId(3), "gainer");
+      await tx`UPDATE sources SET holdout = true WHERE id = ${vid("b")}`;
+
+      const body = await pull(tx);
+      const holdoutBySource = body.rows.map((r: any) => [r.source_id, r.clip_id, r.holdout]);
+      expect(holdoutBySource.sort()).toEqual(
+        [
+          [vid("a"), clipId(1), false],
+          [vid("b"), clipId(2), true],
+          [vid("b"), clipId(3), true],
+          [vid("b"), clipId(3), true],
+        ].sort(),
+      );
+      // gainer is held out entirely, so nobody counts for it.
+      expect(body.trick_contributors).toEqual([{ canonical: "cork", contributors: 1 }]);
+
+      await tx`UPDATE sources SET holdout = false WHERE id = ${vid("b")}`;
+      expect((await pull(tx)).trick_contributors).toEqual([
+        { canonical: "cork", contributors: 2 },
+        { canonical: "gainer", contributors: 1 },
       ]);
     });
   });

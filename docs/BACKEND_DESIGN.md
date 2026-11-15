@@ -321,7 +321,26 @@ Two departures from the master plan's label draft follow from this:
     The export also carries `contributor_minimum`, the hold-back
     threshold (`HOLD_BACK_MIN_CONTRIBUTORS` in `src/export.ts`, 5, a
     judgment call), so the pipeline and the farm read one value. Counts
-    only: no account id leaves the farm.
+    only: no account id leaves the farm. Holdout sources (§1.2.28) are
+    not counted: they are never trained on.
+28. **The curated holdout is a flag on the source.** *Added 2026-11 by
+    the maintainer.* turnip-ml evaluates every candidate on an
+    admin-curated holdout, the maintainer's own footage of people
+    outside the contributor pool (master plan §6). It used to pin those
+    sources by id in turnip-ml's own config; with whole recordings back
+    in the export (§1.2.24) the farm carries the flag instead, so one
+    place says which sources are holdout. `sources.holdout` (default
+    false) is set and cleared only by the maintainer, with
+    `bun run sources:holdout <video_id> [--clear]`; there is no HTTP
+    route, and a contributor can't set it. Changing it moves the
+    source's `updated_at`, so the change reaches the export cursor (§6).
+    The export carries `holdout` on every row (§7.3), and turnip-ml
+    evaluates on those rows and never trains on them. Holdout sources
+    are left out of `trick_contributors` (§1.2.27): the footage is the
+    maintainer's, and counting it would let a trick pass the hold-back
+    on data no model trains on. The flag lives on the source row, so
+    it goes with the source if the source is deleted, and a source
+    registered again under the same `video_id` starts unflagged.
 
 ## 2. Conventions
 
@@ -418,6 +437,9 @@ CREATE TABLE sources (
   -- by the farm at ingest (POSE_FORMAT.md §6 resampling); never client-supplied;
   -- NULL until the canonical blob is stored. Distinct from `id`
   -- (digest of the asset identity).
+  holdout         BOOLEAN NOT NULL DEFAULT false,
+  -- The maintainer's curated holdout (§1.2.28): exported, evaluated on,
+  -- never trained on. Set only by `bun run sources:holdout`.
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT sources_id_hex  CHECK (id     ~ '^[0-9a-f]{64}$'),
@@ -852,6 +874,7 @@ canonical_map AS (       -- normalized canonical → that canonical
 SELECT s.id            AS source_id,
        s.r2_key,
        s.sha256        AS blob_sha256,
+       s.holdout,
        c.id            AS clip_id,
        c.start_frame,
        c.end_frame,
@@ -945,6 +968,7 @@ LEFT JOIN data_quarantine q ON q.source_id = s.id AND q.resolved_at IS NULL
 LEFT JOIN raw_map rm        ON rm.n = norm(l.trick_name)
 LEFT JOIN canonical_map cm  ON cm.n = norm(l.trick_name)
 WHERE q.id IS NULL AND s.sha256 IS NOT NULL
+  AND NOT s.holdout       -- the maintainer's own footage (§1.2.28)
 GROUP BY 1 ORDER BY 1;
 ```
 
@@ -1740,6 +1764,7 @@ The response, exactly (the contract turnip-ml builds against):
       "source_id": "<video_id>",
       "r2_key": "poses/<video_id>.tkp1.gz",
       "blob_sha256": "<64-char hex of the stored .tkp1.gz bytes>",
+      "holdout": false,
       "clip_id": "<uuid>",
       "start_frame": 120,
       "end_frame": 175,
@@ -1774,6 +1799,9 @@ Row fields:
   `poses/<video_id>.tkp1.gz`, and the SHA-256 of its stored (gzipped)
   bytes. The training job fetches it from R2 itself and verifies the
   digest. Every row of a source carries the same pair.
+- `holdout` (boolean): the source is the maintainer's curated holdout
+  (§1.2.28). Evaluate on it; never train on it. The same on every row
+  of a source.
 - `clip_id` (string, UUID), `start_frame`, `end_frame` (integers): the
   clip window in source frames of the canonical blob, end exclusive
   (`0 <= start_frame < end_frame`). Frames outside every clip of a
@@ -1808,8 +1836,8 @@ Whole-dataset fields, the same on every page:
   2026-10-14).
 - `trick_contributors`: per canonical trick under the current taxonomy,
   sorted by `canonical`, the number of distinct accounts whose exported,
-  non-quarantined rows carry it, counted through each row's source
-  attribution (§1.2.27, §6). A canonical absent from the list has 0
+  non-quarantined, non-holdout rows carry it, counted through each row's
+  source attribution (§1.2.27, §1.2.28, §6). A canonical absent from the list has 0
   known contributors. A label with a `null` canonical appears as its
   normalized name.
 - `contributor_minimum` (integer): the hold-back threshold. turnip-ml

@@ -109,6 +109,7 @@ async function selectRows(
     SELECT s.id            AS source_id,
            s.r2_key,
            s.sha256        AS blob_sha256,
+           s.holdout,
            c.id            AS clip_id,
            c.start_frame,
            c.end_frame,
@@ -166,8 +167,10 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
   // Distinct contributing accounts per canonical trick (§1.2.27), for the
   // pipeline's hold-back. Counted over every exported row's source (not
   // just this page's) through its attribution; a source with no
-  // attribution left counts for nobody. Names resolve as each row's
-  // `canonical` does; one with no match counts as its normalized self.
+  // attribution left counts for nobody, and neither does a holdout source
+  // (§1.2.28: the maintainer's own footage, never trained on). Names
+  // resolve as each row's `canonical` does; one with no match counts as
+  // its normalized self.
   const contributors = (await deps.sql`
     WITH raw_map AS (
       SELECT DISTINCT ON (n) n, canonical
@@ -197,6 +200,7 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
            ON cm.n = lower(regexp_replace(btrim(l.trick_name, E' \\t\\n\\x0B\\f\\r'), E'[ \\t\\n\\x0B\\f\\r]+', ' ', 'g'))
     WHERE q.id IS NULL
       AND s.sha256 IS NOT NULL
+      AND NOT s.holdout
     GROUP BY 1
     ORDER BY 1`) as { canonical: string; contributors: number }[];
 
@@ -206,6 +210,7 @@ export async function handleGetLabelsExport(req: Request, deps: ExportDeps): Pro
       source_id: r.source_id,
       r2_key: r.r2_key,
       blob_sha256: r.blob_sha256,
+      holdout: r.holdout,
       clip_id: r.clip_id,
       start_frame: r.start_frame,
       end_frame: r.end_frame,
