@@ -4,7 +4,7 @@
 import type { SQL } from "bun";
 import { SignJWT, exportJWK, generateKeyPair } from "jose";
 import { APPLE_ISSUER, type AppleCredentials } from "./apple";
-import { deriveCandidateKey } from "../labels";
+import { candidateAccountHash, deriveCandidateKey } from "../labels";
 
 export const AUDIENCE = "kim.hoie.turnip";
 export const SUB = "001234.0123456789abcdef0123456789abcdef.0123";
@@ -140,3 +140,59 @@ export type MockApple = Awaited<ReturnType<typeof startMockApple>>;
 
 // The label-candidate HMAC key (§1.2.25) for tests, derived from 32 zero bytes.
 export const testCandidateKey = await deriveCandidateKey(new Uint8Array(32));
+
+// Everything an account leaves in the database besides its user row and
+// sessions, for the account-deletion tests (BACKEND_DESIGN.md §7.3
+// `DELETE /api/account`): on each of its sources a clip and a label, and on
+// the account a consent, a report and a label candidate. The account and
+// its sources (with their attribution) are seeded by the caller.
+export async function seedAccountContributions(sql: SQL, userId: string, sourceIds: readonly string[]): Promise<void> {
+  for (const sourceId of sourceIds) {
+    const [clip] = await sql`INSERT INTO clips (source_id, start_frame, end_frame) VALUES (${sourceId}, 0, 10) RETURNING id`;
+    await sql`INSERT INTO labels (clip_id, trick_name, taxonomy_version) VALUES (${clip.id}, 'cork', 1)`;
+  }
+  await sql`INSERT INTO consents (user_id, disclosure_version) VALUES (${userId}, 3)`;
+  await sql`INSERT INTO reports (reporter_user_id, target_type, target_id, reason)
+    VALUES (${userId}, 'source', ${sourceIds[0] ?? "f".repeat(64)}, 'test report')`;
+  await sql`INSERT INTO label_candidates (name, account_hash)
+    VALUES ('raiz', ${await candidateAccountHash(testCandidateKey, userId)})`;
+}
+
+// What is left of the account and its sources, per table; every count is 0
+// after a full deletion.
+export async function accountRemains(
+  sql: SQL,
+  userId: string,
+  sourceIds: readonly string[],
+): Promise<Record<string, number>> {
+  // Bun doesn't bind a JS array as a Postgres array; source ids are hex.
+  const ids = `{${sourceIds.join(",")}}`;
+  const hash = await candidateAccountHash(testCandidateKey, userId);
+  const [row] = await sql`
+    SELECT (SELECT count(*) FROM users WHERE id = ${userId})::int                          AS users,
+           (SELECT count(*) FROM sessions WHERE user_id = ${userId})::int                  AS sessions,
+           (SELECT count(*) FROM users WHERE id = ${userId}
+              AND apple_refresh_token IS NOT NULL)::int                                     AS apple_tokens,
+           (SELECT count(*) FROM consents WHERE user_id = ${userId})::int                  AS consents,
+           (SELECT count(*) FROM source_attribution WHERE user_id = ${userId})::int        AS attribution,
+           (SELECT count(*) FROM sources WHERE id = ANY(${ids}::char(64)[]))::int          AS sources,
+           (SELECT count(*) FROM clips WHERE source_id = ANY(${ids}::char(64)[]))::int     AS clips,
+           (SELECT count(*) FROM labels l JOIN clips c ON c.id = l.clip_id
+              WHERE c.source_id = ANY(${ids}::char(64)[]))::int                             AS labels,
+           (SELECT count(*) FROM label_candidates WHERE account_hash = ${hash})::int       AS label_candidates,
+           (SELECT count(*) FROM reports WHERE reporter_user_id = ${userId})::int          AS reports`;
+  return row as Record<string, number>;
+}
+
+export const NOTHING_REMAINS = {
+  users: 0,
+  sessions: 0,
+  apple_tokens: 0,
+  consents: 0,
+  attribution: 0,
+  sources: 0,
+  clips: 0,
+  labels: 0,
+  label_candidates: 0,
+  reports: 0,
+};

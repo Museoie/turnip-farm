@@ -9,7 +9,7 @@ import type { R2Client } from "../r2/client";
 import { AppleUnavailableError } from "./apple";
 import { IDLE_ACCOUNT_MONTHS, deleteIdleAccounts, handleDeleteAccount, type AccountDeps } from "./account";
 import { authenticateClient } from "./sessions";
-import { testCandidateKey } from "./testing";
+import { NOTHING_REMAINS, accountRemains, seedAccountContributions, testCandidateKey } from "./testing";
 import { encryptRefreshToken, importRefreshTokenKey, sha256Hex } from "./tokens";
 
 const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
@@ -50,8 +50,8 @@ function fakeR2(opts: { failDelete?: boolean } = {}): R2Client & { deleted: stri
 }
 
 const authed = (token: string) => ({ authorization: `Bearer ${token}` });
-const del = (headers: Record<string, string> = {}) =>
-  new Request("http://farm.test/api/account", { method: "DELETE", headers });
+const del = (headers: Record<string, string> = {}, query = "") =>
+  new Request(`http://farm.test/api/account${query}`, { method: "DELETE", headers });
 
 async function seedUser(tx: TransactionSQL, userId: string, opts: { blocked?: boolean; refreshToken?: boolean } = {}) {
   const refreshKey = await importRefreshTokenKey(crypto.getRandomValues(new Uint8Array(32)));
@@ -175,6 +175,45 @@ describeDb("DELETE /api/account", () => {
       expect(consents).toEqual([]);
     }));
 
+  // Older app builds send ?contributions=keep or =delete; the parameter is
+  // ignored, so every form deletes everything (§7.3).
+  for (const query of ["", "?contributions=keep", "?contributions=delete", "?contributions=whatever"]) {
+    test(`deletes everything the account left, with ${query || "no query"}`, async () =>
+      inRollback(sharedSql, async (tx) => {
+        const { token, refreshKey } = await seedUser(tx, USER_ID);
+        await seedUser(tx, OTHER_USER);
+        await seedSource(tx, SOURCE_ID, USER_ID);
+        await seedSource(tx, OLD_SOURCE_ID, USER_ID, true);
+        await seedSource(tx, OTHER_SOURCE_ID, OTHER_USER);
+        await seedAccountContributions(tx, USER_ID, [SOURCE_ID, OLD_SOURCE_ID]);
+        await seedAccountContributions(tx, OTHER_USER, [OTHER_SOURCE_ID]);
+
+        const r2 = fakeR2();
+        const res = await handleDeleteAccount(del(authed(token), query), deps(tx, refreshKey, r2));
+        expect(res.status).toBe(204);
+        expect(await accountRemains(tx, USER_ID, [SOURCE_ID, OLD_SOURCE_ID])).toEqual(NOTHING_REMAINS);
+        expect(r2.deleted.toSorted()).toEqual([
+          `poses/${SOURCE_ID}.tkp1.gz`,
+          `poses/${OLD_SOURCE_ID}.tkp1.gz`,
+          `staging/${SOURCE_ID}.tkp1.gz`,
+          `staging/${OLD_SOURCE_ID}.tkp1.gz`,
+        ]);
+        // The other account and its contribution are untouched.
+        expect(await accountRemains(tx, OTHER_USER, [OTHER_SOURCE_ID])).toEqual({
+          users: 1,
+          sessions: 1,
+          apple_tokens: 1,
+          consents: 1,
+          attribution: 1,
+          sources: 1,
+          clips: 1,
+          labels: 1,
+          label_candidates: 1,
+          reports: 1,
+        });
+      }));
+  }
+
   test("Apple unreachable → 503 APPLE_UNAVAILABLE with nothing deleted", async () =>
     inRollback(sharedSql, async (tx) => {
       const { token, refreshKey } = await seedUser(tx, USER_ID);
@@ -259,6 +298,7 @@ describeDb("deleteIdleAccounts (§1.2.17)", () => {
       await seedUser(tx, OTHER_USER, { refreshToken: false });
       await seedSource(tx, SOURCE_ID, USER_ID, true);
       await seedSource(tx, OTHER_SOURCE_ID, OTHER_USER);
+      await seedAccountContributions(tx, USER_ID, [SOURCE_ID]);
       await idleFor(tx, USER_ID, 24, 1);
       await idleFor(tx, OTHER_USER, 23, 27);
 
@@ -268,8 +308,7 @@ describeDb("deleteIdleAccounts (§1.2.17)", () => {
 
       expect(d.revoked).toEqual([REFRESH_TOKEN]);
       expect(r2.deleted).toEqual([`poses/${SOURCE_ID}.tkp1.gz`, `staging/${SOURCE_ID}.tkp1.gz`]);
-      expect(await tx`SELECT id FROM users WHERE id = ${USER_ID}`).toHaveLength(0);
-      expect(await tx`SELECT id FROM sources WHERE id = ${SOURCE_ID}`).toHaveLength(0);
+      expect(await accountRemains(tx, USER_ID, [SOURCE_ID])).toEqual(NOTHING_REMAINS);
       const [kept] = await tx`SELECT id FROM users WHERE id = ${OTHER_USER}`;
       expect(kept?.id).toBe(OTHER_USER);
       const [keptSource] = await tx`SELECT id FROM sources WHERE id = ${OTHER_SOURCE_ID}`;

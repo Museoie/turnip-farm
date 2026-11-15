@@ -9,7 +9,16 @@ import { TEST_DATABASE_URL, inRollback } from "../../db/testing";
 import type { R2Client } from "../r2/client";
 import { createAppleJwtVerifier, InvalidTokenError } from "./apple";
 import { handleAppleNotifications, type NotificationsDeps } from "./notifications";
-import { AUDIENCE, SUB, startMockApple, testCandidateKey, type MockApple } from "./testing";
+import {
+  AUDIENCE,
+  NOTHING_REMAINS,
+  SUB,
+  accountRemains,
+  seedAccountContributions,
+  startMockApple,
+  testCandidateKey,
+  type MockApple,
+} from "./testing";
 import { encryptRefreshToken, importRefreshTokenKey, sha256Hex } from "./tokens";
 
 const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
@@ -164,20 +173,18 @@ describeDb("POST /api/auth/apple/notifications", () => {
       expect(sessions).toHaveLength(1);
     }));
 
-  test("account-deleted removes the attributed sources and the user", async () =>
+  test("account-deleted deletes everything the account left", async () =>
     inRollback(sharedSql, async (tx) => {
       await seedUser(tx);
       await seedSource(tx, SOURCE_ID, SUB);
+      await seedAccountContributions(tx, SUB, [SOURCE_ID]);
       const r2 = fakeR2();
       const payload = await apple.notificationPayload({ claims: { events: events("account-deleted") } });
       const res = await handleAppleNotifications(post({ payload }), deps(tx, r2));
       expect(res.status).toBe(200);
 
       expect(r2.deleted).toEqual([`poses/${SOURCE_ID}.tkp1.gz`, `staging/${SOURCE_ID}.tkp1.gz`]);
-      const [source] = await tx`SELECT id FROM sources WHERE id = ${SOURCE_ID}`;
-      expect(source).toBeUndefined();
-      const [user] = await tx`SELECT id FROM users WHERE id = ${SUB}`;
-      expect(user).toBeUndefined();
+      expect(await accountRemains(tx, SUB, [SOURCE_ID])).toEqual(NOTHING_REMAINS);
     }));
 
   test("account-deleted with R2 down → 500, rows survive", async () =>

@@ -150,7 +150,11 @@ Two departures from the master plan's label draft follow from this:
     (`users.last_active_at`, set at sign-in and, at most hourly, by
     authenticated requests). An hourly job deletes idle accounts
     through the same steps as `DELETE /api/account` (§7.3), so their
-    attributed sources go with them.
+    attributed sources go with them. Every one of those deletions is
+    full: the account and every contribution attributed to it, with
+    nothing kept de-linked (§7.3, §8). What outlives it is disclosed
+    (§7.1): models already trained on the data, and database backups,
+    kept at most 30 days.
     The link serves two purposes: finding and blocking an account that
     poisons the dataset (master plan §6), and letting account deletion
     reach every contribution the account made. Ownership is still the
@@ -1039,11 +1043,12 @@ for `users.apple_refresh_token`).
   accessibility as the session token. Keychain items survive app
   deletion and reinstall on current iOS, but Apple doesn't guarantee
   it, so a lost key is an expected state, not an error.
-- Account deletion: Settings offers two choices with equal weight,
-  "Delete my account" and "Also delete my contributions". Delete every
-  source the app holds a key for, then call `DELETE /api/account`, with
-  `?contributions=delete` for the second choice, then delete the local
-  keys and session token (§7.3).
+- Account deletion: Settings offers one choice, "Delete my account",
+  which deletes the account and all its contributions. Delete every
+  source the app holds a key for, then call `DELETE /api/account`, then
+  delete the local keys and session token (§7.3). Older builds that
+  still offer a second choice and send `?contributions=keep` or
+  `=delete` get the same full deletion either way.
 - Consent: the contribution sheet shows the disclosure with a required
   "I'm 16 or older" confirmation, and Confirm calls `POST /api/consent`
   with the disclosure's version (§7.3). On `403 CONSENT_REQUIRED` from
@@ -1052,9 +1057,11 @@ for `users.apple_refresh_token`).
 - Disclosure (version 3), shown at contribution consent and again at
   account deletion: contributions stay linked to the account until the
   account is deleted, by the user or after 24 months without use.
-  Deleting the account deletes the full recordings and the link; short,
-  transformed training segments stay without any link to the account
-  unless the user also chooses "Also delete my contributions" (§7.3).
+  Deleting your account deletes all your contributions; models already
+  trained on them stay, and backups are kept up to 30 days (§7.3, §8).
+  The earlier version-3 wording kept short, de-linked training segments
+  unless the user also chose to delete them; the farm now deletes more
+  than that wording promised, never less, so agreements to it stand.
   The consent copy also asks users
   to contribute only clips of themselves, or of people who agreed: the
   person in a clip may not be the account holder. Versions 1 and 2 said
@@ -1184,14 +1191,15 @@ sign out cleanly. Allowed for blocked users.
 #### `DELETE /api/account` — delete my account
 
 App Review guideline 5.1.1(v). Session required; allowed for blocked
-users. Optional query parameter `contributions`:
+users. Deletes the account and everything it contributed: its sessions,
+its Apple refresh token, its consents, its attribution, its label
+candidates, its reports, and every source attributed to it with that
+source's pose blob, clips and labels. Nothing attributed to it is kept
+de-linked ("Client first" below covers sources it no longer holds the
+attribution for).
 
-- `keep` (the default) and `delete` now delete the same data: the
-  distinction was whether the account's training segments stayed, and
-  training segments are removed (§1.2.24).
-
-Any other value is `422 VALIDATION_ERROR` with
-`details.field = "contributions"`, before anything is deleted.
+The query parameter `contributions` is ignored. Older app builds send
+`keep` or `delete`; any value, or none, gets the same full deletion.
 
 **Client first.** Before calling this endpoint, the app deletes every
 source it holds a key for, with `DELETE /api/sources/:id`. The farm
@@ -1924,13 +1932,17 @@ checklist:
   and contribution requires the current version and a 16+ confirmation
   (§7.3 `POST /api/consent`).
 - Account deletion (§7.3) removes the account, its sessions, its Apple
-  token, its consents, its attribution, and the whole-session pose of
-  every contribution attributed to it or still keyed on the device:
-  the pose blob, clips and labels. Nothing derived from them is kept
-  de-linked (training segments are removed, §1.2.24). Accounts idle
-  for 24 months, and accounts whose Apple account was deleted, are
-  deleted the same way (§1.2.17). Data deleted outright leaves the next
-  training dataset, because training rebuilds from a full pull (§6).
+  token, its consents, its attribution, its label candidates and
+  reports, and every contribution attributed to it or still keyed on
+  the device: the pose blob, clips and labels. Nothing derived from
+  them is kept de-linked (training segments are removed, §1.2.24).
+  There is one way to delete an account and it deletes everything; the
+  `contributions` query parameter is ignored. Accounts idle for 24
+  months, and accounts whose Apple account was deleted, are deleted the
+  same way (§1.2.17). Data deleted outright leaves the next training
+  dataset, because training rebuilds from a full pull (§6). Two things
+  outlive it, and the disclosure says so (§7.1): database backups, for
+  at most 30 days, and models already trained on it.
   Models already trained on it are treated as anonymous, pending the
   assessment in §9 Q8.
 - Contribution is switched off in the EU, EEA and UK: the app hides it

@@ -2,9 +2,11 @@
 // idle-account job that runs the same steps (§1.2.17).
 //
 // App Review guideline 5.1.1(v): the endpoint revokes Apple's refresh
-// token, deletes every source attributed to the account, and deletes the
-// user row. Steps run in order so a retry after a partial failure finishes
-// the job.
+// token, deletes every source attributed to the account with its pose blob,
+// clips and labels, then the account's label candidates and the user row
+// (sessions, consents, attribution and reports cascade). Nothing is kept
+// de-linked. Steps run in order so a retry after a partial failure
+// finishes the job.
 
 import type { SQL } from "bun";
 import { transaction } from "../db";
@@ -29,18 +31,14 @@ export interface AccountDeps {
 /** What steps 2–3 of account deletion need. */
 export type AccountDataDeps = Pick<AccountDeps, "sql" | "r2" | "candidateKey">;
 
-// DELETE /api/account[?contributions=keep|delete]: both values delete the
-// same data. Session required; allowed for blocked users (§1.2.16). 204 once
-// deleted. A retry after success gets 401 — the session is gone.
+// DELETE /api/account: session required; allowed for blocked users
+// (§1.2.16). Deletes the account and every contribution attributed to it.
+// The `contributions` query parameter older app builds send (keep|delete)
+// is ignored: both mean the full deletion. 204 once deleted. A retry after
+// success gets 401 — the session is gone.
 export async function handleDeleteAccount(req: Request, deps: AccountDeps): Promise<Response> {
   const auth = await authenticateClient(req, deps, { allowBlocked: true });
   if (auth instanceof Response) return auth;
-  const contributions = new URL(req.url).searchParams.get("contributions");
-  if (contributions !== null && contributions !== "keep" && contributions !== "delete") {
-    return errorResponse(422, "VALIDATION_ERROR", "contributions must be keep or delete", {
-      details: { field: "contributions" },
-    });
-  }
   switch (await deleteAccount(deps, auth.userId)) {
     case "deleted":
       return new Response(null, { status: 204 });
