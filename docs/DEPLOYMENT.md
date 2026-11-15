@@ -164,6 +164,21 @@ log line ever does, that's a code bug, not a log-config problem.
   changing it is a code change, not an operator knob.
 - The client uploads staged blobs (`staging/<video_id>.tkp1.gz`) with a
   presigned PUT; the ingest worker canonicalizes them (see §8 below).
+- **Once, after deploying the migration that removes training segments**
+  (`20261115120000_delete_training_segments`, `BACKEND_DESIGN.md`
+  §1.2.24): the migration deletes the segment rows but can't reach R2,
+  so delete their blobs under `segments/` with
+  `bun run segments:purge-blobs`, as the service user from
+  `/opt/turnip-farm` (or `docker exec <container> bun run
+  segments:purge-blobs` in the Docker image, which ships `scripts/`). It
+  needs only the `R2_*` variables, prints how many blobs it deleted, and
+  is safe to re-run: it lists the prefix, so a run cut short by an R2
+  error resumes where it stopped. Run it after the restart, so the old
+  build's segmenter can't write a new segment behind it. A bucket that
+  never held segments has nothing under the prefix and it deletes 0.
+  Then `SELECT count(*) FROM training_segments` should read 0; if the old
+  build cut a segment between the migration and the restart, run
+  `DELETE FROM training_segments` and the script again.
 
 ## 8. Ingest trigger: poller vs. R2 event notifications
 

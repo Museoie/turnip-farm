@@ -154,8 +154,7 @@ Two departures from the master plan's label draft follow from this:
     The link serves two purposes: finding and blocking an account that
     poisons the dataset (master plan §6), and letting account deletion
     reach every contribution the account made. Ownership is still the
-    source key (§1.2.13), training splits by source (through the
-    segments' `split_bucket`, §1.2.24), and
+    source key (§1.2.13), training splits by source, and
     reputation is still not computed from contributions (§9 Q2).
     *Why the change:* the plan treats unlinked pose sequences as
     personal data anyway, since a sequence can be matched against a
@@ -231,56 +230,29 @@ Two departures from the master plan's label draft follow from this:
     never asks for a different size, and a client-controlled limit is a
     memory-exhaustion knob on a joined query. Tests override it through
     the handler's deps to cross the `LIMIT` boundary cheaply.
-24. **Training uses segments, never whole-session pose.** *Added
-    2026-11 by the privacy plan* (§8.1). A whole session is the most
-    re-identifiable thing the farm holds: hours of one person's movement,
-    which can be matched against a video of them. So the training export
-    serves only short **segments**, cut around each labeled clip window
-    and transformed to strip what identifies a person but doesn't teach
-    tricks (format: POSE_FORMAT.md §12):
-    - **Cut:** each labeled clip window plus 5 frames (0.5 s) of context
-      on each side, clamped to the blob. A segment longer than 80 frames
-      (8 s) is dropped. Clips are taken in start order, and one whose
-      segment would start fewer than 10 frames (1 s) after the last kept
-      segment ends is dropped, so no two kept segments overlap or touch
-      and a session can't be stitched back together.
-    - **Transform:** centered on the segment's mean hip position and
-      scaled by the median torso length over the whole blob, so every
-      segment of a source shares one scale and the app can compute it
-      from the session it holds (turnip-ml `MODEL_CONTRACT.md` §3.6);
-      every bone re-targeted to a standard length along its
-      observed direction (proportions go, angles stay); keypoints 0–4
-      collapsed to one head point; Gaussian noise of 0.02 torso lengths
-      on every joint.
-    - **Identity:** each segment gets a fresh random UUID and blob key
-      and no timestamps. It carries its clip's labels and provenance
-      (§1.2.18), the clip window inside the segment, and a
-      `split_bucket` (first byte of SHA-256 of the source id, mod 10)
-      so the pipeline can keep one session's segments on one side of a
-      holdout split without knowing which session they came from.
-    - **Link:** `segment_sources` maps a segment to its source. It is
-      deleted with the source, and so with the account (§7.3
-      `DELETE /api/account`); the segment then stays as de-linked
-      training data. Deleting a source directly (`DELETE
-      /api/sources/:id`) or purging it from quarantine deletes its
-      linked segments and their blobs too. A segment that is already
-      de-linked can no longer be found by source, and so can't be
-      quarantined: `POST /api/quarantine` resolves `segment_ids` through
-      this link and counts de-linked ones as `unlinked` (§7.3).
-    - **When:** clips arrive after ingest, so cutting happens in a
-      segmenter job on the ingest poller's interval (`src/ingest/segmenter.ts`),
-      not inside the staged-upload ingest. Ingest and every clip or label
-      write set `sources.segments_dirty_at`; the job re-cuts a dirty
-      source from its canonical blob, replaces its segments (new ids,
-      fresh noise) in one transaction claimed by compare-and-set on
-      `segments_dirty_at`, and deletes the replaced blobs. A change to
-      the transform ships with a migration that marks every ingested
-      source dirty, so existing segments are re-cut (as the 2026-11
-      switch to the blob-wide torso scale did).
-    The constants (context, maximum length, minimum gap, noise, bone
-    lengths, bucket count) are judgment calls, named in
-    `src/ingest/segments.ts`. Logs never put a segment id next to a
-    source id.
+24. **Training segments — removed.** *Added 2026-11 by the privacy
+    plan; removed 2026-11 by the maintainer.* For a short time the
+    training export served short segments (POSE_FORMAT.md §12, `TKS1`)
+    instead of whole recordings: a window cut around each labeled clip,
+    re-targeted onto a standard body, noised, and given a random id, so
+    that the data the farm kept, de-linked, after an account was deleted
+    could not easily be traced back to a person. Account deletion now
+    deletes every contribution of the account (§1.2.17, §7.3
+    `DELETE /api/account`), so nothing is kept de-linked and the
+    segments protected nothing; and they hurt training, since a window
+    with half a second of context gives the model too few "no trick"
+    frames. The export serves one row per labeled clip name with the
+    source's whole-recording `TKP1` blob again (§6, §7.3), and
+    `POST /api/models` and `POST /api/quarantine` take source ids only.
+    A data migration deleted every segment row, and
+    `bun run segments:purge-blobs` deletes their blobs under `segments/`
+    (DEPLOYMENT.md §7). The emptied tables `training_segments`,
+    `training_segment_labels` and `segment_sources`, and the columns
+    `sources.segments_dirty_at` and `segments_cut_at`, stay in the schema,
+    unread, because migrations are additive (§2); dropping them needs a
+    maintainer decision recorded there. Two things outlive a deleted
+    contribution and are disclosed (§7.1): models already trained on it,
+    and backups, kept at most 30 days (§8).
 25. **Labels come only from the vocabulary.** *Added 2026-11 by the
     privacy plan* (§8.1). A free-text name is whatever the user typed,
     which can be a name, a place or a joke about a friend; the farm has
@@ -334,11 +306,12 @@ Two departures from the master plan's label draft follow from this:
     until enough people contributed it. Only the farm knows who
     contributed, so the export carries `trick_contributors`: per
     canonical trick, the number of distinct accounts whose exported
-    segments carry it. It is counted over segments still linked to an
-    attributed source, excluding quarantined sources; a de-linked
-    segment's contributor is unknown and counts for nobody, so the count
-    errs toward holding back. A name resolves to its canonical as the
-    export's labels do (§7.3), so aliases count once; a name with no
+    rows carry it, counted through each row's source attribution over
+    every exported row, not just one page (§6), excluding quarantined
+    sources. A source with no attribution left (only an account that
+    never agreed to disclosure version 3, §1.2.17) counts for nobody, so
+    the count errs toward holding back. A name resolves to its canonical
+    as each export row's `canonical` does (§7.3), so aliases count once; a name with no
     match (only labels from before §1.2.25) counts as its normalized
     self. A trick absent from the list has no known contributor.
     The export also carries `contributor_minimum`, the hold-back
@@ -462,11 +435,9 @@ CREATE INDEX source_attribution_user_id_idx ON source_attribution (user_id);
 CREATE INDEX source_attribution_attributed_at_idx
   ON source_attribution (attributed_at);
 
--- On sources (§1.2.24): segments_dirty_at TIMESTAMPTZ, set by ingest and
--- by clip and label writes; segments_cut_at TIMESTAMPTZ, the
--- segments_dirty_at the current segments were cut for.
-CREATE INDEX sources_segments_dirty_idx ON sources (segments_dirty_at)
-  WHERE segments_dirty_at IS NOT NULL;
+-- On sources, unused since training segments were removed (§1.2.24):
+-- segments_dirty_at and segments_cut_at TIMESTAMPTZ, and the partial
+-- index sources_segments_dirty_idx on segments_dirty_at.
 
 CREATE TABLE label_candidates (
   name         TEXT NOT NULL
@@ -482,40 +453,10 @@ CREATE UNIQUE INDEX label_candidates_name_account_uniq
 CREATE INDEX label_candidates_account_hash_idx ON label_candidates (account_hash);
 CREATE INDEX label_candidates_submitted_at_idx ON label_candidates (submitted_at);
 
-CREATE TABLE training_segments (
-  id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  r2_key                 TEXT NOT NULL UNIQUE,
-  -- segments/<id>.tks1.gz (POSE_FORMAT.md §12)
-  sha256                 CHAR(64) NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-  -- Of the stored (gzipped) bytes.
-  frame_count            INTEGER NOT NULL CHECK (frame_count > 0),
-  window_start           INTEGER NOT NULL CHECK (window_start >= 0),
-  window_end             INTEGER NOT NULL,
-  -- The clip window inside the segment, in segment frames, end exclusive.
-  split_bucket           SMALLINT NOT NULL CHECK (split_bucket BETWEEN 0 AND 9),
-  proposal_model_version TEXT,
-  suggested_names        TEXT[] NOT NULL DEFAULT '{}',
-  suggestions_withheld   BOOLEAN NOT NULL DEFAULT FALSE,
-  -- The clip's provenance (§1.2.18), copied at cut time. No source,
-  -- clip, account or timestamp column (§1.2.24).
-  CONSTRAINT training_segments_window CHECK (window_start < window_end AND window_end <= frame_count)
-);
-
-CREATE TABLE training_segment_labels (
-  segment_id       UUID NOT NULL REFERENCES training_segments(id) ON DELETE CASCADE,
-  trick_name       TEXT NOT NULL,
-  origin           TEXT NOT NULL CHECK (origin IN ('typed', 'vocabulary', 'model')),
-  taxonomy_version INTEGER NOT NULL,
-  PRIMARY KEY (segment_id, trick_name)
-);
-
-CREATE TABLE segment_sources (
-  segment_id UUID PRIMARY KEY REFERENCES training_segments(id) ON DELETE CASCADE,
-  source_id  CHAR(64) NOT NULL REFERENCES sources(id) ON DELETE CASCADE
-  -- The only link from a segment to its source; deleted with the source,
-  -- and so with the account. The segment itself stays, de-linked.
-);
-CREATE INDEX segment_sources_source_id_idx ON segment_sources (source_id);
+-- Unused since training segments were removed (§1.2.24) and kept empty
+-- because migrations are additive (§2): training_segments,
+-- training_segment_labels and segment_sources (created by
+-- 20261113130000_training_segments.sql; nothing reads or writes them).
 
 CREATE TABLE clips (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -888,63 +829,14 @@ Properties:
 
 ## 6. Training-data queries (quarantine exclusion)
 
-The training export serves segments (§1.2.24), never whole-session pose.
-It must exclude quarantined data. Because a purge hard-deletes the
-source and its linked segments (§1.2.3, §1.2.24), "quarantined" for
-training purposes means **linked to a source with an open (unresolved)
-quarantine row**:
+The training export serves whole recordings: one row per (source, clip,
+label), each carrying its source's canonical `TKP1` blob reference. It
+must exclude quarantined sources. Because a purge hard-deletes the
+source row (§1.2.3), "quarantined" for training purposes means **has an
+open (unresolved) quarantine row**:
 
 ```sql
-SELECT t.id AS segment_id, t.r2_key, t.sha256 AS blob_sha256,
-       t.frame_count, t.window_start, t.window_end, t.split_bucket,
-       t.proposal_model_version, t.suggested_names, t.suggestions_withheld,
-       (SELECT json_agg(json_build_object('trick_name', l.trick_name,
-                                          'origin', l.origin,
-                                          'taxonomy_version', l.taxonomy_version)
-                        ORDER BY l.trick_name)
-        FROM training_segment_labels l WHERE l.segment_id = t.id) AS labels
-FROM training_segments t
-LEFT JOIN segment_sources ss ON ss.segment_id = t.id
-LEFT JOIN data_quarantine q  ON q.source_id = ss.source_id AND q.resolved_at IS NULL
-WHERE q.id IS NULL
-  AND EXISTS (SELECT 1 FROM training_segment_labels l WHERE l.segment_id = t.id)
-  AND t.id > $1          -- since cursor: the last segment id of the previous page
-ORDER BY t.id ASC
-LIMIT 10000;
-```
-
-Notes:
-
-- One entry per segment, with all its labels. The segmenter cuts only
-  labeled clips, so every segment has at least one label; the `EXISTS`
-  states it.
-- A de-linked segment (its account was deleted) has no source, so it
-  can't be quarantined, and stays in the export.
-- Keyset is on the segment id alone: ids are unique, so the order is
-  total. Ids are random and segments carry no timestamps, so the cursor
-  is a pagination position, not a change watermark: new segments land
-  anywhere in the order. `next_cursor` is the opaque encoding of the
-  last returned id, non-null whenever `segments` is non-empty and null
-  only on an empty page.
-- **The export carries no deletions, and no incremental pull.** A
-  segment re-cut after a clip edit gets a new id, and a deleted one
-  simply stops appearing. The training job builds every dataset from a
-  **full pull** (no `since`) and discards any cached segment blob absent
-  from it.
-- No account or source identifier is exported (§1.2.17, §1.2.24).
-  Training splits by `split_bucket`, which is the same for every segment
-  of a source.
-- Provenance (§1.2.18) rides on every segment: each label's `origin`,
-  and the clip's `proposal_model_version`, `suggested_names` and
-  `suggestions_withheld`.
-- Canonicalization (`raw → canonical`) happens in the training job using
-  the `taxonomy` block shipped with the export response (§7,
-  `GET /api/labels/export`), not in SQL. The one exception is
-  `trick_contributors` (§1.2.27), which the farm has to count per
-  canonical because only it knows the accounts:
-
-```sql
--- norm(x) = lower(regexp_replace(btrim(x), '[[:space:]]+', ' ', 'g'))
+-- norm(x) = lower(regexp_replace(btrim(x, E' \t\n\v\f\r'), E'[ \t\n\v\f\r]+', ' ', 'g'))
 WITH raw_map AS (        -- normalized raw → its greatest-version canonical
   SELECT DISTINCT ON (norm(raw)) norm(raw) AS n, canonical
   FROM label_taxonomy ORDER BY norm(raw), taxonomy_version DESC
@@ -953,20 +845,104 @@ canonical_map AS (       -- normalized canonical → that canonical
   SELECT DISTINCT ON (norm(canonical)) norm(canonical) AS n, canonical
   FROM label_taxonomy ORDER BY norm(canonical), taxonomy_version DESC
 )
-SELECT COALESCE(rm.canonical, cm.canonical, norm(l.trick_name)) AS canonical,
-       count(DISTINCT a.user_id) AS contributors
-FROM training_segment_labels l
-JOIN segment_sources ss    ON ss.segment_id = l.segment_id
-JOIN source_attribution a  ON a.source_id = ss.source_id
-LEFT JOIN data_quarantine q ON q.source_id = ss.source_id AND q.resolved_at IS NULL
-LEFT JOIN raw_map rm        ON rm.n = norm(l.trick_name)
-LEFT JOIN canonical_map cm  ON cm.n = norm(l.trick_name)
+SELECT s.id            AS source_id,
+       s.r2_key,
+       s.sha256        AS blob_sha256,
+       c.id            AS clip_id,
+       c.start_frame,
+       c.end_frame,
+       c.proposal_model_version,
+       c.suggested_names,
+       c.suggestions_withheld,
+       l.trick_name,                    -- raw, as the client sent it
+       COALESCE(rm.canonical, cm.canonical) AS canonical,
+       l.origin,
+       l.taxonomy_version,
+       GREATEST(s.updated_at, c.updated_at, l.updated_at) AS row_cursor
+FROM sources s
+JOIN clips  c ON c.source_id = s.id
+JOIN labels l ON l.clip_id   = c.id
+LEFT JOIN data_quarantine q
+       ON q.source_id = s.id AND q.resolved_at IS NULL
+LEFT JOIN raw_map rm       ON rm.n = norm(l.trick_name)
+LEFT JOIN canonical_map cm ON cm.n = norm(l.trick_name)
 WHERE q.id IS NULL
-GROUP BY 1 ORDER BY 1;
+  AND s.sha256 IS NOT NULL
+  AND (GREATEST(s.updated_at, c.updated_at, l.updated_at), c.id, l.trick_name)
+      > ($1, $2, $3)  -- since cursor: (row_cursor, clip_id, trick_name)
+ORDER BY row_cursor ASC, clip_id ASC, trick_name ASC
+LIMIT 10000;
 ```
 
-The same `raw_map` and `canonical_map` give each exported label its
-`canonical` (§7.3).
+Notes:
+
+- Sources with no labels contribute no rows. (Unlabeled *regions* of
+  labeled sources serve as background negatives — derived from clip
+  windows, not from label-less sources.)
+- Keyset is on `(row_cursor, clip_id, trick_name)`, not `row_cursor`
+  alone: `row_cursor` ties are guaranteed, not rare — §5 replaces a
+  clip's label set in the same transaction as the clip upserts, and
+  Postgres `now()` returns the transaction start, so every row a batch
+  touches shares the exact same `updated_at`. Keying on `row_cursor`
+  alone with `next_cursor = max(row_cursor)` would silently skip rows
+  sharing the max cursor value past the `LIMIT` boundary. The first
+  page uses `('-infinity', nil UUID, '')` as its lower bound, so one
+  query serves every page.
+- `next_cursor` is the opaque encoding of the last returned row's
+  `(row_cursor, clip_id, trick_name)`; the training job passes it back
+  as `since`. It is non-null whenever `rows` is non-empty and null only
+  on an empty page, so the pipeline gets an exact watermark for the cost
+  of one extra empty request per pull (maintainer decision 2026-10-14).
+  It carries `row_cursor` at full microsecond precision, formatted by
+  Postgres (`to_char(... AT TIME ZONE 'UTC', ...US"Z")`): `now()` stores
+  microseconds, and a millisecond cursor would make the `>` predicate
+  match the page's last row again, so the cursor would never advance.
+- `blob_sha256` is never null in export rows: the query filters
+  `s.sha256 IS NOT NULL` explicitly. Label submission already requires
+  an ingested blob (`BLOB_MISSING`), so this only states it; the
+  pipeline fails the run if it ever sees a null rather than training on
+  a row it can't fetch (maintainer decision 2026-10-14).
+- **The export carries no deletions.** A source deleted by its owner,
+  by account deletion, or by a quarantine purge, and a label dropped
+  when a clip's label set is replaced, simply stop appearing. An
+  incremental pull never learns of them. The training job therefore
+  builds every dataset from a **full pull** (no `since`) and discards
+  any locally cached pose blob whose source is absent from it. `since`
+  is only for cheap change detection, such as counting new labels
+  before deciding to train.
+- No account identifier is exported (§1.2.17). Training splits by
+  source.
+- Provenance (§1.2.18) rides on every row: `origin` per label, and the
+  clip's `proposal_model_version`, `suggested_names` and
+  `suggestions_withheld` repeated on each of its label rows. The app
+  contributes a clip only once it has at least one name
+  (`CONTRIBUTION_DESIGN.md` §3.3), so a clip whose suggestions were all
+  removed still exports through the name the user gave instead; only a
+  clip whose label set was later cleared to `[]` drops out, with its
+  provenance.
+- `norm` is the label-name normalization of §1.2.25, with whitespace
+  spelled out as ASCII. Each row's `canonical` resolves its name through
+  the greatest-version raw mapping first, else as a canonical itself;
+  `null` when neither matches (only labels from before §1.2.25). The
+  training job can also canonicalize from the `taxonomy` block shipped
+  with the export response (§7.3 `GET /api/labels/export`). The farm
+  resolves too because `trick_contributors` (§1.2.27) has to be counted
+  per canonical, and only the farm knows the accounts. It is counted
+  over every exported row, not just the page:
+
+```sql
+SELECT COALESCE(rm.canonical, cm.canonical, norm(l.trick_name)) AS canonical,
+       count(DISTINCT a.user_id) AS contributors
+FROM sources s
+JOIN clips  c ON c.source_id = s.id
+JOIN labels l ON l.clip_id   = c.id
+JOIN source_attribution a   ON a.source_id = s.id
+LEFT JOIN data_quarantine q ON q.source_id = s.id AND q.resolved_at IS NULL
+LEFT JOIN raw_map rm        ON rm.n = norm(l.trick_name)
+LEFT JOIN canonical_map cm  ON cm.n = norm(l.trick_name)
+WHERE q.id IS NULL AND s.sha256 IS NOT NULL
+GROUP BY 1 ORDER BY 1;
+```
 
 ## 7. API
 
@@ -1210,9 +1186,9 @@ sign out cleanly. Allowed for blocked users.
 App Review guideline 5.1.1(v). Session required; allowed for blocked
 users. Optional query parameter `contributions`:
 
-- `keep` (the default): the account's training segments stay as
-  de-linked training data (§1.2.24).
-- `delete`: they are deleted too, with their blobs.
+- `keep` (the default) and `delete` now delete the same data: the
+  distinction was whether the account's training segments stayed, and
+  training segments are removed (§1.2.24).
 
 Any other value is `422 VALIDATION_ERROR` with
 `details.field = "contributions"`, before anything is deleted.
@@ -1239,29 +1215,16 @@ finishes the job:
    deleted. Any other error is logged and deletion proceeds: the user's
    right to delete does not depend on Apple's answer.
 2. Delete every source attributed to the user (§4): first its R2 blob
-   and any staged upload (and, with `contributions=delete`, the blobs of
-   its training segments), then the rows. Clips, labels, quarantine rows,
-   training membership, attribution and `segment_sources` links cascade;
-   with `contributions=delete` the segment rows are deleted in the same
-   transaction. Without it, no full-session pose, attribution or link to
-   the account survives, only de-linked segments.
+   and any staged upload, then the rows. Clips, labels, quarantine rows,
+   training membership and attribution cascade, and the account's label
+   candidates are deleted in the same transaction.
 3. `DELETE FROM users WHERE id = $1`. Sessions, consents and reports
    cascade.
 
 Response `204`. A retry after success gets `401` (the session is gone).
 The hourly idle-account job runs the same three steps for accounts idle
-for 24 months (§1.2.17, §4), with `contributions=keep`, and so does the
-`account-deleted` notification (steps 2 and 3).
-
-**Why those keep the segments (maintainer decision, 2026-11).** A
-deletion request reaches the farm only from a user signed in with their
-Apple account; it is the only way the farm can tell whose data a
-request is about. When the Apple account is deleted, or the farm's
-account is deleted for inactivity, nobody is left who can make that
-request, and the de-linked segments carry nothing that would let the
-farm find one person's data. So they are kept, like any other de-linked
-segment, until someone asks to delete specific data with a reasonable
-way to identify it.
+for 24 months (§1.2.17, §4), and so does the `account-deleted`
+notification (steps 2 and 3).
 
 #### `POST /api/consent` — record agreement to the contribution disclosure
 
@@ -1338,8 +1301,7 @@ By `events.type`, for the user `events.sub`:
   sign in again, or delete the account.
 - `account-deleted` (the user deleted their Apple Account; Apple has
   invalidated all their tokens, and they can never sign in again to
-  delete their data): run `DELETE /api/account` steps 2 and 3. Training
-  segments stay, de-linked (§7.3 "Why those keep the segments").
+  delete their data): run `DELETE /api/account` steps 2 and 3.
 - `email-enabled`, `email-disabled`: ignored. These events carry an
   email address, which the farm never stores or logs.
 
@@ -1607,11 +1569,8 @@ ever being downloadable by another.
 
 #### `DELETE /api/sources/:id` — owner-only hard delete
 
-`Source-Key` header required. Deletes the R2 blob, the source's linked
-training segments and their blobs (§1.2.24), and the source row; clips,
-labels, quarantine rows, and attribution cascade. Blobs go first; a
-segment the segmenter commits in between is deleted with the row and
-its blob right after. `204` on
+`Source-Key` header required. Deletes the R2 blob, then the source row;
+clips, labels, quarantine rows, and attribution cascade. `204` on
 success (`404` if missing or the key doesn't match). This is the "keep
 forever, user-deletable" retention posture (master plan §4): deletable
 by whoever holds the key.
@@ -1732,20 +1691,19 @@ Request:
   "name_metrics": {
     "gainer": {"precision": 0.9, "recall": 0.84, "holdout_count": 31, "train_count": 412}
   },
-  "training_source_ids": ["<64-char hex>", "..."],
-  "training_segment_ids": ["<uuid>", "..."]
+  "training_source_ids": ["<64-char hex>", "..."]
 }
 ```
 
-`training_segment_ids` (optional, at most 100000 UUIDs) names the
-exported segments the model trained on (§1.2.24); `training_source_ids`
-stays for compatibility but the export no longer reveals source ids.
+`training_source_ids` (optional, at most 100000) names the exported
+sources the model trained on: the export rows' `source_id`.
+`training_segment_ids` is no longer read (training segments are removed,
+§1.2.24); a body that still carries it is accepted, and those ids record
+nothing.
 
 Behavior: inserts per §4 with `promoted_at = now()`, and in the same
-transaction records in `model_training_sources` (§4) the
-`training_source_ids` that still exist, plus the sources that the
-`training_segment_ids` are still linked to through `segment_sources`.
-De-linked, re-cut or deleted segments match nothing and are skipped. An existing
+transaction records `training_source_ids` in `model_training_sources`
+(§4), skipping ids whose source no longer exists. An existing
 `version` → `409 VERSION_EXISTS` (bump the version instead), with
 nothing recorded. A rollback publish (`TRAINING_DESIGN.md` §8) sends
 the re-promoted champion's own source list. Response `201`:
@@ -1754,32 +1712,36 @@ the re-promoted champion's own source list. Response `201`:
 
 #### `GET /api/labels/export?since=` — training pull (service key)
 
-Serves training segments (§1.2.24, POSE_FORMAT.md §12), never
-whole-session pose. `since` is the opaque cursor from the previous
-response's `next_cursor`; omit it for a full pull, which is how every
-dataset is built (§6). A malformed cursor, including one from the
-whole-session export, is `422 VALIDATION_ERROR`. Returns one entry per
-segment, segments of quarantined sources excluded, ordered by
-`segment_id` ascending, at most 10000 per page (§1.2.23):
+Serves whole recordings: one row per label row, that is, per
+(source, clip, label), each carrying its source's canonical `TKP1` blob
+(POSE_FORMAT.md). `since` is the opaque cursor from the previous
+response's `next_cursor` (the §6 `(row_cursor, clip_id, trick_name)`
+triple, encoded opaquely); omit it for a full pull, which is how every
+dataset is built (§6). A malformed cursor, including a `[segment_id]`
+cursor from the removed segment export (§1.2.24), is
+`422 VALIDATION_ERROR`. Quarantined sources and sources not yet ingested
+are excluded; rows are ordered by cursor ascending, at most 10000 per
+page (§1.2.23).
+
+The response, exactly (the contract turnip-ml builds against):
 
 ```json
 {
-  "segments": [
+  "rows": [
     {
-      "segment_id": "<uuid>",
-      "r2_key": "segments/<segment_id>.tks1.gz",
-      "blob_sha256": "<64-char hex of the stored .tks1.gz bytes>",
-      "frame_count": 30,
-      "window_start": 5,
-      "window_end": 25,
-      "split_bucket": 3,
+      "source_id": "<video_id>",
+      "r2_key": "poses/<video_id>.tkp1.gz",
+      "blob_sha256": "<64-char hex of the stored .tkp1.gz bytes>",
+      "clip_id": "<uuid>",
+      "start_frame": 120,
+      "end_frame": 175,
       "proposal_model_version": "trick-v1.3",
       "suggested_names": ["cork", "gainer"],
       "suggestions_withheld": false,
-      "labels": [
-        {"trick_name": "Cork", "canonical": "cork", "origin": "model", "taxonomy_version": 3},
-        {"trick_name": "gainer", "canonical": "gainer", "origin": "typed", "taxonomy_version": 3}
-      ]
+      "trick_name": "Cork",
+      "canonical": "cork",
+      "origin": "model",
+      "taxonomy_version": 3
     }
   ],
   "taxonomy": [
@@ -1790,53 +1752,61 @@ segment, segments of quarantined sources excluded, ordered by
     {"canonical": "gainer", "contributors": 3}
   ],
   "contributor_minimum": 5,
-  "next_cursor": "<opaque>"  // non-null when segments is non-empty; null only on an empty page
+  "next_cursor": "<opaque>"  // non-null when rows is non-empty; null only on an empty page
 }
 ```
 
-Fields:
+Row fields:
 
-- `segment_id`: random UUIDv4, unrelated to any source or clip. A re-cut
-  (after a clip or label edit) replaces it.
-- `r2_key`, `blob_sha256`: the `TKS1` blob (gzipped) and the SHA-256 of
-  its stored bytes. The training job fetches it from R2 itself and
-  verifies the digest.
-- `frame_count`: frames in the blob, at 10 Hz.
-- `window_start`, `window_end`: the labeled clip window inside the
-  segment, in segment frames, end exclusive (`0 <= window_start <
-  window_end <= frame_count`). Frames outside it are context.
-- `split_bucket`: 0–9, the same for every segment of one source. Split
-  train and holdout by bucket to keep a session on one side.
-- `proposal_model_version`, `suggested_names`, `suggestions_withheld`:
-  the clip's provenance (§1.2.18).
-- `labels`: the clip's label set, sorted by `trick_name`, each with its
-  `origin` and `taxonomy_version`. Never empty. `trick_name` is the
-  name as the user gave it. `canonical` is the farm's resolution of it,
+- `source_id` (string, 64-char lowercase hex): the source's video id.
+  Training splits train and holdout by source, and `POST /api/models`
+  and `POST /api/quarantine` take these ids back.
+- `r2_key` (string), `blob_sha256` (string, 64-char lowercase hex, never
+  null): the source's whole-recording canonical 10 Hz `TKP1` blob,
+  `poses/<video_id>.tkp1.gz`, and the SHA-256 of its stored (gzipped)
+  bytes. The training job fetches it from R2 itself and verifies the
+  digest. Every row of a source carries the same pair.
+- `clip_id` (string, UUID), `start_frame`, `end_frame` (integers): the
+  clip window in source frames of the canonical blob, end exclusive
+  (`0 <= start_frame < end_frame`). Frames outside every clip of a
+  source are unlabeled background.
+- `proposal_model_version` (string or null), `suggested_names` (string
+  array), `suggestions_withheld` (boolean): the clip's provenance
+  (§1.2.18), repeated on each of its label rows.
+- `trick_name` (string): the label as the user gave it, trimmed. A clip
+  with N labels is N rows sharing `clip_id`.
+- `canonical` (string or null): the farm's resolution of `trick_name`
   by its normalized form (§1.2.25): the greatest-version canonical of a
   matching raw, else a matching canonical itself, else `null` (a
   pre-§1.2.25 free-text label). Use `canonical` rather than looking
   `trick_name` up in `taxonomy`: an exact raw lookup misses a name
   accepted through a canonical with no raw row, or one with different
   spacing or case.
-- `trick_contributors` (whole-dataset, the same on every page, like
-  `taxonomy`): per canonical trick under the current taxonomy, sorted
-  by `canonical`, the number of distinct accounts whose exported,
-  non-quarantined segments carry it, counting only segments still
-  linked to an account (§1.2.27). A canonical absent from the list has
-  0 known contributors. A label with a `null` canonical appears as its
-  normalized name.
-- `contributor_minimum`: the hold-back threshold. turnip-ml trains a
-  trick only when its `contributors >= contributor_minimum` (§9 Q8).
+- `origin` (`"typed"`, `"vocabulary"` or `"model"`), `taxonomy_version`
+  (integer): the label's provenance (§1.2.18).
 
-`taxonomy` carries the whole `label_taxonomy` table (`raw → canonical`
-per version), so the training job canonicalizes without a second call.
-Shipping only "the versions present in `segments`" would silently unmap
-a raw string whose labels all sit at an old version (versions are
-append-only: a bump adds only new or changed mappings, which the
-`(raw, taxonomy_version DESC)` lookup assumes). The table is small; it
-ships on every page. The training job pins to the greatest version in
-it, so curation applies at the next run (maintainer decision 2026-10-14
-on #19).
+No row carries an account id or anything derived from one (§1.2.17).
+
+Whole-dataset fields, the same on every page:
+
+- `taxonomy`: the whole `label_taxonomy` table (`raw → canonical` per
+  version), so the training job can canonicalize without a second call.
+  Shipping only "the versions present in `rows`" would silently unmap a
+  raw string whose labels all sit at an old version (versions are
+  append-only: a bump adds only new or changed mappings, which the
+  `(raw, taxonomy_version DESC)` lookup assumes). The table is small;
+  it ships on every page. The training job pins to the greatest version
+  in it, so curation applies at the next run (maintainer decision
+  2026-10-14).
+- `trick_contributors`: per canonical trick under the current taxonomy,
+  sorted by `canonical`, the number of distinct accounts whose exported,
+  non-quarantined rows carry it, counted through each row's source
+  attribution (§1.2.27, §6). A canonical absent from the list has 0
+  known contributors. A label with a `null` canonical appears as its
+  normalized name.
+- `contributor_minimum` (integer): the hold-back threshold. turnip-ml
+  trains a trick only when its `contributors >= contributor_minimum`
+  (§9 Q8).
 
 #### `POST /api/quarantine` — pipeline reports regressing sources (service key)
 
@@ -1844,26 +1814,18 @@ Request:
 
 ```json
 {
-  "segment_ids": ["<uuid>", "..."],
   "source_ids": ["<64-char hex>", "..."],
   "reason": "fixture regression: challenger 0.61 < champion 0.66",
   "metrics": {"challenger": 0.61, "champion": 0.66}
 }
 ```
 
-`segment_ids` and `source_ids` are each optional, at most 10000 ids,
-and at least one of them must be non-empty; otherwise `422
-VALIDATION_ERROR`. The pipeline trains on segments and knows only their
-ids (§1.2.24; turnip-ml `TRAINING_DESIGN.md` §10 Q14), so it sends
-`segment_ids`: each resolves through `segment_sources` to the source it
-is still linked to, and that source is quarantined as below, so all of
-its segments leave the export. A segment that is de-linked (its account
-was deleted) or no longer exists (re-cut or deleted since the pull) has
-nothing left to quarantine; it is counted, not fatal. `source_ids` is
-still accepted, for the maintainer and for pipelines that predate
-segments.
+`source_ids` is required: a non-empty array of at most 10000 source ids
+(the export rows' `source_id`), else `422 VALIDATION_ERROR`.
+`segment_ids` is no longer read (training segments are removed,
+§1.2.24), so a body carrying only `segment_ids` is a `422`.
 
-Inserts one `data_quarantine` row per source (`reason`, `metrics` JSONB
+Inserts one `data_quarantine` row per id (`reason`, `metrics` JSONB
 object; the farm assigns `id` and `quarantined_at`). Ids that already
 have an open quarantine are skipped — the `data_quarantine_open_uniq`
 partial index makes resubmission a no-op, not an error
@@ -1873,22 +1835,8 @@ and this call, and quarantining a deleted source is meaningless.
 Response `200`:
 
 ```json
-{
-  "quarantined": ["<id>", "..."],
-  "already_open": ["<id>"],
-  "unknown": ["<id>"],
-  "segments": {"sources_quarantined": 3, "sources_already_open": 1, "unlinked": 2}
-}
+{"quarantined": ["<id>", "..."], "already_open": ["<id>"], "unknown": ["<id>"]}
 ```
-
-`quarantined`, `already_open` and `unknown` cover `source_ids` only.
-`segments` covers `segment_ids`, as counts only:
-`sources_quarantined` and `sources_already_open` count the distinct
-sources the segments resolved to, and `unlinked` counts the distinct
-segment ids that resolved to no source. The farm never returns the
-source ids behind segments: that would hand the pipeline the
-segment-to-source link the export withholds (§1.2.24). The maintainer
-reads the quarantined sources from `data_quarantine`.
 
 The id list is explicit, not a farm-side time window: the pipeline
 builds it from a `since=<watermark>` export pull taken after the
@@ -1910,10 +1858,8 @@ quarantine row exists for the source. Response `200`:
 
 The review queue marks a row purged (bad data): sets `resolved_at =
 now()`, `resolution = 'purged'`, then hard-deletes the source row —
-cascades to clips/labels, and the R2 blob and the source's linked
-training segments are deleted too (§1.2.3, §1.2.24), so poisoned data is
-gone entirely rather than merely excluded. A segment already de-linked
-(its account was deleted) can't be found and stays. R2 is
+cascades to clips/labels, and the R2 blob is deleted too (§1.2.3), so
+poisoned data is gone entirely rather than merely excluded. R2 is
 deleted before the row (the `DELETE /api/sources/:id` order); if
 either delete throws, the source row survives so the call can be
 retried. `404` when no open quarantine row exists. Response `204`.
@@ -1969,9 +1915,9 @@ checklist:
     deleted account leaves the backups within 30 days.
   - **Alerts:** anti-poisoning alerts name sources and counts, never
     accounts. The maintainer reads attribution from the database.
-  - **Exports:** nothing exported to training carries an account or
-    source identifier, and the export serves transformed segments,
-    never whole-session pose (§1.2.24, §6).
+  - **Exports:** nothing exported to training carries an account
+    identifier (§6); the export counts contributors per trick but sends
+    only the counts (§1.2.27).
   - **Reports:** deleted 30 days after they are filed, since the
     reporter is usually the target's contributor (§1.2.17).
 - Consent is recorded per account and disclosure version (`consents`),
@@ -1979,15 +1925,12 @@ checklist:
   (§7.3 `POST /api/consent`).
 - Account deletion (§7.3) removes the account, its sessions, its Apple
   token, its consents, its attribution, and the whole-session pose of
-  every contribution attributed to it or still keyed on the device.
-  "Also delete my contributions" (`?contributions=delete`) removes the
-  training segments cut from them too; otherwise those stay, de-linked.
-  Accounts idle for 24 months, and accounts whose Apple account was
-  deleted, are deleted the same way and keep their de-linked segments
-  (§1.2.17, §7.3 "Why those keep the segments"). The account's whole-session pose goes with it; its
-  training segments stay, de-linked (§1.2.24). Data deleted outright
-  leaves the next training dataset, because training rebuilds from a
-  full pull (§6).
+  every contribution attributed to it or still keyed on the device:
+  the pose blob, clips and labels. Nothing derived from them is kept
+  de-linked (training segments are removed, §1.2.24). Accounts idle
+  for 24 months, and accounts whose Apple account was deleted, are
+  deleted the same way (§1.2.17). Data deleted outright leaves the next
+  training dataset, because training rebuilds from a full pull (§6).
   Models already trained on it are treated as anonymous, pending the
   assessment in §9 Q8.
 - Contribution is switched off in the EU, EEA and UK: the app hides it
@@ -2001,10 +1944,9 @@ live. Items move out of this list into the sections above as they are
 built; until then, the sections above describe the code. The app side
 is in turnip-ios `CONTRIBUTION_DESIGN.md` §8.1.
 
-- **Kept training data.** *Built* (§1.2.24): segments, their
-  transform, and the link deleted with the account. Still to do: the
-  public commitment that the set is never published and never
-  re-identified.
+- **Kept training data.** *Withdrawn 2026-11* (§1.2.24): the farm
+  keeps no training data de-linked after an account is deleted, so
+  there is no kept set to make a commitment about.
 
 ## 9. Open questions
 

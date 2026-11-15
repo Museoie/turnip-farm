@@ -303,4 +303,37 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       expect(models).toBe(1);
     });
   });
+
+  test("the segment-removal migration deletes every segment row with its labels and links (§1.2.24)", async () => {
+    const file = await Bun.file(
+      new URL("./migrations/20261115120000_delete_training_segments.sql", import.meta.url),
+    ).text();
+    const up = file.slice(file.indexOf("-- migrate:up"), file.indexOf("-- migrate:down"));
+    await inRollback(sql, async (tx) => {
+      await insertClip(tx);
+      await tx`UPDATE sources SET segments_dirty_at = now() WHERE id = ${SOURCE_ID}`;
+      const [{ before }] = await tx`SELECT updated_at::text AS before FROM sources WHERE id = ${SOURCE_ID}`;
+      for (const [i, linked] of [[1, true], [2, false]] as const) {
+        const id = `123e4567-e89b-42d3-a456-42661417000${i}`;
+        await tx`INSERT INTO training_segments (id, r2_key, sha256, frame_count, window_start, window_end, split_bucket)
+          VALUES (${id}::uuid, ${`segments/${id}.tks1.gz`}, ${DIGEST}, 20, 5, 15, 0)`;
+        await tx`INSERT INTO training_segment_labels (segment_id, trick_name, origin, taxonomy_version)
+          VALUES (${id}::uuid, 'cork', 'typed', 1)`;
+        if (linked) await tx`INSERT INTO segment_sources (segment_id, source_id) VALUES (${id}::uuid, ${SOURCE_ID})`;
+      }
+      await tx.unsafe(up);
+      const [counts] = await tx`
+        SELECT (SELECT count(*) FROM training_segments)::int       AS segments,
+               (SELECT count(*) FROM training_segment_labels)::int AS labels,
+               (SELECT count(*) FROM segment_sources)::int         AS links,
+               (SELECT count(*) FROM sources)::int                 AS sources,
+               (SELECT count(*) FROM clips)::int                   AS clips`;
+      expect(counts).toEqual({ segments: 0, labels: 0, links: 0, sources: 1, clips: 1 });
+      // Nothing left for a segmenter to cut, and the export cursor unmoved.
+      const [after] = await tx`SELECT segments_dirty_at, updated_at::text AS updated FROM sources WHERE id = ${SOURCE_ID}`;
+      expect(after).toEqual({ segments_dirty_at: null, updated: before });
+      // Re-runnable: a second run deletes nothing more and doesn't fail.
+      await tx.unsafe(up);
+    });
+  });
 });

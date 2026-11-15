@@ -48,8 +48,7 @@ in place as dbmate migrations.
   ownership (§7.2). An ingest worker polls R2 and turns each staged
   upload into the canonical 10 Hz blob (§1.2.10).
 - **Training:** the vocabulary (`GET /api/taxonomy/current`), the
-  training export of re-targeted segments, never whole-session pose
-  (`GET /api/labels/export`, §1.2.24), the quarantine flow
+  label export (`GET /api/labels/export`), the quarantine flow
   (`POST /api/quarantine` with its release and purge calls), and the
   model registry (`POST /api/models`, `GET /api/models/current`).
 - **Moderation:** `POST /api/reports`, and maintainer scripts to resolve
@@ -107,7 +106,7 @@ src/
     validate.ts    request validation shared by the contribution endpoints
     purge.ts       the 30-day report purge (and legacy attribution purge) (§1.2.17)
   ingest/          staged upload → canonical TKP1 blob (POSE_FORMAT.md), and the
-                   segmenter that cuts TKS1 training segments from it (§1.2.24)
+                   one-off purge of the removed training segments' blobs (§1.2.24)
   r2/              R2 client, presigned URLs, key conventions
   pipeline.ts      service-key auth for the pipeline endpoints (§7.1)
   export.ts        GET /api/labels/export (§6)

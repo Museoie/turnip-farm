@@ -22,7 +22,8 @@
     "moderation:source-account": "bun scripts/source-account.ts",
     "moderation:block": "bun scripts/block-account.ts",
     "labels:candidates": "bun scripts/label-candidates.ts",
-    "labels:promote": "bun scripts/promote-label.ts"
+    "labels:promote": "bun scripts/promote-label.ts",
+    "segments:purge-blobs": "bun scripts/purge-segment-blobs.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",

@@ -11,7 +11,6 @@ import { transaction } from "../db";
 import { errorResponse } from "../errors";
 import type { R2Client } from "../r2/client";
 import { stagingKeyFor } from "../r2/keys";
-import { deleteSegmentBlobsAfterCommit } from "../contrib/sources";
 import { deleteAccountCandidates } from "../labels";
 import { AppleUnavailableError, type RevokeRefreshToken } from "./apple";
 import { authenticateClient } from "./sessions";
@@ -30,17 +29,9 @@ export interface AccountDeps {
 /** What steps 2–3 of account deletion need. */
 export type AccountDataDeps = Pick<AccountDeps, "sql" | "r2" | "candidateKey">;
 
-export interface AccountDeletionOptions {
-  /**
-   * Also delete the training segments cut from the account's sources
-   * (`?contributions=delete`). Otherwise they stay, de-linked (§1.2.24).
-   */
-  deleteSegments?: boolean;
-}
-
-// DELETE /api/account[?contributions=keep|delete]: session required; allowed
-// for blocked users (§1.2.16). 204 once deleted. A retry after success gets
-// 401 — the session is gone.
+// DELETE /api/account[?contributions=keep|delete]: both values delete the
+// same data. Session required; allowed for blocked users (§1.2.16). 204 once
+// deleted. A retry after success gets 401 — the session is gone.
 export async function handleDeleteAccount(req: Request, deps: AccountDeps): Promise<Response> {
   const auth = await authenticateClient(req, deps, { allowBlocked: true });
   if (auth instanceof Response) return auth;
@@ -50,7 +41,7 @@ export async function handleDeleteAccount(req: Request, deps: AccountDeps): Prom
       details: { field: "contributions" },
     });
   }
-  switch (await deleteAccount(deps, auth.userId, { deleteSegments: contributions === "delete" })) {
+  switch (await deleteAccount(deps, auth.userId)) {
     case "deleted":
       return new Response(null, { status: 204 });
     case "apple-unavailable":
@@ -68,11 +59,7 @@ export type AccountDeletion = "deleted" | "apple-unavailable" | "blob-delete-fai
 // was already invalid, and any other answer means the farm is misconfigured
 // and must not block the deletion. Apple unreachable → "apple-unavailable"
 // with nothing deleted, so the retry revokes before it deletes.
-export async function deleteAccount(
-  deps: AccountDeps,
-  userId: string,
-  opts: AccountDeletionOptions = {},
-): Promise<AccountDeletion> {
+export async function deleteAccount(deps: AccountDeps, userId: string): Promise<AccountDeletion> {
   const [user] = await deps.sql`SELECT apple_refresh_token FROM users WHERE id = ${userId}`;
   const sealed = user?.apple_refresh_token as Uint8Array<ArrayBuffer> | null | undefined;
   if (sealed != null) {
@@ -94,7 +81,7 @@ export async function deleteAccount(
   }
 
   try {
-    await deleteAccountData(deps, userId, opts);
+    await deleteAccountData(deps, userId);
   } catch {
     return "blob-delete-failed";
   }
@@ -107,55 +94,25 @@ export async function deleteAccount(
 // R2 blobs go before the rows, mirroring `DELETE /api/sources/:id`: if a
 // blob delete throws, the rows survive and the retry finishes the job.
 // Attribution is kept until deletion (§1.2.17), so this reaches every
-// source the account last wrote. Deleting a source cascades its
-// segment_sources links, so its training segments stay de-linked unless
-// opts.deleteSegments asks for them too (§1.2.24). Deleting the user row
-// cascades sessions, consents and reports (§3).
-export async function deleteAccountData(
-  { sql, r2, candidateKey }: AccountDataDeps,
-  userId: string,
-  opts: AccountDeletionOptions = {},
-): Promise<void> {
+// source the account last wrote. Deleting the user row cascades sessions,
+// consents and reports (§3).
+export async function deleteAccountData({ sql, r2, candidateKey }: AccountDataDeps, userId: string): Promise<void> {
   const attributed = await sql`
     SELECT s.id, s.r2_key
     FROM source_attribution a
     JOIN sources s ON s.id = a.source_id
     WHERE a.user_id = ${userId}`;
-  const segmentKeys = opts.deleteSegments
-    ? ((await sql`
-        SELECT t.r2_key
-        FROM source_attribution a
-        JOIN segment_sources ss ON ss.source_id = a.source_id
-        JOIN training_segments t ON t.id = ss.segment_id
-        WHERE a.user_id = ${userId}`) as { r2_key: string }[]).map((r) => r.r2_key)
-    : [];
   for (const row of attributed as { id: string; r2_key: string }[]) {
     await r2.deleteObject(row.r2_key);
     await r2.deleteObject(stagingKeyFor(row.id));
   }
-  for (const key of segmentKeys) await r2.deleteObject(key);
-  const lateKeys = await transaction(sql, async (tx) => {
-    let late: string[] = [];
-    if (opts.deleteSegments) {
-      const deleted = (await tx`
-        DELETE FROM training_segments
-        WHERE id IN (
-          SELECT ss.segment_id FROM segment_sources ss
-          JOIN source_attribution a ON a.source_id = ss.source_id
-          WHERE a.user_id = ${userId}
-        )
-        RETURNING r2_key`) as { r2_key: string }[];
-      late = deleted.map((d) => d.r2_key).filter((k) => !segmentKeys.includes(k));
-    }
+  await transaction(sql, async (tx) => {
     await tx`
       DELETE FROM sources
       WHERE id IN (SELECT source_id FROM source_attribution WHERE user_id = ${userId})`;
     await deleteAccountCandidates(tx, candidateKey, userId);
     await tx`DELETE FROM users WHERE id = ${userId}`;
-    return late;
   });
-  // Segments the segmenter committed between the key read and the delete.
-  await deleteSegmentBlobsAfterCommit(r2, lateKeys);
 }
 
 /** Accounts with no authenticated request or sign-in for this long are deleted (§1.2.17). */

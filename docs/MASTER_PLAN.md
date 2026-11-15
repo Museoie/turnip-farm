@@ -387,10 +387,10 @@ match.
 - `POST /api/models` — training pipeline publishes the champion
   (admin-scoped), with its `name_metrics` and the ids of the sources it
   trained on.
-- `GET /api/labels/export?since=` — training pipeline pull: training
-  segments (short, re-targeted windows around labeled clips, never
-  whole-session pose) with their labels and provenance. **Excludes
-  quarantined sources.** (`BACKEND_DESIGN.md` §1.2.24, §7.3.)
+- `GET /api/labels/export?since=` — training pipeline pull: one row per
+  labeled clip name, with its provenance and the source's whole-recording
+  pose blob reference. **Excludes quarantined sources.**
+  (`BACKEND_DESIGN.md` §7.3.)
 - `POST /api/reports` — report a bad label/clip.
 
 Dropped from the Rev 1 draft: `GET /api/labels/pending` — there is no
@@ -477,22 +477,21 @@ draft clips).
 - Training target: one segment per confirmed clip window; combo clips
   carry their N canonical names on the single window.
 
-**Data.** `GET /api/labels/export` → training segments
-(`BACKEND_DESIGN.md` §1.2.24, `POSE_FORMAT.md` §12): per labeled clip,
-a short `TKS1` window with context, re-targeted onto a standard body
-(13 joints in torso lengths, one head point, light noise), its clip
-window, a `split_bucket` for leakage-free splits, labels and provenance.
-Whole-session pose is never exported (privacy plan, 2026-11). Two
-consequences for training: background negatives come only from the
-context frames around each clip, and the on-device model must apply the
-same re-targeting (without the noise) to its input, since it no longer
-trains on raw `TKP1`. The export also counts distinct contributors
-per canonical trick, and training holds back a trick with fewer than
-the export's `contributor_minimum` (5), so a model never learns a trick
-from one or two people (`BACKEND_DESIGN.md` §1.2.27). Curation: normalize raw strings to canonical names
-via `label_taxonomy` (a combo string like
+**Data.** `GET /api/labels/export?since=` → (whole-recording pose blob,
+clip windows, labels with their canonical names and provenance). Whole
+recordings, not windows cut around each clip: the farm briefly exported
+short re-targeted segments instead (2026-11), which gave the model too
+little context for "no trick" windows, and with account deletion now
+deleting every contribution they protected nothing that outlives its
+contributor (`BACKEND_DESIGN.md` §1.2.24). The export also counts
+distinct contributors per canonical trick, and training holds back a
+trick with fewer than the export's `contributor_minimum` (5), so a model
+never learns a trick from one or two people (`BACKEND_DESIGN.md`
+§1.2.27). Curation: normalize raw strings to canonical names via
+`label_taxonomy` (a combo string like
 `"hook - scoot - gainer - cartfull (combo)"` splits into four canonical
-labels on one window); raw strings never discarded. The Profile's
+labels on one window); raw strings never discarded. Non-labeled regions
+of contributed sources serve as background negatives. The Profile's
 achievements will pull contributions toward popular tricks, so training
 samples classes in balance rather than in proportion to how often they
 are labeled.
@@ -544,11 +543,10 @@ model now knows gainers this well".
 fixture regression suite (the pose fixture clips on R2 plus
 trick-labeled fixtures — segment IoU + name accuracy vs. champion):
 - On regression: (1) fire a **Discord webhook alert** with the metrics
-  delta and the counts the farm reports (never account IDs: an alert
-  outlives an account's deletion); (2) **quarantine that day's ingested
-  data** by its segment ids, which the farm resolves to their sources
-  (`data_quarantine`, `BACKEND_DESIGN.md` §7.3), and skip them in
-  training; (3) skip promotion.
+  delta and affected source IDs (never account IDs: an alert outlives
+  an account's deletion); (2) **quarantine that day's ingested
+  sources** (`data_quarantine`) and skip them in training; (3) skip
+  promotion.
 - The engineer reviews the quarantine queue, cleans (purge bad
   sources, release good ones); the next night retries.
 - Attribution comes from the farm's `source_attribution`, which links
