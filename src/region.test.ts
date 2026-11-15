@@ -1,41 +1,94 @@
-// Country backstop (BACKEND_DESIGN.md §7.2, §8.1).
+// Country backstop (BACKEND_DESIGN.md §7.2, §8).
 
 import { describe, expect, test } from "bun:test";
-import { BLOCKED_CONTRIBUTION_COUNTRIES, refuseBlockedRegion } from "./region";
+import {
+  BLOCKED_STOREFRONT_COUNTRIES,
+  invalidStorefrontCountry,
+  readStorefrontCountry,
+  refuseBlockedStorefront,
+} from "./region";
 
-const req = (country?: string) =>
-  new Request("http://farm.test/api/sources", {
-    method: "POST",
-    headers: country === undefined ? {} : { "CF-IPCountry": country },
+const body = (country: unknown) => ({ storefront_country: country });
+
+async function errorOf(res: Response | null) {
+  expect(res).not.toBeNull();
+  const json = (await res!.json()) as { error: { code: string; details: unknown } };
+  return { status: res!.status, code: json.error.code, details: json.error.details };
+}
+
+describe("BLOCKED_STOREFRONT_COUNTRIES", () => {
+  test("is exactly the EU 27, ISL, LIE, NOR and GBR", () => {
+    expect([...BLOCKED_STOREFRONT_COUNTRIES].sort()).toEqual(
+      [
+        "AUT", "BEL", "BGR", "HRV", "CYP", "CZE", "DNK", "EST", "FIN", "FRA", "DEU", "GRC", "HUN", "IRL",
+        "ITA", "LVA", "LTU", "LUX", "MLT", "NLD", "POL", "PRT", "ROU", "SVK", "SVN", "ESP", "SWE",
+        "ISL", "LIE", "NOR",
+        "GBR",
+      ].sort(),
+    );
+    // Switzerland is in neither the EU nor the EEA.
+    for (const code of ["USA", "KOR", "CHE", "GB", "UK"]) {
+      expect(BLOCKED_STOREFRONT_COUNTRIES.has(code)).toBe(false);
+    }
+  });
+});
+
+describe("readStorefrontCountry", () => {
+  test("uppercases a three-letter ASCII code", () => {
+    expect(readStorefrontCountry(body("gbr"))).toBe("GBR");
+    expect(readStorefrontCountry(body("Kor"))).toBe("KOR");
+    expect(readStorefrontCountry(body("USA"))).toBe("USA");
   });
 
-describe("refuseBlockedRegion", () => {
-  test("covers exactly the EU 27, IS, LI, NO and GB", () => {
-    expect(BLOCKED_CONTRIBUTION_COUNTRIES.size).toBe(31);
-    for (const code of ["DE", "FR", "IE", "SE", "HR", "IS", "LI", "NO", "GB"]) {
-      expect(BLOCKED_CONTRIBUTION_COUNTRIES.has(code)).toBe(true);
+  test("null when absent, JSON null, or the body is not an object", () => {
+    expect(readStorefrontCountry({})).toBeNull();
+    expect(readStorefrontCountry(body(null))).toBeNull();
+    expect(readStorefrontCountry(null)).toBeNull();
+  });
+
+  test("invalid for anything but three ASCII letters", () => {
+    // "ı" and "ß" uppercase to ASCII letters, so the check has to run first.
+    for (const value of ["GB", "GBRR", "", "G1R", "123", " GBR", "GBR\n", "ıta", "gß", 826, true, ["GBR"], {}]) {
+      expect(readStorefrontCountry(body(value))).toBe("invalid");
     }
-    // Switzerland is in neither the EU nor the EEA; "UK" is not the ISO code.
-    for (const code of ["US", "CH", "UK", "XX", "T1"]) {
-      expect(BLOCKED_CONTRIBUTION_COUNTRIES.has(code)).toBe(false);
+  });
+});
+
+describe("refuseBlockedStorefront", () => {
+  test("403 REGION_UNAVAILABLE for a blocked storefront, any case", async () => {
+    for (const country of ["GBR", "deu", "Nor", "LIE"]) {
+      expect(await errorOf(refuseBlockedStorefront(body(country)))).toEqual({
+        status: 403,
+        code: "REGION_UNAVAILABLE",
+        details: {},
+      });
     }
   });
 
-  test("403 REGION_UNAVAILABLE for a blocked country, any case", async () => {
-    for (const country of ["GB", "de", " NO "]) {
-      const res = refuseBlockedRegion(req(country));
-      expect(res?.status).toBe(403);
-      const body = (await res!.json()) as { error: { code: string; details: unknown } };
-      expect(body.error.code).toBe("REGION_UNAVAILABLE");
-      expect(body.error.details).toEqual({});
+  test("null for other storefronts, an absent or null field, and malformed values", () => {
+    for (const country of ["USA", "KOR", "CHE", null, "GB", "GBRR", 826]) {
+      expect(refuseBlockedStorefront(body(country))).toBeNull();
+    }
+    expect(refuseBlockedStorefront({})).toBeNull();
+    expect(refuseBlockedStorefront(null)).toBeNull();
+  });
+});
+
+describe("invalidStorefrontCountry", () => {
+  test("422 VALIDATION_ERROR naming the field for a malformed value", async () => {
+    for (const country of ["GB", "GBRR", "G1R", 826, false]) {
+      expect(await errorOf(invalidStorefrontCountry(body(country)))).toEqual({
+        status: 422,
+        code: "VALIDATION_ERROR",
+        details: { field: "storefront_country" },
+      });
     }
   });
 
-  test("null for other countries, Cloudflare's unknown codes, and a missing header", () => {
-    expect(refuseBlockedRegion(req("US"))).toBeNull();
-    expect(refuseBlockedRegion(req("CH"))).toBeNull();
-    expect(refuseBlockedRegion(req("XX"))).toBeNull();
-    expect(refuseBlockedRegion(req())).toBeNull();
-    expect(refuseBlockedRegion(req(""))).toBeNull();
+  test("null for a well-formed code, blocked or not, and an absent or null field", () => {
+    for (const country of ["GBR", "usa", null]) {
+      expect(invalidStorefrontCountry(body(country))).toBeNull();
+    }
+    expect(invalidStorefrontCountry({})).toBeNull();
   });
 });

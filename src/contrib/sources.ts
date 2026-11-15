@@ -14,7 +14,7 @@ import { canonicalKeyFor, stagingKeyFor } from "../r2/keys";
 import type { R2Client } from "../r2/client";
 import type { RateLimits } from "../app";
 import { requireConsent } from "../consent";
-import { refuseBlockedRegion } from "../region";
+import { invalidStorefrontCountry, refuseBlockedStorefront } from "../region";
 import { isSourceKey, isVideoId, readJsonObject } from "./validate";
 
 export interface SourcesDeps {
@@ -52,7 +52,8 @@ function sourceKeyHash(req: Request): string | null {
 
 // POST /api/sources — register a source, get the blob upload URL (§7.3).
 export async function handleRegisterSource(req: Request, deps: SourcesDeps): Promise<Response> {
-  const region = refuseBlockedRegion(req);
+  const body = await readJsonObject(req);
+  const region = refuseBlockedStorefront(body);
   if (region) return region;
   const auth = await authed(req, deps);
   if (auth instanceof Response) return auth;
@@ -61,7 +62,6 @@ export async function handleRegisterSource(req: Request, deps: SourcesDeps): Pro
   const unconsented = await requireConsent(deps.sql, auth.userId, deps.currentDisclosureVersion);
   if (unconsented) return unconsented;
 
-  const body = await readJsonObject(req);
   const videoId = body?.video_id;
   const sourceKey = body?.source_key;
   const frameCount = body?.frame_count;
@@ -78,6 +78,8 @@ export async function handleRegisterSource(req: Request, deps: SourcesDeps): Pro
   if (keypointFormat !== "tkp1") {
     return errorResponse(422, "UNSUPPORTED_FORMAT", "keypoint_format must be tkp1");
   }
+  const storefront = invalidStorefrontCountry(body);
+  if (storefront) return storefront;
 
   const keyHash = sha256Hex(sourceKey);
   const r2Key = canonicalKeyFor(videoId);

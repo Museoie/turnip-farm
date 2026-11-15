@@ -145,7 +145,41 @@ describeDb("POST /api/sources", () => {
     });
   });
 
-  test("403 REGION_UNAVAILABLE from a blocked country, before anything is written", async () => {
+  test("403 REGION_UNAVAILABLE from a blocked storefront, before anything is written", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      // One token in the bucket: a refusal that spent it would turn the allowed request into a 429.
+      const d = deps(tx, fakeR2(), 1, 0);
+      const token = await seedUser(tx, "u1");
+      // Stale enough that authentication would move both forward.
+      await tx`UPDATE users SET last_active_at = now() - interval '2 hours' WHERE id = 'u1'`;
+      await tx`UPDATE sessions SET last_used_at = now() - interval '2 days' WHERE user_id = 'u1'`;
+      const activity = () => tx`
+        SELECT u.last_active_at::text AS active, s.last_used_at::text AS used, s.expires_at::text AS expires
+        FROM users u JOIN sessions s ON s.user_id = u.id WHERE u.id = 'u1'`;
+      const before = await activity();
+
+      for (const country of ["GBR", "gbr", "DEU", "NOR"]) {
+        const refused = await registerSource(tx, d, token, { storefront_country: country });
+        await expectError(refused, 403, "REGION_UNAVAILABLE");
+      }
+      // Without a session too: the check runs before authentication.
+      await expectError(
+        await registerSource(tx, d, "bad-token", { storefront_country: "FRA" }),
+        403,
+        "REGION_UNAVAILABLE",
+      );
+      const [count] = await tx`SELECT count(*)::int AS n FROM sources`;
+      expect(count.n).toBe(0);
+      const [attr] = await tx`SELECT count(*)::int AS n FROM source_attribution`;
+      expect(attr.n).toBe(0);
+      expect(await activity()).toEqual(before);
+
+      const allowed = await registerSource(tx, d, token, { storefront_country: "USA" });
+      expect(allowed.status).toBe(201);
+    });
+  });
+
+  test("an allowed, absent or null storefront passes; the connection's country is not read", async () => {
     await inRollback(sharedSql!, async (tx) => {
       const d = deps(tx, fakeR2());
       const token = await seedUser(tx, "u1");
@@ -156,21 +190,29 @@ describeDb("POST /api/sources", () => {
         sample_rate: 10,
         keypoint_format: "tkp1",
       };
-      const refused = await handleRegisterSource(
-        post("/api/sources", body, authed(token, { "cf-ipcountry": "GB" })),
+      const fromGb = await handleRegisterSource(
+        post("/api/sources", body, authed(token, { "CF-IPCountry": "GB" })),
         d,
       );
-      await expectError(refused, 403, "REGION_UNAVAILABLE");
+      expect(fromGb.status).toBe(201);
+      expect((await registerSource(tx, d, token, { storefront_country: "KOR" })).status).toBe(200);
+      expect((await registerSource(tx, d, token, { storefront_country: "usa" })).status).toBe(200);
+      expect((await registerSource(tx, d, token, { storefront_country: null })).status).toBe(200);
+    });
+  });
+
+  test("422 VALIDATION_ERROR for a storefront_country that is not three ASCII letters", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const d = deps(tx, fakeR2());
+      const token = await seedUser(tx, "u1");
+      for (const country of ["GB", "GBRR", "", "G1R", "123", " GBR", "GBR\n", "ıta", 826, true, ["GBR"], { code: "GBR" }]) {
+        const res = await registerSource(tx, d, token, { storefront_country: country });
+        expect(res.status).toBe(422);
+        const body = await bodyJson(res);
+        expect(body.error).toMatchObject({ code: "VALIDATION_ERROR", details: { field: "storefront_country" } });
+      }
       const [count] = await tx`SELECT count(*)::int AS n FROM sources`;
       expect(count.n).toBe(0);
-      const [attr] = await tx`SELECT count(*)::int AS n FROM source_attribution`;
-      expect(attr.n).toBe(0);
-
-      const allowed = await handleRegisterSource(
-        post("/api/sources", body, authed(token, { "cf-ipcountry": "US" })),
-        d,
-      );
-      expect(allowed.status).toBe(201);
     });
   });
 

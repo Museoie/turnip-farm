@@ -8,7 +8,7 @@ import type { RateLimits } from "./app";
 import { authenticateClient } from "./auth/sessions";
 import { readJsonObject } from "./contrib/validate";
 import { errorResponse } from "./errors";
-import { refuseBlockedRegion } from "./region";
+import { invalidStorefrontCountry, refuseBlockedStorefront } from "./region";
 
 /**
  * The first disclosure version that tells users attribution is kept until
@@ -28,9 +28,11 @@ export interface ConsentDeps {
   currentDisclosureVersion: number;
 }
 
-// POST /api/consent {"disclosure_version": int, "age_confirmed": true} → 204.
+// POST /api/consent {"disclosure_version": int, "age_confirmed": true,
+// "storefront_country"?: alpha-3} → 204.
 export async function handlePostConsent(req: Request, deps: ConsentDeps): Promise<Response> {
-  const region = refuseBlockedRegion(req);
+  const body = await readJsonObject(req);
+  const region = refuseBlockedStorefront(body);
   if (region) return region;
   const auth = await authenticateClient(req, deps);
   if (auth instanceof Response) return auth;
@@ -40,7 +42,6 @@ export async function handlePostConsent(req: Request, deps: ConsentDeps): Promis
     });
   }
 
-  const body = await readJsonObject(req);
   const version = body?.disclosure_version;
   if (!Number.isInteger(version) || (version as number) < 1 || (version as number) > MAX_DISCLOSURE_VERSION) {
     return errorResponse(422, "VALIDATION_ERROR", "disclosure_version must be a positive integer", {
@@ -52,6 +53,8 @@ export async function handlePostConsent(req: Request, deps: ConsentDeps): Promis
       details: { field: "age_confirmed" },
     });
   }
+  const storefront = invalidStorefrontCountry(body);
+  if (storefront) return storefront;
 
   await deps.sql`
     INSERT INTO consents (user_id, disclosure_version)

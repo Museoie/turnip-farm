@@ -143,13 +143,59 @@ describeDb("POST /api/consent", () => {
       expect((await errorOf(await handlePostConsent(post("/api/consent", body), d))).code).toBe("RATE_LIMITED");
     }));
 
-  test("403 REGION_UNAVAILABLE from a blocked country, before authentication", async () =>
+  test("403 REGION_UNAVAILABLE from a blocked storefront, before anything is written", async () =>
     inRollback(sharedSql, async (tx) => {
       await seedUser(tx);
+      // Stale enough that authentication would move it forward.
+      await tx`UPDATE users SET last_active_at = now() - interval '2 hours' WHERE id = ${USER_ID}`;
+      const activity = async () =>
+        (await tx`SELECT last_active_at::text AS t FROM users WHERE id = ${USER_ID}`)[0].t as string;
+      const before = await activity();
+      // One token: a refusal that spent it would turn the allowed request into a 429.
+      const d = deps(tx, 1);
+      for (const country of ["FRA", "gbr", "ISL", "LIE"]) {
+        const body = { disclosure_version: 3, age_confirmed: true, storefront_country: country };
+        expect(await errorOf(await handlePostConsent(post("/api/consent", body), d))).toEqual({
+          status: 403,
+          code: "REGION_UNAVAILABLE",
+          details: {},
+        });
+      }
+      const unauthenticated = { disclosure_version: 3, age_confirmed: true, storefront_country: "DEU" };
+      expect((await handlePostConsent(post("/api/consent", unauthenticated, {}), d)).status).toBe(403);
+      expect(await consents(tx)).toHaveLength(0);
+      expect(await activity()).toBe(before);
+
+      const allowed = { disclosure_version: 3, age_confirmed: true, storefront_country: "USA" };
+      expect((await handlePostConsent(post("/api/consent", allowed), d)).status).toBe(204);
+      expect(await consents(tx)).toHaveLength(1);
+    }));
+
+  test("an allowed, absent or null storefront passes; the connection's country is not read", async () =>
+    inRollback(sharedSql, async (tx) => {
+      await seedUser(tx);
+      const d = deps(tx);
       const body = { disclosure_version: 3, age_confirmed: true };
-      const res = await handlePostConsent(post("/api/consent", body, { "cf-ipcountry": "FR" }), deps(tx));
-      expect((await errorOf(res)).code).toBe("REGION_UNAVAILABLE");
-      expect(res.status).toBe(403);
+      const headers = { authorization: `Bearer ${TOKEN}`, "CF-IPCountry": "GB" };
+      expect((await handlePostConsent(post("/api/consent", body, headers), d)).status).toBe(204);
+      for (const country of ["KOR", "kor", null]) {
+        const res = await handlePostConsent(post("/api/consent", { ...body, storefront_country: country }), d);
+        expect(res.status).toBe(204);
+      }
+    }));
+
+  test("422 VALIDATION_ERROR for a storefront_country that is not three ASCII letters", async () =>
+    inRollback(sharedSql, async (tx) => {
+      await seedUser(tx);
+      const d = deps(tx);
+      for (const country of ["GB", "GBRR", "", "G8R", " GBR", "ıta", 826, false, ["GBR"]]) {
+        const body = { disclosure_version: 3, age_confirmed: true, storefront_country: country };
+        expect(await errorOf(await handlePostConsent(post("/api/consent", body), d))).toEqual({
+          status: 422,
+          code: "VALIDATION_ERROR",
+          details: { field: "storefront_country" },
+        });
+      }
       expect(await consents(tx)).toHaveLength(0);
     }));
 });
