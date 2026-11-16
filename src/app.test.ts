@@ -88,7 +88,18 @@ describe("createHandler routing", () => {
       ["POST", "/api/clips/abc/labels"],
       ["POST", "/api/reports"],
     ] as const) {
-      const res = await handle(request(method, path));
+      // The storefront check runs before authentication (BACKEND_DESIGN.md
+      // §7.2), so the two routes it guards get an allowed storefront.
+      const guarded = path === "/api/consent" || path === "/api/sources";
+      const res = await handle(
+        guarded
+          ? new Request(`http://farm.test${path}`, {
+              method,
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ storefront_country: "USA" }),
+            })
+          : request(method, path),
+      );
       expect(res.status).toBe(401);
       expect(((await res.json()) as { error: { code: string } }).error.code).toBe("UNAUTHENTICATED");
     }

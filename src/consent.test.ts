@@ -78,6 +78,7 @@ const registration = {
   frame_count: 600,
   sample_rate: 10,
   keypoint_format: "tkp1",
+  storefront_country: "USA",
 };
 
 describeDb("POST /api/consent", () => {
@@ -85,14 +86,14 @@ describeDb("POST /api/consent", () => {
     inRollback(sharedSql, async (tx) => {
       await seedUser(tx);
       const d = deps(tx);
-      const res = await handlePostConsent(post("/api/consent", { disclosure_version: 3, age_confirmed: true }), d);
+      const res = await handlePostConsent(post("/api/consent", { disclosure_version: 3, age_confirmed: true, storefront_country: "USA" }), d);
       expect(res.status).toBe(204);
       expect(await res.text()).toBe("");
       const [first] = await consents(tx);
       expect(first.disclosure_version).toBe(3);
 
       await tx`UPDATE consents SET agreed_at = '2026-11-01T00:00:00Z' WHERE user_id = ${USER_ID}`;
-      const again = await handlePostConsent(post("/api/consent", { disclosure_version: 3, age_confirmed: true }), d);
+      const again = await handlePostConsent(post("/api/consent", { disclosure_version: 3, age_confirmed: true, storefront_country: "USA" }), d);
       expect(again.status).toBe(204);
       const rows = await consents(tx);
       expect(rows).toHaveLength(1);
@@ -104,10 +105,10 @@ describeDb("POST /api/consent", () => {
       await seedUser(tx);
       const d = deps(tx);
       for (const body of [
-        { disclosure_version: 3 },
-        { disclosure_version: 3, age_confirmed: false },
-        { disclosure_version: 3, age_confirmed: "true" },
-        { disclosure_version: 3, age_confirmed: 1 },
+        { disclosure_version: 3, storefront_country: "USA" },
+        { disclosure_version: 3, age_confirmed: false, storefront_country: "USA" },
+        { disclosure_version: 3, age_confirmed: "true", storefront_country: "USA" },
+        { disclosure_version: 3, age_confirmed: 1, storefront_country: "USA" },
       ]) {
         expect(await errorOf(await handlePostConsent(post("/api/consent", body), d))).toEqual({
           status: 422,
@@ -123,7 +124,7 @@ describeDb("POST /api/consent", () => {
       await seedUser(tx);
       const d = deps(tx);
       for (const version of [undefined, 0, -1, 2.5, "3", 2_147_483_648]) {
-        const res = await handlePostConsent(post("/api/consent", { disclosure_version: version, age_confirmed: true }), d);
+        const res = await handlePostConsent(post("/api/consent", { disclosure_version: version, age_confirmed: true, storefront_country: "USA" }), d);
         expect(await errorOf(res)).toEqual({
           status: 422,
           code: "VALIDATION_ERROR",
@@ -136,7 +137,7 @@ describeDb("POST /api/consent", () => {
   test("401 without a session; 429 when the per-user bucket is empty", async () =>
     inRollback(sharedSql, async (tx) => {
       await seedUser(tx);
-      const body = { disclosure_version: 3, age_confirmed: true };
+      const body = { disclosure_version: 3, age_confirmed: true, storefront_country: "USA" };
       expect((await handlePostConsent(post("/api/consent", body, {}), deps(tx))).status).toBe(401);
       const d = deps(tx, 1);
       expect((await handlePostConsent(post("/api/consent", body), d)).status).toBe(204);
@@ -158,7 +159,7 @@ describeDb("POST /api/consent", () => {
         expect(await errorOf(await handlePostConsent(post("/api/consent", body), d))).toEqual({
           status: 403,
           code: "REGION_UNAVAILABLE",
-          details: {},
+          details: { reason: "storefront_blocked" },
         });
       }
       const unauthenticated = { disclosure_version: 3, age_confirmed: true, storefront_country: "DEU" };
@@ -171,14 +172,38 @@ describeDb("POST /api/consent", () => {
       expect(await consents(tx)).toHaveLength(1);
     }));
 
-  test("an allowed, absent or null storefront passes; the connection's country is not read", async () =>
+  test("403 REGION_UNAVAILABLE for an absent or null storefront, before anything is written", async () =>
+    inRollback(sharedSql, async (tx) => {
+      await seedUser(tx);
+      await tx`UPDATE users SET last_active_at = now() - interval '2 hours' WHERE id = ${USER_ID}`;
+      const activity = async () =>
+        (await tx`SELECT last_active_at::text AS t FROM users WHERE id = ${USER_ID}`)[0].t as string;
+      const before = await activity();
+      // One token: a refusal that spent it would turn the allowed request into a 429.
+      const d = deps(tx, 1);
+      const missing = { status: 403, code: "REGION_UNAVAILABLE", details: { reason: "storefront_missing" } };
+      for (const body of [
+        { disclosure_version: 3, age_confirmed: true },
+        { disclosure_version: 3, age_confirmed: true, storefront_country: null },
+      ]) {
+        expect(await errorOf(await handlePostConsent(post("/api/consent", body), d))).toEqual(missing);
+        // Without a session too: the check runs before authentication.
+        expect(await errorOf(await handlePostConsent(post("/api/consent", body, {}), d))).toEqual(missing);
+      }
+      expect(await consents(tx)).toHaveLength(0);
+      expect(await activity()).toBe(before);
+      const allowed = { disclosure_version: 3, age_confirmed: true, storefront_country: "USA" };
+      expect((await handlePostConsent(post("/api/consent", allowed), d)).status).toBe(204);
+    }));
+
+  test("an allowed storefront passes, any case; the connection's country is not read", async () =>
     inRollback(sharedSql, async (tx) => {
       await seedUser(tx);
       const d = deps(tx);
-      const body = { disclosure_version: 3, age_confirmed: true };
+      const body = { disclosure_version: 3, age_confirmed: true, storefront_country: "USA" };
       const headers = { authorization: `Bearer ${TOKEN}`, "CF-IPCountry": "GB" };
       expect((await handlePostConsent(post("/api/consent", body, headers), d)).status).toBe(204);
-      for (const country of ["KOR", "kor", null]) {
+      for (const country of ["KOR", "kor", "Che"]) {
         const res = await handlePostConsent(post("/api/consent", { ...body, storefront_country: country }), d);
         expect(res.status).toBe(204);
       }
@@ -216,7 +241,7 @@ describeDb("the consent gate on contribution writes", () => {
       );
       expect(await tx`SELECT id FROM sources`).toHaveLength(0);
 
-      await handlePostConsent(post("/api/consent", { disclosure_version: 3, age_confirmed: true }), d);
+      await handlePostConsent(post("/api/consent", { disclosure_version: 3, age_confirmed: true, storefront_country: "USA" }), d);
       expect((await handleRegisterSource(post("/api/sources", registration), d)).status).toBe(201);
     }));
 

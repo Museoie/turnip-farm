@@ -14,7 +14,7 @@ import { canonicalKeyFor, stagingKeyFor } from "../r2/keys";
 import type { R2Client } from "../r2/client";
 import type { RateLimits } from "../app";
 import { requireConsent } from "../consent";
-import { invalidStorefrontCountry, refuseBlockedStorefront } from "../region";
+import { invalidStorefrontCountry, refuseStorefront } from "../region";
 import { isSourceKey, isVideoId, readJsonObject } from "./validate";
 
 export interface SourcesDeps {
@@ -53,7 +53,7 @@ function sourceKeyHash(req: Request): string | null {
 // POST /api/sources — register a source, get the blob upload URL (§7.3).
 export async function handleRegisterSource(req: Request, deps: SourcesDeps): Promise<Response> {
   const body = await readJsonObject(req);
-  const region = refuseBlockedStorefront(body);
+  const region = refuseStorefront(body);
   if (region) return region;
   const auth = await authed(req, deps);
   if (auth instanceof Response) return auth;

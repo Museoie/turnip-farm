@@ -8,7 +8,7 @@ import type { RateLimits } from "./app";
 import { authenticateClient } from "./auth/sessions";
 import { readJsonObject } from "./contrib/validate";
 import { errorResponse } from "./errors";
-import { invalidStorefrontCountry, refuseBlockedStorefront } from "./region";
+import { invalidStorefrontCountry, refuseStorefront } from "./region";
 
 /**
  * The first disclosure version that tells users attribution is kept until
@@ -29,10 +29,10 @@ export interface ConsentDeps {
 }
 
 // POST /api/consent {"disclosure_version": int, "age_confirmed": true,
-// "storefront_country"?: alpha-3} → 204.
+// "storefront_country": alpha-3} → 204.
 export async function handlePostConsent(req: Request, deps: ConsentDeps): Promise<Response> {
   const body = await readJsonObject(req);
-  const region = refuseBlockedStorefront(body);
+  const region = refuseStorefront(body);
   if (region) return region;
   const auth = await authenticateClient(req, deps);
   if (auth instanceof Response) return auth;

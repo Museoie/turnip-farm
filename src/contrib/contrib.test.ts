@@ -125,6 +125,7 @@ async function registerSource(
         frame_count: 600,
         sample_rate: 10,
         keypoint_format: "tkp1",
+        storefront_country: "USA",
         ...overrides,
       },
       authed(token),
@@ -168,6 +169,8 @@ describeDb("POST /api/sources", () => {
         403,
         "REGION_UNAVAILABLE",
       );
+      const blocked = await bodyJson(await registerSource(tx, d, token, { storefront_country: "SWE" }));
+      expect(blocked.error.details).toEqual({ reason: "storefront_blocked" });
       const [count] = await tx`SELECT count(*)::int AS n FROM sources`;
       expect(count.n).toBe(0);
       const [attr] = await tx`SELECT count(*)::int AS n FROM source_attribution`;
@@ -179,10 +182,17 @@ describeDb("POST /api/sources", () => {
     });
   });
 
-  test("an allowed, absent or null storefront passes; the connection's country is not read", async () => {
+  test("403 REGION_UNAVAILABLE for an absent or null storefront, before anything is written", async () => {
     await inRollback(sharedSql!, async (tx) => {
-      const d = deps(tx, fakeR2());
+      // One token in the bucket: a refusal that spent it would turn the allowed request into a 429.
+      const d = deps(tx, fakeR2(), 1, 0);
       const token = await seedUser(tx, "u1");
+      await tx`UPDATE users SET last_active_at = now() - interval '2 hours' WHERE id = 'u1'`;
+      await tx`UPDATE sessions SET last_used_at = now() - interval '2 days' WHERE user_id = 'u1'`;
+      const activity = () => tx`
+        SELECT u.last_active_at::text AS active, s.last_used_at::text AS used, s.expires_at::text AS expires
+        FROM users u JOIN sessions s ON s.user_id = u.id WHERE u.id = 'u1'`;
+      const before = await activity();
       const body = {
         video_id: VIDEO_ID,
         source_key: SOURCE_KEY,
@@ -190,14 +200,49 @@ describeDb("POST /api/sources", () => {
         sample_rate: 10,
         keypoint_format: "tkp1",
       };
+      for (const [b, auth] of [
+        [body, authed(token)],
+        [{ ...body, storefront_country: null }, authed(token)],
+        // Without a session too: the check runs before authentication.
+        [body, {}],
+      ] as const) {
+        const res = await handleRegisterSource(post("/api/sources", b, auth), d);
+        expect(res.status).toBe(403);
+        const json = await bodyJson(res);
+        expect(json.error).toMatchObject({ code: "REGION_UNAVAILABLE", details: { reason: "storefront_missing" } });
+      }
+      const [count] = await tx`SELECT count(*)::int AS n FROM sources`;
+      expect(count.n).toBe(0);
+      const [attr] = await tx`SELECT count(*)::int AS n FROM source_attribution`;
+      expect(attr.n).toBe(0);
+      expect(await activity()).toEqual(before);
+
+      expect((await registerSource(tx, d, token, { storefront_country: "USA" })).status).toBe(201);
+    });
+  });
+
+  test("an allowed storefront passes, any case; the connection's country is not read", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const d = deps(tx, fakeR2());
+      const token = await seedUser(tx, "u1");
       const fromGb = await handleRegisterSource(
-        post("/api/sources", body, authed(token, { "CF-IPCountry": "GB" })),
+        post(
+          "/api/sources",
+          {
+            video_id: VIDEO_ID,
+            source_key: SOURCE_KEY,
+            frame_count: 600,
+            sample_rate: 10,
+            keypoint_format: "tkp1",
+            storefront_country: "USA",
+          },
+          authed(token, { "CF-IPCountry": "GB" }),
+        ),
         d,
       );
       expect(fromGb.status).toBe(201);
       expect((await registerSource(tx, d, token, { storefront_country: "KOR" })).status).toBe(200);
       expect((await registerSource(tx, d, token, { storefront_country: "usa" })).status).toBe(200);
-      expect((await registerSource(tx, d, token, { storefront_country: null })).status).toBe(200);
     });
   });
 

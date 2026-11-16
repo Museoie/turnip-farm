@@ -5,7 +5,7 @@ import {
   BLOCKED_STOREFRONT_COUNTRIES,
   invalidStorefrontCountry,
   readStorefrontCountry,
-  refuseBlockedStorefront,
+  refuseStorefront,
 } from "./region";
 
 const body = (country: unknown) => ({ storefront_country: country });
@@ -54,23 +54,31 @@ describe("readStorefrontCountry", () => {
   });
 });
 
-describe("refuseBlockedStorefront", () => {
-  test("403 REGION_UNAVAILABLE for a blocked storefront, any case", async () => {
+describe("refuseStorefront", () => {
+  test("403 REGION_UNAVAILABLE, reason storefront_blocked, for a blocked storefront, any case", async () => {
     for (const country of ["GBR", "deu", "Nor", "LIE"]) {
-      expect(await errorOf(refuseBlockedStorefront(body(country)))).toEqual({
+      expect(await errorOf(refuseStorefront(body(country)))).toEqual({
         status: 403,
         code: "REGION_UNAVAILABLE",
-        details: {},
+        details: { reason: "storefront_blocked" },
       });
     }
   });
 
-  test("null for other storefronts, an absent or null field, and malformed values", () => {
-    for (const country of ["USA", "KOR", "CHE", null, "GB", "GBRR", 826]) {
-      expect(refuseBlockedStorefront(body(country))).toBeNull();
+  test("403 REGION_UNAVAILABLE, reason storefront_missing, when absent, null, or the body is not an object", async () => {
+    for (const b of [{}, body(null), null]) {
+      expect(await errorOf(refuseStorefront(b))).toEqual({
+        status: 403,
+        code: "REGION_UNAVAILABLE",
+        details: { reason: "storefront_missing" },
+      });
     }
-    expect(refuseBlockedStorefront({})).toBeNull();
-    expect(refuseBlockedStorefront(null)).toBeNull();
+  });
+
+  test("null for other storefronts, and for malformed values (answered as 422 later)", () => {
+    for (const country of ["USA", "KOR", "CHE", "usa", "GB", "GBRR", 826, false]) {
+      expect(refuseStorefront(body(country))).toBeNull();
+    }
   });
 });
 

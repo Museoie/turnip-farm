@@ -1078,9 +1078,10 @@ for `users.apple_refresh_token`).
   with the disclosure's version (§7.3). On `403 CONSENT_REQUIRED` from
   a contribution write, the app shows the sheet again. Both
   `POST /api/consent` and `POST /api/sources` carry the App Store
-  storefront's country as `storefront_country` (§7.2 "Country
-  backstop"). On `403 REGION_UNAVAILABLE`, it stops offering
-  contribution.
+  storefront's country as `storefront_country`, which the farm
+  requires (§7.2 "Country backstop"). With no storefront (no App Store
+  account, the simulator) the app hides contribution. On
+  `403 REGION_UNAVAILABLE`, it stops offering contribution.
 - Disclosure (version 3), shown at contribution consent and again at
   account deletion: contributions stay linked to the account until the
   account is deleted, by the user or after 24 months without use.
@@ -1105,8 +1106,9 @@ for `users.apple_refresh_token`).
   ```
 
   Codes: `UNAUTHENTICATED` (401), `ACCOUNT_BLOCKED` (403),
-  `REGION_UNAVAILABLE` (403: contribution is switched off in the
-  storefront country the request names, see "Country backstop" below),
+  `REGION_UNAVAILABLE` (403: the request names no storefront country,
+  `details.reason = "storefront_missing"`, or one where contribution is
+  switched off, `"storefront_blocked"`; see "Country backstop" below),
   `CONSENT_REQUIRED` (403: the account has not agreed to the current contribution
   disclosure, §7.3 `POST /api/consent`), `NOT_FOUND`
   (404), `NO_MODEL` (404), `VALIDATION_ERROR` (422), `UNKNOWN_LABEL` (422:
@@ -1141,10 +1143,14 @@ for `users.apple_refresh_token`).
 - **Country backstop:** contribution is switched off in the EU 27,
   Iceland, Liechtenstein, Norway and the UK (§8). The app hides it on
   those App Store storefronts, and the contribution entry points
-  (`POST /api/consent` and `POST /api/sources`) take an optional
+  (`POST /api/consent` and `POST /api/sources`) require a
   `storefront_country` body field: the storefront's ISO 3166-1 alpha-3
   code, as StoreKit's `Storefront.countryCode` gives it. The farm
-  uppercases it and refuses the request with `403 REGION_UNAVAILABLE`
+  refuses the request with `403 REGION_UNAVAILABLE` and
+  `details.reason = "storefront_missing"` when the field is absent or
+  JSON `null` (or the body is not a JSON object). Otherwise it
+  uppercases the code and refuses the request with
+  `403 REGION_UNAVAILABLE` and `details.reason = "storefront_blocked"`
   when it is one of `AUT BEL BGR HRV CYP CZE DNK EST FIN FRA DEU GRC HUN
   IRL ITA LVA LTU LUX MLT NLD POL PRT ROU SVK SVN ESP SWE`, `ISL LIE
   NOR` or `GBR` (`src/region.ts`; the same list as the app's). The
@@ -1157,11 +1163,12 @@ for `users.apple_refresh_token`).
     letters is `422 VALIDATION_ERROR` with `details.field =
     "storefront_country"`, checked with the endpoint's other fields
     after the session, rate-limit and consent checks.
-  - **Absent:** a missing field, or JSON `null` (like the other
-    optional fields), passes. The value is client-supplied, so this is
-    a backstop behind the app's own check, not an enforcement: a client
-    that sends a false country could equally omit it. App builds that
-    predate the field send nothing and are allowed.
+  - **Required, but client-supplied:** a device with no storefront (no
+    App Store account, the simulator) can't contribute, and neither can
+    an app build that predates the field (turnip-ios #318 added it).
+    The value is still whatever the client says, so this remains a
+    backstop behind the app's own check, not an enforcement: a client
+    that sends a false country gets past it, and the farm can't tell.
   - **Not kept:** the value is read only to decide the refusal; it is
     never stored or logged (§8).
 - **Rate limiting:** per-user token bucket on POST endpoints
@@ -1284,21 +1291,23 @@ Session required. Request:
 {"disclosure_version": 3, "age_confirmed": true, "storefront_country": "USA"}
 ```
 
-`storefront_country` is optional: the App Store storefront's ISO
+`storefront_country` is required: the App Store storefront's ISO
 3166-1 alpha-3 code (§7.2 "Country backstop").
 
 Refused first with `403 REGION_UNAVAILABLE` when `storefront_country`
-names a storefront where contribution is off (§7.2 "Country
-backstop"). Then the usual session checks and the per-user POST bucket
-(§7.2).
+is absent or `null` (`details.reason = "storefront_missing"`) or names
+a storefront where contribution is off (`"storefront_blocked"`; §7.2
+"Country backstop"). Then the usual session checks and the per-user
+POST bucket (§7.2).
 
 Validation: `disclosure_version` is an integer from 1 to 2147483647;
 otherwise `422 VALIDATION_ERROR` with `details.field =
 "disclosure_version"`. `age_confirmed` must be the JSON value `true`
 (the user confirmed they are 16 or older); missing, `false` or any other
 value is `422 VALIDATION_ERROR` with `details.field = "age_confirmed"`.
-`storefront_country`, when present and not `null`, is three ASCII
-letters in any case; otherwise `422 VALIDATION_ERROR` with
+`storefront_country` is three ASCII letters in any case; any other
+value (a string of another shape, a number, a boolean, an array or an
+object) is `422 VALIDATION_ERROR` with
 `details.field = "storefront_country"`.
 
 Behavior: records the agreement in `consents`. Agreeing again to a
@@ -1381,12 +1390,13 @@ Request:
 }
 ```
 
-`storefront_country` is optional: the App Store storefront's ISO
+`storefront_country` is required: the App Store storefront's ISO
 3166-1 alpha-3 code (§7.2 "Country backstop").
 
 Refused first with `403 REGION_UNAVAILABLE` when `storefront_country`
-names a storefront where contribution is off (§7.2 "Country
-backstop"), then, after the session and rate-limit checks, with
+is absent or `null` (`details.reason = "storefront_missing"`) or names
+a storefront where contribution is off (`"storefront_blocked"`; §7.2
+"Country backstop"), then, after the session and rate-limit checks, with
 `403 CONSENT_REQUIRED` unless the account agreed to the current
 disclosure (§7.3 `POST /api/consent`).
 
@@ -1394,8 +1404,8 @@ Validation: `video_id` matches `^[0-9a-f]{64}$`; `source_key` is 43
 base64url characters (§7.2); `frame_count > 0`; `sample_rate` in
 `1..30` Hz (the normative client analysis range, POSE_FORMAT.md §6);
 `keypoint_format` must be `tkp1` (anything else →
-`422 UNSUPPORTED_FORMAT`); `storefront_country`, when present and not
-`null`, is three ASCII letters in any case (otherwise
+`422 UNSUPPORTED_FORMAT`); `storefront_country` is three ASCII
+letters in any case (any other non-null value →
 `422 VALIDATION_ERROR` with `details.field = "storefront_country"`).
 
 Behavior: upserts the source row per §4 (`r2_key =
@@ -2008,9 +2018,10 @@ checklist:
   Models already trained on it are treated as anonymous, pending the
   assessment in §9 Q8.
 - Contribution is switched off in the EU, EEA and UK: the app hides it
-  on those App Store storefronts, and the farm refuses a contribution
-  request that names one of those storefronts as a backstop (§7.2
-  "Country backstop").
+  on those App Store storefronts, and the farm, as a backstop, refuses
+  a contribution request that names one of those storefronts or names
+  none (§7.2 "Country backstop"). The country is client-supplied, so
+  the backstop can't catch a client that lies about it.
 
 ### 8.1 Planned changes (privacy plan, 2026-11)
 

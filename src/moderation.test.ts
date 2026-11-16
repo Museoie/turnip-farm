@@ -140,6 +140,7 @@ describeDb("blocking", () => {
           frame_count: 100,
           sample_rate: 10,
           keypoint_format: "tkp1",
+          storefront_country: "USA",
         }),
       }),
       { sql: tx, r2: fakeR2, limits, currentDisclosureVersion: 3 },
