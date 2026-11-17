@@ -46,6 +46,7 @@ function deps(tx: SQL, userCapacity = 1000) {
       user: new TokenBucket(userCapacity, 1),
       ip: new TokenBucket(1000, 60),
       publicIp: new TokenBucket(1000, 60),
+      adminIp: new TokenBucket(1000, 60),
     },
   };
 }

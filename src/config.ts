@@ -26,6 +26,10 @@ export interface Config {
   };
   // Service key for the pipeline endpoints (BACKEND_DESIGN.md §7.1).
   pipelineKey: string;
+  // The maintainer's sign-in through the auth service, for the /admin page
+  // and its endpoints (BACKEND_DESIGN.md §7.1 "Admin"). Null when the AUTH_*
+  // variables are unset: the admin endpoints are off.
+  adminAuth: AdminAuthConfig | null;
   // Proxies, besides loopback, whose X-Forwarded-For per-IP rate limits
   // read through (BACKEND_DESIGN.md §7.2). Empty when unset.
   trustedProxies: ProxyRange[];
@@ -50,6 +54,23 @@ export const REQUIRED_ENV = [
 ] as const;
 
 export const DEFAULT_PORT = 3000;
+
+export interface AdminAuthConfig {
+  issuer: string;
+  backChannelUrl?: string;
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  audience?: string;
+}
+
+// Set together or not at all; AUTH_BACKCHANNEL_URL and AUTH_AUDIENCE are optional.
+export const ADMIN_AUTH_ENV = ["AUTH_ISSUER", "AUTH_CLIENT_ID", "AUTH_CLIENT_SECRET", "AUTH_REDIRECT_URI"] as const;
+
+// The farm's own callback route; AUTH_REDIRECT_URI must point at it.
+export const ADMIN_CALLBACK_PATH = "/auth/callback";
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 // Default CURRENT_DISCLOSURE_VERSION: the app's disclosure that says
 // attribution is kept until deletion (BACKEND_DESIGN.md §1.2.17).
@@ -104,6 +125,8 @@ export function loadConfig(env: Env): Config {
     }
   }
 
+  const adminAuth = parseAdminAuth(env, problems);
+
   const currentDisclosureVersion = parseDisclosureVersion(env.CURRENT_DISCLOSURE_VERSION);
   if (currentDisclosureVersion === null) {
     problems.push(
@@ -138,9 +161,66 @@ export function loadConfig(env: Env): Config {
       refreshTokenKey,
     },
     pipelineKey: required.TURNIP_PIPELINE_KEY,
+    adminAuth,
     trustedProxies,
     currentDisclosureVersion,
   };
+}
+
+// An https URL, or http on a loopback host (local development), with no
+// query or fragment.
+function isWebUrl(raw: string): URL | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  const ok = url.protocol === "https:" || (url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname));
+  return ok && url.search === "" && url.hash === "" ? url : null;
+}
+
+function parseAdminAuth(env: Env, problems: string[]): AdminAuthConfig | null {
+  const value = (name: string) => {
+    const v = env[name]?.trim();
+    return v === undefined || v === "" ? undefined : v;
+  };
+  const set = ADMIN_AUTH_ENV.filter((name) => value(name) !== undefined);
+  const optional = ["AUTH_BACKCHANNEL_URL", "AUTH_AUDIENCE"].filter((name) => value(name) !== undefined);
+  if (set.length === 0 && optional.length === 0) return null;
+  if (set.length < ADMIN_AUTH_ENV.length) {
+    const missing = ADMIN_AUTH_ENV.filter((name) => value(name) === undefined);
+    problems.push(`${missing.join(", ")} must be set with the other AUTH_* variables, or none of them`);
+    return null;
+  }
+  const issuer = value("AUTH_ISSUER")!;
+  const redirectUri = value("AUTH_REDIRECT_URI")!;
+  const backChannelUrl = value("AUTH_BACKCHANNEL_URL");
+  const before = problems.length;
+  if (!isWebUrl(issuer)) problems.push("AUTH_ISSUER must be an https URL (http only for localhost)");
+  const redirect = isWebUrl(redirectUri);
+  if (!redirect || redirect.pathname !== ADMIN_CALLBACK_PATH) {
+    problems.push(`AUTH_REDIRECT_URI must be this farm's https URL ending in ${ADMIN_CALLBACK_PATH}`);
+  }
+  if (backChannelUrl !== undefined) {
+    try {
+      const back = new URL(backChannelUrl);
+      if ((back.protocol !== "https:" && back.protocol !== "http:") || back.search || back.hash) throw new Error();
+    } catch {
+      problems.push("AUTH_BACKCHANNEL_URL must be an http or https URL with no query");
+    }
+  }
+  if (problems.length > before) return null;
+  const config: AdminAuthConfig = {
+    issuer,
+    clientId: value("AUTH_CLIENT_ID")!,
+    clientSecret: value("AUTH_CLIENT_SECRET")!,
+    redirectUri,
+  };
+  if (backChannelUrl !== undefined) config.backChannelUrl = backChannelUrl;
+  const audience = value("AUTH_AUDIENCE");
+  if (audience !== undefined) config.audience = audience;
+  return config;
 }
 
 function parseDisclosureVersion(raw: string | undefined): number | null {

@@ -68,6 +68,8 @@ Keep them in a systemd `EnvironmentFile` (e.g.
 | `APPLE_PRIVATE_KEY` | PKCS#8 PEM of the `.p8` key, on one line with newlines as `\n` (`src/config.ts` decodes them). A literal multiline PEM does NOT work: systemd's `EnvironmentFile` ignores lines without `=`, so only the first line would load — it passes the PKCS#8-header shape check, then `importApplePrivateKey` fails at startup and the service exits 1 |
 | `APPLE_REFRESH_TOKEN_KEY` | 32 random bytes (base64) — the AES-256-GCM key for `users.apple_refresh_token`. Generate with `openssl rand -base64 32` |
 | `TURNIP_PIPELINE_KEY` | Random service key for the pipeline endpoints (`BACKEND_DESIGN.md` §7.1). See §9 for rotation |
+| `AUTH_ISSUER`, `AUTH_CLIENT_ID`, `AUTH_CLIENT_SECRET`, `AUTH_REDIRECT_URI` | Optional, all or none: the `/admin` holdout page's sign-in through the auth service (`BACKEND_DESIGN.md` §7.1 "Admin"). `AUTH_REDIRECT_URI` is `https://<farm host>/auth/callback`. Unset, the admin routes answer 404. See §9 |
+| `AUTH_BACKCHANNEL_URL`, `AUTH_AUDIENCE` | Optional: a private-network URL for the auth service, for the farm's server-to-server calls; and the farm's `aud` when the service name differs from the client id |
 | `PORT` | Optional; defaults to `3000` |
 | `INGEST_POLL_INTERVAL_MS` | Optional; ingest poll interval, defaults to `30000`. `0` disables the poller (e.g. when R2 event notifications drive ingest instead) |
 | `CURRENT_DISCLOSURE_VERSION` | Optional; defaults to `3`. The contribution disclosure version an account must have agreed to (`POST /api/consent`) before contributing (`BACKEND_DESIGN.md` §7.3). Raise it only after the app release with the new wording is live: every account is then asked again on its next contribution |
@@ -206,6 +208,34 @@ starting position.
   other secrets. Rotation: deploy the new value, then update the
   pipeline consumer (turnip-ml's training job) in the same window —
   there is exactly one consumer, so a flag day is acceptable.
+- **Admin sign-in.** Set it up only where the maintainer uses the
+  `/admin` holdout page. In the auth service's services file, declare
+  the farm (auth's `docs/DESIGN.md` §6):
+  ```json
+  {
+    "name": "turnip-farm",
+    "roles": ["admin"],
+    "mfa_roles": ["admin"],
+    "signup": "closed",
+    "clients": [{
+      "id": "turnip-farm",
+      "type": "confidential",
+      "redirect_uris": ["https://<farm host>/auth/callback"],
+      "post_logout_redirect_uris": ["https://<farm host>/admin"]
+    }],
+    "events_url": "https://<farm host>/auth/events"
+  }
+  ```
+  Restart auth, print the client secret with
+  `bun cli.ts client secret turnip-farm` on auth's side, and grant the
+  maintainer `turnip-farm:admin`. Then set the `AUTH_*` variables above
+  in `/etc/turnip-farm/env` and restart the farm. The farm also checks
+  for the `admin` role and a second-factor sign-in, so keep `mfa_roles`
+  as shown: without it, signing in ends at `/admin?signin=mfa_required`.
+  `events_url` may be a private-network URL if auth reaches the farm
+  that way. Rotation: `bun cli.ts client secret turnip-farm` again,
+  update `AUTH_CLIENT_SECRET`, restart, then
+  `bun cli.ts client retire-old-secrets turnip-farm`.
 - **Q4 — R2 topology.** Single bucket, 15-minute presigned-URL TTLs
   (see §7).
 - **Q6 — Apple keys.** `APPLE_PRIVATE_KEY` comes from the Apple

@@ -49,6 +49,7 @@ describe("loadConfig", () => {
         refreshTokenKey: REFRESH_KEY_BYTES,
       },
       pipelineKey: "pipeline-key",
+      adminAuth: null,
       trustedProxies: [],
       currentDisclosureVersion: DEFAULT_DISCLOSURE_VERSION,
     });
@@ -109,6 +110,62 @@ describe("loadConfig", () => {
     expect(problemsFor({ ...FULL_ENV, APPLE_REFRESH_TOKEN_KEY: key })).toEqual([
       "APPLE_REFRESH_TOKEN_KEY must be 32 random bytes, base64-encoded",
     ]);
+  });
+
+  describe("admin sign-in (AUTH_*)", () => {
+    const AUTH_ENV = {
+      AUTH_ISSUER: "https://auth.example.com",
+      AUTH_CLIENT_ID: "turnip-farm",
+      AUTH_CLIENT_SECRET: "client-secret",
+      AUTH_REDIRECT_URI: "https://farm.example.com/auth/callback",
+    };
+
+    test("reads the client, with the optional back channel and audience", () => {
+      expect(loadConfig({ ...FULL_ENV, ...AUTH_ENV }).adminAuth).toEqual({
+        issuer: "https://auth.example.com",
+        clientId: "turnip-farm",
+        clientSecret: "client-secret",
+        redirectUri: "https://farm.example.com/auth/callback",
+      });
+      const full = loadConfig({
+        ...FULL_ENV,
+        ...AUTH_ENV,
+        AUTH_BACKCHANNEL_URL: "http://auth.internal:3000",
+        AUTH_AUDIENCE: "turnip",
+      }).adminAuth;
+      expect(full?.backChannelUrl).toBe("http://auth.internal:3000");
+      expect(full?.audience).toBe("turnip");
+    });
+
+    test("is off when every AUTH_* variable is unset or blank", () => {
+      expect(loadConfig(FULL_ENV).adminAuth).toBeNull();
+      expect(loadConfig({ ...FULL_ENV, AUTH_ISSUER: " ", AUTH_CLIENT_ID: "" }).adminAuth).toBeNull();
+    });
+
+    test("refuses a partial set", () => {
+      expect(problemsFor({ ...FULL_ENV, AUTH_ISSUER: AUTH_ENV.AUTH_ISSUER })).toEqual([
+        "AUTH_CLIENT_ID, AUTH_CLIENT_SECRET, AUTH_REDIRECT_URI must be set with the other AUTH_* variables, or none of them",
+      ]);
+      expect(problemsFor({ ...FULL_ENV, AUTH_AUDIENCE: "turnip" })).toHaveLength(1);
+    });
+
+    test("refuses a plain-http issuer or a redirect URI that isn't the callback", () => {
+      expect(problemsFor({ ...FULL_ENV, ...AUTH_ENV, AUTH_ISSUER: "http://auth.example.com" })).toEqual([
+        "AUTH_ISSUER must be an https URL (http only for localhost)",
+      ]);
+      for (const uri of ["https://farm.example.com/callback", "http://farm.example.com/auth/callback", "nope"]) {
+        expect(problemsFor({ ...FULL_ENV, ...AUTH_ENV, AUTH_REDIRECT_URI: uri })).toEqual([
+          "AUTH_REDIRECT_URI must be this farm's https URL ending in /auth/callback",
+        ]);
+      }
+      const local = loadConfig({
+        ...FULL_ENV,
+        ...AUTH_ENV,
+        AUTH_ISSUER: "http://localhost:4000",
+        AUTH_REDIRECT_URI: "http://localhost:3000/auth/callback",
+      }).adminAuth;
+      expect(local?.issuer).toBe("http://localhost:4000");
+    });
   });
 
   test("reads TRUSTED_PROXIES, skipping blank entries", () => {

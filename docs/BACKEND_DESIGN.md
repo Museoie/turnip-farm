@@ -226,7 +226,9 @@ Two departures from the master plan's label draft follow from this:
     `POST /api/quarantine/:source_id/release` and `/purge` authenticate
     with the pipeline service key — the only non-user credential in the
     system; the maintainer operates the pipeline, so no separate admin
-    auth exists yet. Purge hard-deletes the source (§1.2.3), so a
+    auth exists for them. (The holdout page signs the maintainer in
+    through the auth service instead, §1.2.28, §7.1; an admin session
+    does not open these.) Purge hard-deletes the source (§1.2.3), so a
     `resolution='purged'` row never survives on its own: the quarantine
     row cascades with the source it condemned.
 23. **The export page size is a deployment constant, not a parameter.**
@@ -330,9 +332,14 @@ Two departures from the master plan's label draft follow from this:
     sources by id in turnip-ml's own config; with whole recordings back
     in the export (§1.2.24) the farm carries the flag instead, so one
     place says which sources are holdout. `sources.holdout` (default
-    false) is set and cleared only by the maintainer, with
-    `bun run sources:holdout <video_id> [--clear]`; there is no HTTP
-    route, and a contributor can't set it. Changing it moves the
+    false) is set and cleared only by the maintainer, either with
+    `bun run sources:holdout <video_id> [--clear]` or from the web
+    client's `/admin` page, whose admin endpoints (§7.3,
+    `PUT`/`DELETE /api/admin/sources/:id/holdout`) run the same write
+    (`setHoldout` in `src/holdout.ts`). A contributor can't set it: the
+    endpoints take an admin session from a sign-in through the auth
+    service (§7.1 "Admin"), never an app session or a source key. The page also lists sources and plays their pose blobs, so
+    the maintainer can check the footage before flagging it. Changing it moves the
     source's `updated_at`, so the change reaches the export cursor (§6).
     The export carries `holdout` on every row (§7.3), and turnip-ml
     evaluates on those rows and never trains on them. Holdout sources
@@ -410,6 +417,31 @@ CREATE TABLE sessions (
 CREATE INDEX sessions_user_id_idx ON sessions (user_id);
 CREATE INDEX sessions_expires_at_idx ON sessions (expires_at);
 
+CREATE TABLE admin_sessions (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  token_hash    CHAR(64) NOT NULL UNIQUE CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+  -- SHA-256 of the __Host-turnip-admin cookie's token (§7.1 "Admin").
+  auth_sub      TEXT NOT NULL,
+  auth_sid      TEXT NOT NULL,
+  -- The maintainer's user and sign-in at the auth service, so its events
+  -- end the right sessions. An admin is not a farm user: no row here
+  -- refers to users, sessions or sources.
+  username      TEXT NOT NULL,
+  role          TEXT NOT NULL,
+  refresh_token TEXT,
+  -- auth's refresh token, usable only with the client secret (auth's §7.6).
+  recheck_at    TIMESTAMPTZ NOT NULL,
+  -- When the access token expires: the next request refreshes it.
+  verified_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- The last successful check; requests ride out an auth outage for an hour.
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at    TIMESTAMPTZ NOT NULL
+  -- 12 hours after sign-in; expired rows go with the hourly retention jobs.
+);
+CREATE INDEX admin_sessions_auth_sid_idx ON admin_sessions (auth_sid);
+CREATE INDEX admin_sessions_auth_sub_idx ON admin_sessions (auth_sub);
+CREATE INDEX admin_sessions_expires_at_idx ON admin_sessions (expires_at);
+
 CREATE TABLE sources (
   id              CHAR(64) PRIMARY KEY,
   -- Deterministic video_id (master plan §1): SHA-256 hex of
@@ -437,9 +469,14 @@ CREATE TABLE sources (
   -- by the farm at ingest (POSE_FORMAT.md §6 resampling); never client-supplied;
   -- NULL until the canonical blob is stored. Distinct from `id`
   -- (digest of the asset identity).
+  ingested_at     TIMESTAMPTZ,
+  -- When the ingest worker last stored the canonical blob, set with
+  -- sha256. NULL before the first ingest, and for sources ingested before
+  -- the column existed (the farm kept no record of that time).
   holdout         BOOLEAN NOT NULL DEFAULT false,
   -- The maintainer's curated holdout (§1.2.28): exported, evaluated on,
-  -- never trained on. Set only by `bun run sources:holdout`.
+  -- never trained on. Set only by the maintainer: `bun run
+  -- sources:holdout`, or the admin endpoints (§7.3).
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT sources_id_hex  CHECK (id     ~ '^[0-9a-f]{64}$'),
@@ -1017,6 +1054,53 @@ notes that "User sessions are long-lived on device".
 **Pipeline** (`POST /api/models`, `GET /api/labels/export`): pre-shared
 service key, `Authorization: Bearer <TURNIP_PIPELINE_KEY>`.
 
+**Admin** (`/api/admin/*` and `/auth/*`, §7.3): the maintainer signs
+in to the `/admin` page through the auth service (`hoiekim/auth`), as a
+web app of that service's: a confidential OpenID Connect client, by the
+contract in auth's `docs/DESIGN.md` §7.1, §7.6 and §12.1. auth's client
+library does the protocol; the farm vendors it unmodified at a pinned
+commit (`src/auth/auth-client.ts`). Neither the pipeline key nor an app
+session opens an admin route, and an admin session opens nothing else.
+- **Off unless configured:** with the `AUTH_*` variables unset, every
+  admin route answers `404 NOT_FOUND`, as an unknown path does. Set,
+  they need `AUTH_ISSUER`, `AUTH_CLIENT_ID`, `AUTH_CLIENT_SECRET` and
+  `AUTH_REDIRECT_URI` (the farm's own `https://…/auth/callback`)
+  together; `AUTH_BACKCHANNEL_URL` and `AUTH_AUDIENCE` are optional.
+  The farm refuses to start on a partial or malformed set.
+- **Who is an admin:** auth's deployment declares the farm as a service
+  whose only role is `admin`, with `mfa_roles: ["admin"]` and
+  `signup: "closed"` (DEPLOYMENT.md §9). At the callback the farm checks
+  both again: the access token's `role` must be `admin`, and the ID
+  token's `amr` must hold `mfa`; otherwise it opens no session and
+  revokes the refresh token. A sign-in older than a day is redone
+  (`max_age=86400`).
+- **The session:** a random 32-byte token in a `__Host-turnip-admin`
+  cookie (`Secure; HttpOnly; SameSite=Lax; Path=/`), stored as its
+  SHA-256 in `admin_sessions` (§3) with auth's `sub`, `sid`, the
+  username, the role and the refresh token, which is useless without the
+  client secret (auth's §7.6). A session ends 12 hours after sign-in.
+- **Re-checks:** when the access token it was issued with expires (10
+  minutes), the next request refreshes it over the back channel and
+  reads the role auth holds now. A refused grant, a lost role or a bad
+  token ends the session (`401 UNAUTHENTICATED`). If auth is
+  unreachable, requests go through while the last good check is under
+  an hour old, then answer `503 AUTH_UNAVAILABLE` (auth's §7.1).
+- **Events:** auth pushes `session.ended`, `user.disabled`,
+  `user.deleted` and `access.changed` to `POST /auth/events` (auth's
+  §7.4); the farm verifies each with the client library and deletes the
+  sessions it names (all but an `access.changed` that keeps `admin`),
+  so a sign-out elsewhere or a removed role ends access at once.
+- **Writes:** `PUT`, `DELETE` and `POST /auth/logout` need an `Origin`
+  header naming the farm's own origin (from `AUTH_REDIRECT_URI`), else
+  `403 FORBIDDEN`; with `SameSite=Lax` that keeps another site from
+  writing with the maintainer's cookie.
+- **Limits:** `/api/admin/*` and `/auth/*` share a per-IP bucket (§7.2),
+  taken before any session lookup or call to auth. Admin responses are
+  `Cache-Control: no-store`.
+- **In the browser:** the `/admin` page is served to anyone, like the
+  rest of the site, but shows nothing until `GET /api/admin/session`
+  answers; hiding the page is not the control.
+
 **Apple** (`POST /api/auth/apple/notifications`): no bearer token; the
 body is a JWT signed by Apple, verified as below.
 
@@ -1109,15 +1193,19 @@ for `users.apple_refresh_token`).
   `REGION_UNAVAILABLE` (403: the request names no storefront country,
   `details.reason = "storefront_missing"`, or one where contribution is
   switched off, `"storefront_blocked"`; see "Country backstop" below),
+  `FORBIDDEN` (403: an admin write from another origin, §7.1 "Admin"),
   `CONSENT_REQUIRED` (403: the account has not agreed to the current contribution
   disclosure, §7.3 `POST /api/consent`), `NOT_FOUND`
   (404), `NO_MODEL` (404), `VALIDATION_ERROR` (422), `UNKNOWN_LABEL` (422:
   a label name outside the vocabulary, §1.2.25), `UNSUPPORTED_FORMAT` (422),
-  `BLOB_MISSING` (422), `BLOB_DIGEST_MISMATCH` (422),
+  `BLOB_MISSING` (422), `BLOB_DIGEST_MISMATCH` (422), `BLOB_TOO_LARGE`
+  (422: a stored blob over the farm's read cap),
   `SOURCE_ALREADY_CLAIMED` (409), `VERSION_EXISTS` (409),
   `RATE_LIMITED` (429), `INTERNAL` (500), `APPLE_UNAVAILABLE` (503:
   Apple's token or revocation endpoint is unreachable or answered 5xx;
-  retry later).
+  retry later), `AUTH_UNAVAILABLE` (503: the auth service has been
+  unreachable past the admin re-check window, or an event can't be
+  verified yet, §7.1 "Admin").
 - **Source keys** prove ownership of a source (§1.2.13).
   - **What a key is:** 32 random bytes the client generates once per
     source when it first contributes it, sent base64url-encoded without
@@ -1176,7 +1264,8 @@ for `users.apple_refresh_token`).
   `Retry-After`). `POST /api/auth/apple` has no user yet, so it is
   limited per client IP (suggested: 10 requests/minute), and so are
   the three public endpoints (suggested: 30 requests/minute; all are
-  cacheable, see §7.3). The client IP is the socket peer's address,
+  cacheable, see §7.3), and so is every `/api/admin/*` and `/auth/*`
+  request (60 requests/minute), before any session lookup. The client IP is the socket peer's address,
   with IPv6 limited per /64, unless the peer is a trusted proxy:
   loopback (a reverse proxy on the same host), or an address in the
   optional `TRUSTED_PROXIES` setting, a comma-separated list of
@@ -1941,6 +2030,91 @@ poisoned data is gone entirely rather than merely excluded. R2 is
 deleted before the row (the `DELETE /api/sources/:id` order); if
 either delete throws, the source row survives so the call can be
 retried. `404` when no open quarantine row exists. Response `204`.
+
+#### `GET /auth/login`, `GET /auth/callback`, `POST /auth/logout`, `POST /auth/events` — admin sign-in (auth service)
+
+The routes auth's web-app contract asks for (its §7.6), outside `/api`
+because auth's deployment registers their URLs; like `/api`, an unknown
+`/auth` path is a JSON `404`, never the web client. All answer `404`
+when admin sign-in isn't configured. §7.1 "Admin" has the rules.
+- `GET /auth/login`: `302` to auth's authorize endpoint, with auth's
+  short-lived login cookie.
+- `GET /auth/callback`: finishes the sign-in. Success: `302 /admin`
+  with the session cookie. Failure: `302 /admin?signin=<reason>`, one
+  of `failed`, `unavailable`, `forbidden` (no `admin` role) or
+  `mfa_required`, which the page explains.
+- `POST /auth/logout`: same origin only. Deletes the session, revokes
+  its refresh token, clears the cookie and answers `303` to auth's
+  logout, which returns to `/admin`.
+- `POST /auth/events`: a Security Event Token from auth, at most
+  64 KiB. `204` when handled or ignored; `422 VALIDATION_ERROR` when it
+  doesn't verify; `503 AUTH_UNAVAILABLE` when auth's keys can't be
+  fetched, so auth retries.
+
+#### `GET /api/admin/session` — the signed-in admin (admin session)
+
+Response `200`: `{"username": "alice", "role": "admin"}`; `401` without
+a live admin session. The page reads it to know whether to offer
+sign-in.
+
+#### `GET /api/admin/sources?holdout=&cursor=` — browse sources (admin session)
+
+The holdout page's source list (§1.2.28), newest first. `holdout` is
+`all` (the default), `true` (holdout only) or `false` (not holdout);
+`cursor` is the previous page's `next_cursor`. Pages hold 50 sources
+(a deployment constant, as in §1.2.23), keyset-ordered by
+`(created_at, id)` descending, so sources registered in one
+transaction still page in a total order. A bad `holdout` or `cursor`
+is `422 VALIDATION_ERROR` with `details.field`. Response `200`:
+
+```json
+{
+  "sources": [
+    {
+      "id": "<video_id>",
+      "created_at": "2026-11-02T10:00:00.000001Z",
+      "ingested_at": "2026-11-02T10:00:41.000001Z",
+      "frame_count": 600,
+      "sample_rate": 30.0,
+      "ingested": true,
+      "holdout": false,
+      "quarantined": false,
+      "clips": [
+        {"id": "<uuid>", "start_frame": 120, "end_frame": 175, "names": ["cork", "gainer"]}
+      ]
+    }
+  ],
+  "next_cursor": "<opaque, or null on the last page>"
+}
+```
+
+`created_at` is the source's registration time and `ingested_at` its
+last ingest (§3; `null` before the first, and for sources ingested
+before the farm recorded the time); `ingested` says whether the
+canonical blob is stored (`sha256` set). `quarantined` is an open quarantine row.
+`clips` is ordered by window; `names` is the clip's distinct label
+names. Nothing here comes from `source_attribution` or names an
+account (§8).
+
+#### `PUT /api/admin/sources/:id/holdout`, `DELETE …` — set or clear the holdout flag (admin session)
+
+`PUT` flags the source as holdout, `DELETE` clears the flag: the same
+write as `bun run sources:holdout` (§1.2.28), so a change moves
+`updated_at` and reaches the export cursor, and setting the state the
+source already has changes nothing. Same origin only (§7.1 "Admin").
+`404` for an unknown source.
+Response `200`: `{"source_id": "<id>", "holdout": true, "changed": true}`.
+
+#### `GET /api/admin/sources/:id/pose` — a source's pose blob (admin session)
+
+The canonical `poses/<id>.tkp1.gz` bytes as stored, `Content-Type:
+application/gzip`, for the page's player to decode (POSE_FORMAT.md).
+The farm reads the blob from R2 and returns it rather than presigning
+a URL: a browser fetch of a presigned R2 URL needs a CORS rule on the
+bucket, which the app's downloads don't, and the farm already reads
+canonical blobs under the `MAX_CANONICAL_BLOB_BYTES` cap. `404` for an
+unknown source; `422 BLOB_MISSING` when the source isn't ingested yet
+or its blob is gone from R2; `422 BLOB_TOO_LARGE` over the cap.
 
 #### `POST /api/reports` — report a bad label/clip
 

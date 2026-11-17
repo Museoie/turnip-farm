@@ -128,6 +128,7 @@ describeDb("blocking", () => {
     user: new TokenBucket(1000, 60000),
     ip: new TokenBucket(1000, 60000),
     publicIp: new TokenBucket(1000, 60000),
+    adminIp: new TokenBucket(1000, 60000),
   };
   const register = (tx: SQL) =>
     handleRegisterSource(

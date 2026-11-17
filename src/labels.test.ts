@@ -50,7 +50,7 @@ function deps(tx: SQL) {
     r2,
     candidateKey: testCandidateKey,
     currentDisclosureVersion: 3,
-    limits: { user: new TokenBucket(1000, 60), ip: new TokenBucket(1000, 60), publicIp: new TokenBucket(1000, 60) },
+    limits: { user: new TokenBucket(1000, 60), ip: new TokenBucket(1000, 60), publicIp: new TokenBucket(1000, 60), adminIp: new TokenBucket(1000, 60) },
   };
 }
 

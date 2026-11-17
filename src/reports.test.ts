@@ -27,7 +27,7 @@ const CLIP_ID = "123e4567-e89b-42d3-a456-426614174000";
 function deps(sql: SQL, user = new TokenBucket(1000, 60000)): ReportsDeps {
   return {
     sql,
-    limits: { user, ip: new TokenBucket(1000, 60000), publicIp: new TokenBucket(1000, 60000) },
+    limits: { user, ip: new TokenBucket(1000, 60000), publicIp: new TokenBucket(1000, 60000), adminIp: new TokenBucket(1000, 60000) },
   };
 }
 

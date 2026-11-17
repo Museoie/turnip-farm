@@ -72,7 +72,12 @@ the vocabulary, and community stats (user signups and labeling
 contributions over the last 90 days, from the public `GET /api/stats`
 endpoint, every count rounded down to a multiple of 5). The status page reads only the public endpoints
 above; it never authenticates and never shows the model's presigned R2
-URL.
+URL. The one page that authenticates is `/admin`, the maintainer's
+holdout page (BACKEND_DESIGN.md §1.2.28): it browses the ingested
+sources, plays a source's pose, and marks or unmarks holdout sources,
+through admin endpoints that need a sign-in through the auth service
+(`hoiekim/auth`) with the `admin` role and a second factor; they are off
+when the `AUTH_*` variables are unset. It is not linked from the site.
 
 ## Layout
 
@@ -83,10 +88,12 @@ src/
   pack.ts          server bundler (bun build): src/index.ts → build/server/bundle.js
   client/          the web client (Vite + React): the public site — the
                    marketing home at `/`, support and privacy pages, and
-                   the read-only status page at `/status`; builds into
+                   the read-only status page at `/status` — and the
+                   maintainer's holdout page at `/admin`; builds into
                    build/client
-    pages/         Home, Support, Privacy, Status; App.tsx is the shell
-                   (header/footer) and pathname router
+    pages/         Home, Support, Privacy, Status, Admin; App.tsx is the
+                   shell (header/footer) and pathname router
+    admin/         the holdout page's API calls and pose player
   app.ts           HTTP routing
   errors.ts        the API error shape (BACKEND_DESIGN.md §7.2)
   ratelimit.ts     per-user and per-IP token buckets, and the client address they key on (§7.2)
@@ -100,6 +107,8 @@ src/
     notifications.ts Apple server-to-server notifications
     tokens.ts        session tokens and refresh-token encryption
     testing.ts       stand-in Apple endpoints for tests
+    admin.ts         the maintainer's /admin sign-in through the auth service (§7.1)
+    auth-client.ts   the auth service's client library, vendored at a pinned commit
   contrib/
     sources.ts     source registration, read, pose download, delete
     clips.ts       clip upserts and label-set replacement (§4, §5)
@@ -117,7 +126,8 @@ src/
   consent.ts       POST /api/consent and the consent gate on contribution writes (§7.3)
   labels.ts        vocabulary-only labels, POST /api/labels/candidates, and the candidate scripts (§1.2.25)
   moderation.ts    attribution lookup and blocking, for the scripts below
-  holdout.ts       the curated-holdout flag on sources, for sources:holdout (§1.2.28)
+  holdout.ts       the curated-holdout flag on sources, for sources:holdout and admin.ts (§1.2.28)
+  admin.ts         the /admin page's endpoints: sources, holdout flag, pose blob (§7.3)
   *.test.ts        tests (bun test), next to the code they cover
 scripts/           maintainer scripts, run with bun run (see Moderation)
 db/
@@ -248,6 +258,8 @@ exits with status 1 and lists every problem at once.
 | `APPLE_PRIVATE_KEY`       | yes      | That key's `.p8` PEM; on one line, newlines as `\n`           |
 | `APPLE_REFRESH_TOKEN_KEY` | yes      | 32 random bytes, base64: encrypts stored Apple refresh tokens |
 | `TURNIP_PIPELINE_KEY`     | yes      | Service key for the training pipeline's endpoints             |
+| `AUTH_ISSUER`, `AUTH_CLIENT_ID`, `AUTH_CLIENT_SECRET`, `AUTH_REDIRECT_URI` | no (all or none) | The `/admin` page's sign-in through the auth service; unset turns it off (§7.1) |
+| `AUTH_BACKCHANNEL_URL`, `AUTH_AUDIENCE` | no | A private URL for the auth service, and its `aud` for the farm when it isn't the client id |
 | `TRUSTED_PROXIES`         | no       | Trusted proxy addresses and CIDRs, comma-separated (§7.2)     |
 | `CURRENT_DISCLOSURE_VERSION` | no    | Disclosure version contribution requires (default `3`, §7.3)  |
 

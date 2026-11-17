@@ -1,8 +1,8 @@
 // The curated holdout (BACKEND_DESIGN.md §1.2.28): the maintainer flags
 // their own footage as holdout, and the training export carries the flag
-// on every row so turnip-ml evaluates on it and never trains on it. Run
-// from scripts/source-holdout.ts against the database directly; nothing
-// here is reachable over HTTP.
+// on every row so turnip-ml evaluates on it and never trains on it.
+// setHoldout is the one write: scripts/source-holdout.ts runs it against
+// the database directly, and the admin endpoints (admin.ts) over HTTP.
 
 import type { SQL } from "bun";
 import { isVideoId } from "./contrib/validate";

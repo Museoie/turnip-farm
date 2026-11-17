@@ -285,7 +285,7 @@ describe("pollStagingOnce", () => {
 const pgSql = TEST_DATABASE_URL ? new SQL(TEST_DATABASE_URL) : null;
 
 describe.if(pgSql !== null)("createPostgresSourceStore", () => {
-  test("setSha256 commits the digest; unknown id throws", async () => {
+  test("setSha256 commits the digest and the ingest time; unknown id throws", async () => {
     await inRollback(pgSql!, async (tx) => {
       const store = createPostgresSourceStore(tx as SQL);
       const id = "c".repeat(64);
@@ -294,10 +294,14 @@ describe.if(pgSql !== null)("createPostgresSourceStore", () => {
       expect(await store.get(id)).toMatchObject({ id, r2_key: canonicalKeyFor(id) });
       expect(await store.get("e".repeat(64))).toBeNull();
 
+      const [before] = await tx`SELECT ingested_at FROM sources WHERE id = ${id}`;
+      expect(before!.ingested_at).toBeNull();
+
       const digest = "f".repeat(64);
       await store.setSha256(id, digest);
-      const rows = await tx`SELECT sha256, updated_at FROM sources WHERE id = ${id}`;
+      const rows = await tx`SELECT sha256, ingested_at = now() AS ingested_now FROM sources WHERE id = ${id}`;
       expect(rows[0]!.sha256).toBe(digest);
+      expect(rows[0]!.ingested_now).toBe(true);
 
       await expect(store.setSha256("e".repeat(64), digest)).rejects.toThrow(/source-vanished/);
     });

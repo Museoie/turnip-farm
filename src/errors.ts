@@ -4,6 +4,7 @@
 export type ErrorCode =
   | "UNAUTHENTICATED"
   | "ACCOUNT_BLOCKED"
+  | "FORBIDDEN"
   | "REGION_UNAVAILABLE"
   | "CONSENT_REQUIRED"
   | "NOT_FOUND"
@@ -18,7 +19,8 @@ export type ErrorCode =
   | "NO_MODEL"
   | "RATE_LIMITED"
   | "INTERNAL"
-  | "APPLE_UNAVAILABLE";
+  | "APPLE_UNAVAILABLE"
+  | "AUTH_UNAVAILABLE";
 
 export function errorResponse(
   status: number,

@@ -48,6 +48,7 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
       ORDER BY table_name`;
     expect(rows.map((r: { table_name: string }) => r.table_name)).toEqual([
+      "admin_sessions",
       "clips",
       "consents",
       "data_quarantine",
@@ -74,6 +75,11 @@ describe.skipIf(!TEST_DATABASE_URL)("schema (BACKEND_DESIGN.md §3)", () => {
       WHERE schemaname = 'public' AND tablename <> 'schema_migrations'
       ORDER BY tablename, indexname`;
     expect(rows.map((r: { indexdef: string }) => r.indexdef)).toEqual([
+      "CREATE INDEX admin_sessions_auth_sid_idx ON public.admin_sessions USING btree (auth_sid)",
+      "CREATE INDEX admin_sessions_auth_sub_idx ON public.admin_sessions USING btree (auth_sub)",
+      "CREATE INDEX admin_sessions_expires_at_idx ON public.admin_sessions USING btree (expires_at)",
+      "CREATE UNIQUE INDEX admin_sessions_pkey ON public.admin_sessions USING btree (id)",
+      "CREATE UNIQUE INDEX admin_sessions_token_hash_key ON public.admin_sessions USING btree (token_hash)",
       "CREATE UNIQUE INDEX clips_pkey ON public.clips USING btree (id)",
       "CREATE INDEX clips_source_id_idx ON public.clips USING btree (source_id)",
       "CREATE UNIQUE INDEX consents_pkey ON public.consents USING btree (user_id, disclosure_version)",

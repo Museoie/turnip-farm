@@ -463,3 +463,263 @@ main.page section li strong {
   font-size: 14px;
   margin: 8px 0 0;
 }
+
+/* Holdout admin page (/admin), in the site theme. */
+main.admin .btn {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 8px 14px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+main.admin .btn-primary {
+  border: 1px solid transparent;
+}
+
+main.admin .btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+main.admin select {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+
+main.admin code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95em;
+}
+
+main.admin .dim {
+  color: var(--text-dim);
+}
+
+.admin-error {
+  color: var(--pink-light);
+}
+
+.admin-session {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 8px;
+}
+
+main.admin section ul.source-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 10px;
+}
+
+main.admin section li.source-row {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  color: var(--text);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 16px;
+  align-items: center;
+}
+
+main.admin li.source-row.is-selected {
+  border-color: var(--pink);
+}
+
+.source-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.source-meta {
+  grid-column: 1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 16px;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
+.source-actions {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.confirm {
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+.confirm p {
+  margin: 0 0 8px;
+}
+
+.confirm .source-actions {
+  justify-content: flex-start;
+}
+
+.tag {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+
+.tag-holdout {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.tag-quarantine {
+  border-color: var(--pink);
+  color: var(--pink-light);
+}
+
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.player-canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  width: auto;
+  height: auto;
+  margin: 0 auto 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.player-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  margin-bottom: 10px;
+}
+
+.player-time {
+  color: var(--text-dim);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.scrubber {
+  position: relative;
+  margin-bottom: 12px;
+}
+
+.scrub-track {
+  position: relative;
+  height: 24px;
+  border-radius: 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.scrub-gap,
+.scrub-clip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+
+.scrub-gap {
+  background: repeating-linear-gradient(45deg, var(--border) 0 3px, transparent 3px 6px);
+}
+
+.scrub-clip {
+  background: var(--pink);
+  opacity: 0.55;
+  border: 0;
+  padding: 0 4px;
+  color: #fff;
+  font: inherit;
+  font-size: 11px;
+  line-height: 24px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.scrub-clip.is-current {
+  opacity: 1;
+}
+
+.scrubber input[type="range"] {
+  width: 100%;
+  margin: 6px 0 0;
+  accent-color: var(--pink);
+}
+
+main.admin section ol.clip-list {
+  padding-left: 0;
+  list-style: none;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+main.admin section ol.clip-list li {
+  padding: 0;
+}
+
+.clip-jump {
+  font: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+
+.clip-jump.is-current {
+  border-color: var(--pink);
+}
+
+.clip-time {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 640px) {
+  main.admin section li.source-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .source-actions {
+    grid-column: 1;
+    grid-row: auto;
+    justify-content: flex-start;
+  }
+}

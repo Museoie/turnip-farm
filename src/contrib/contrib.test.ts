@@ -70,6 +70,7 @@ function deps(tx: SQL, r2: R2Client, userCapacity = 1000, refillPerMinute = 60):
       user: new TokenBucket(userCapacity, refillPerMinute),
       ip: new TokenBucket(1000, 60),
       publicIp: new TokenBucket(1000, 60),
+      adminIp: new TokenBucket(1000, 60),
     },
   };
 }

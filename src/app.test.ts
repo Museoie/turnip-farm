@@ -39,6 +39,7 @@ const deps: AppDeps = {
     user: new TokenBucket(1000, 60000),
     ip: new TokenBucket(1000, 60000),
     publicIp: new TokenBucket(1000, 60000),
+    adminIp: new TokenBucket(1000, 60000),
   },
 };
 
@@ -343,6 +344,7 @@ describe("startServer", () => {
         user: new TokenBucket(1000, 60000),
         ip: new TokenBucket(2, 1),
         publicIp: new TokenBucket(1000, 60000),
+        adminIp: new TokenBucket(1000, 60000),
       },
     });
     try {
@@ -373,6 +375,7 @@ describe("startServer", () => {
         user: new TokenBucket(1000, 60000),
         ip: new TokenBucket(1000, 60000),
         publicIp: new TokenBucket(2, 1),
+        adminIp: new TokenBucket(1000, 60000),
       },
     });
     try {
@@ -397,6 +400,7 @@ describe("startServer", () => {
         user: new TokenBucket(1000, 60000),
         ip: new TokenBucket(1000, 60000),
         publicIp: new TokenBucket(2, 1),
+        adminIp: new TokenBucket(1000, 60000),
       },
     });
     try {
@@ -423,6 +427,7 @@ describe("startServer", () => {
         user: new TokenBucket(1000, 60000),
         ip: new TokenBucket(1000, 60000),
         publicIp: new TokenBucket(2, 1),
+        adminIp: new TokenBucket(1000, 60000),
       },
     });
     try {
@@ -446,6 +451,7 @@ describe("startServer", () => {
         user: new TokenBucket(1000, 60000),
         ip: new TokenBucket(2, 1),
         publicIp: new TokenBucket(1000, 60000),
+        adminIp: new TokenBucket(1000, 60000),
       },
     });
     try {
@@ -474,6 +480,7 @@ describe("startServer", () => {
         user: new TokenBucket(1000, 60000),
         ip: new TokenBucket(2, 1),
         publicIp: new TokenBucket(1000, 60000),
+        adminIp: new TokenBucket(1000, 60000),
         trustedProxies: [parseProxyRange("10.0.0.0/8")!],
       },
     });

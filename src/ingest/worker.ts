@@ -68,9 +68,11 @@ export function createPostgresSourceStore(sql: SQL): SourceStore {
     },
     // Set ONLY on successful ingest, and only here: the registration
     // upsert deliberately never overwrites sha256 (§1.2.10), and
-    // updated_at is set explicitly — no triggers (§1.2.11).
+    // updated_at is set explicitly — no triggers (§1.2.11). ingested_at
+    // records this ingest, so a re-contribution moves it.
     async setSha256(id, sha256) {
-      const result = await sql`UPDATE sources SET sha256 = ${sha256}, updated_at = now() WHERE id = ${id}`;
+      const result = await sql`
+        UPDATE sources SET sha256 = ${sha256}, ingested_at = now(), updated_at = now() WHERE id = ${id}`;
       if (result.count !== 1) throw new IngestError("source-vanished", id);
     },
   };

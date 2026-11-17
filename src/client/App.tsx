@@ -1,3 +1,4 @@
+import { AdminPage } from "./pages/Admin";
 import { Home } from "./pages/Home";
 import { Privacy } from "./pages/Privacy";
 import { StatusPage } from "./pages/Status";
@@ -68,6 +69,8 @@ export function App() {
         <Support />
       ) : route === "/privacy" ? (
         <Privacy />
+      ) : route === "/admin" ? (
+        <AdminPage />
       ) : (
         <NotFound />
       )}
