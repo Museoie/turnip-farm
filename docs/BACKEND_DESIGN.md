@@ -351,6 +351,45 @@ Two departures from the master plan's label draft follow from this:
     on data no model trains on. The flag lives on the source row, so
     it goes with the source if the source is deleted, and a source
     registered again under the same `video_id` starts unflagged.
+29. **App users suggest synonyms; the maintainer merges them.**
+    *Added 2026-11 by the maintainer.* Tricks go by several names
+    (`cartfull` and `cartwheel full twist`, `cork` and `corkscrew`), and
+    the people naming clips are the ones who know which. The app lets a
+    user mark two of their tricks as one; the merge applies on their
+    device at once, and the app sends the pair to
+    `POST /api/labels/synonyms` (§7.3), into `synonym_candidates`. A
+    pair is a suggestion for the shared vocabulary, never applied by the
+    farm on its own: one account could otherwise fold any trick into any
+    other for every user and every training label, since the export
+    canonicalizes through `label_taxonomy` (§7.3). It is kept as
+    `label_candidates` are (§1.2.25): under `account_hash`, never the
+    account id; deleted 30 days after the account first sent it
+    (`LABEL_CANDIDATE_TTL_DAYS`) and with the account; once per account
+    and ordered pair, case-insensitively, since which name to keep is
+    part of the suggestion. A pair whose two names already resolve to
+    one canonical is skipped. A name resolves as a label's does in the
+    export (§6): its normalized form through the greatest-version raw
+    mapping first, else as a canonical itself, so a canonical with no
+    raw row of its own counts as known. The maintainer reviews pairs with
+    `bun run labels:synonyms [--min N]` and applies one with
+    `bun run labels:merge <name> <same_as>`, which merges the whole
+    trick `<name>` resolves to into the trick `<same_as>` resolves to
+    (each resolved as above) at a new `taxonomy_version`, the way a
+    rename resolves forward (§3):
+    every raw resolving to the old canonical, the canonical itself
+    included, gets a row pointing at the new one. A `<name>` the
+    vocabulary lacks is added under the trick, a `<same_as>` it lacks
+    becomes a canonical of its own, and the label candidates and pairs
+    the merge settles are dropped. The app picks the merge up from
+    `GET /api/taxonomy/current`. The web client's `/admin/synonyms`
+    page does both over two admin endpoints (§7.3
+    `GET /api/admin/synonyms`, `POST /api/admin/merges`), which run the
+    scripts' list, capped, and their merge, and need an admin
+    session (§7.1 "Admin"). No pair count applies a merge by itself
+    (§9 Q5). Not gated on consent:
+    a pair carries two names and nothing about a clip, a source or a
+    pose. *(Judgment calls: maintainer-applied rather than automatic at
+    a threshold of accounts, and the candidates' 30 days.)*
 
 ## 2. Conventions
 
@@ -518,6 +557,22 @@ CREATE UNIQUE INDEX label_candidates_name_account_uniq
   ON label_candidates (lower(name), account_hash);
 CREATE INDEX label_candidates_account_hash_idx ON label_candidates (account_hash);
 CREATE INDEX label_candidates_submitted_at_idx ON label_candidates (submitted_at);
+
+CREATE TABLE synonym_candidates (
+  name         TEXT NOT NULL
+               CHECK (name <> '' AND name = btrim(name) AND char_length(name) <= 64),
+  same_as      TEXT NOT NULL
+               CHECK (same_as <> '' AND same_as = btrim(same_as) AND char_length(same_as) <= 64),
+  -- The name the account wants kept: `name` goes under `same_as` (§1.2.29).
+  account_hash CHAR(64) NOT NULL CHECK (account_hash ~ '^[0-9a-f]{64}$'),
+  -- The same HMAC-SHA-256 of the account id as label_candidates (§1.2.25).
+  submitted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  -- The account's first submission of the pair; deleted 30 days after it.
+);
+CREATE UNIQUE INDEX synonym_candidates_pair_account_uniq
+  ON synonym_candidates (lower(name), lower(same_as), account_hash);
+CREATE INDEX synonym_candidates_account_hash_idx ON synonym_candidates (account_hash);
+CREATE INDEX synonym_candidates_submitted_at_idx ON synonym_candidates (submitted_at);
 
 -- Unused since training segments were removed (§1.2.24) and kept empty
 -- because migrations are additive (§2): training_segments,
@@ -787,6 +842,7 @@ WHERE a.attributed_at < now() - interval '30 days'
                   WHERE c.user_id = a.user_id AND c.disclosure_version >= 3);
 DELETE FROM reports WHERE created_at < now() - interval '30 days';
 DELETE FROM label_candidates WHERE submitted_at < now() - make_interval(days => 30);
+DELETE FROM synonym_candidates WHERE submitted_at < now() - make_interval(days => 30);
 ```
 
 Then accounts idle for 24 months are deleted, up to 100 per run, each
@@ -1108,7 +1164,8 @@ session opens an admin route, and an admin session opens nothing else.
   §7.4); the farm verifies each with the client library and deletes the
   sessions it names (all but an `access.changed` that keeps `admin`),
   so a sign-out elsewhere or a removed role ends access at once.
-- **Writes:** `PUT`, `DELETE` and `POST /auth/logout` need an `Origin`
+- **Writes:** every `/api/admin/*` request but a `GET` or `HEAD` (each
+  `PUT`, `DELETE` and `POST`), and `POST /auth/logout`, need an `Origin`
   header naming the farm's own origin (from `AUTH_REDIRECT_URI`), else
   `403 FORBIDDEN`; with `SameSite=Lax` that keeps another site from
   writing with the maintainer's cookie.
@@ -1355,8 +1412,8 @@ sign out cleanly. Allowed for blocked users.
 
 App Review guideline 5.1.1(v). Session required; allowed for blocked
 users. Deletes the account and everything it contributed: its sessions,
-its Apple refresh token, its consents, its attribution, its label
-candidates, its reports, and every source attributed to it with that
+its Apple refresh token, its consents, its attribution, its label and
+synonym candidates, its reports, and every source attributed to it with that
 source's pose blob, clips and labels. Nothing attributed to it is kept
 de-linked ("Client first" below covers sources it no longer holds the
 attribution for).
@@ -1388,7 +1445,7 @@ finishes the job:
 2. Delete every source attributed to the user (§4): first its R2 blob
    and any staged upload, then the rows. Clips, labels, quarantine rows,
    training membership and attribution cascade, and the account's label
-   candidates are deleted in the same transaction.
+   and synonym candidates are deleted in the same transaction.
 3. `DELETE FROM users WHERE id = $1`. Sessions, consents and reports
    cascade.
 
@@ -1690,6 +1747,36 @@ case-insensitively; resubmitting
 keeps the first `submitted_at`. The app sends a typed name here when
 the user names a clip with something the vocabulary lacks, and labels
 the clip with vocabulary names only.
+
+Response `202`, no body.
+
+#### `POST /api/labels/synonyms` — suggest that two names are one trick
+
+Session required; per-user POST bucket (§7.2). Not gated on consent
+(§1.2.29). Request:
+
+```json
+{"synonyms": [{"name": "cartwheel full twist", "same_as": "cartfull"}]}
+```
+
+`name` is the name to go under `same_as`, the name the user kept.
+Either may be outside the vocabulary.
+
+Validation: `synonyms` is an array of 1 to 20 objects, each with
+`name` and `same_as` strings of 1 to 64 characters after trimming whose
+normalized forms (§1.2.25) differ; otherwise `422 VALIDATION_ERROR`
+with `details.field = "synonyms"` (and `details.index` for a bad
+entry).
+
+Behavior: a pair whose two names already resolve to one canonical is
+skipped, each name resolving as a label's does in the export (§6):
+through the greatest-version raw mapping first, else as a canonical
+itself. Each other
+pair is stored with runs of whitespace collapsed to one space, in
+`synonym_candidates` with the caller's `account_hash` (§1.2.25), once
+per account and ordered pair, case-insensitively; resubmitting keeps
+the first `submitted_at`. Nothing changes in the vocabulary until the
+maintainer runs `labels:merge` (§1.2.29).
 
 Response `202`, no body.
 
@@ -2169,6 +2256,71 @@ or its blob is gone from R2; `422 BLOB_TOO_LARGE` when its declared size
 is over the cap. A blob that passes the cap without declaring its size is
 cut off mid-response.
 
+#### `GET /api/admin/synonyms?min=` — synonym candidates (admin session)
+
+The synonyms page's list (§1.2.29): what `bun run labels:synonyms`
+prints, capped. One entry per ordered pair, case-insensitively, with the
+number of distinct accounts that sent it, most first; `min` (default 1)
+keeps pairs at least that many accounts sent. At most 100 pairs (a
+deployment constant, as in §1.2.23): those most accounts sent, ties in
+name order. `truncated` says more pairs meet `min`; raising `min` reaches
+the pairs more accounts agree on. A bad `min` is `422 VALIDATION_ERROR`
+with `details.field = "min"`. Response `200`:
+
+```json
+{
+  "synonyms": [
+    {
+      "name": "cartwheel full twist",
+      "same_as": "cartfull",
+      "accounts": 3,
+      "name_canonical": null,
+      "same_as_canonical": "cartfull",
+      "first_submitted_at": "2026-11-19T10:00:00.000001Z"
+    }
+  ],
+  "truncated": false
+}
+```
+
+`name_canonical` and `same_as_canonical` are the canonical each name
+resolves to now, resolving as a label's does in the export (§6), or
+`null` for a name the vocabulary lacks; a
+pair something other than a merge has since made one trick, such as a
+`labels:promote`, shows the same canonical on both sides.
+`first_submitted_at` is the earliest `submitted_at` of the pair's rows.
+Counts only: no `account_hash` and no account id (§8).
+
+#### `POST /api/admin/merges` — merge two tricks (admin session)
+
+The same merge as `bun run labels:merge` (§1.2.29), in one transaction.
+Same origin only (§7.1 "Admin"). Request:
+
+```json
+{"name": "cartwheel full twist", "same_as": "cartfull"}
+```
+
+`name` and `same_as` are strings of 1 to 64 characters whose
+normalized forms (§1.2.25) differ; otherwise `422 VALIDATION_ERROR`
+with `details.field`. Either may be outside the vocabulary. Response
+`200`:
+
+```json
+{
+  "merged": true,
+  "name": "cartwheel full twist",
+  "canonical": "cartfull",
+  "taxonomy_version": 8,
+  "remapped": 1,
+  "synonyms_dropped": 2,
+  "candidates_dropped": 1
+}
+```
+
+`canonical` is the trick both names now resolve to. Two names already
+one trick change nothing and answer `{"merged": false, "name": …,
+"canonical": …}`, as setting a holdout flag a source already has does.
+
 #### `POST /api/reports` — report a bad label/clip
 
 Request:
@@ -2198,8 +2350,8 @@ checklist:
   Identity tokens and email notifications carry an email address; it is
   discarded unread.
 - No free-text label names: labels come only from the vocabulary, and
-  a candidate name is kept 30 days under a keyed hash of the account,
-  never its id (§1.2.25).
+  a candidate name or synonym pair is kept 30 days under a keyed hash
+  of the account, never its id (§1.2.25, §1.2.29).
 - No app profile state: no achievements, levels, progress, scores,
   gallery grouping, highlights, favorites, spots, or which clips show
   the user (§1.2.21). Provenance fields (§1.2.18) say how a label was
@@ -2231,8 +2383,8 @@ checklist:
   and contribution requires the current version and a 16+ confirmation
   (§7.3 `POST /api/consent`).
 - Account deletion (§7.3) removes the account, its sessions, its Apple
-  token, its consents, its attribution, its label candidates and
-  reports, and every contribution attributed to it or still keyed on
+  token, its consents, its attribution, its label and synonym candidates
+  and reports, and every contribution attributed to it or still keyed on
   the device: the pose blob, clips and labels. Nothing derived from
   them is kept de-linked (training segments are removed, §1.2.24).
   There is one way to delete an account and it deletes everything; the
@@ -2276,8 +2428,9 @@ is in turnip-ios `CONTRIBUTION_DESIGN.md` §8.1.
    details not specified here (15-minute TTLs assumed above).
 5. **Taxonomy curation.** Who canonicalizes new names and bumps
    `taxonomy_version` (master plan §9 Q1). The mechanics are specified
-   (§1.2.25: candidates, `labels:promote`); the human process and a
-   promotion threshold are not.
+   (§1.2.25: candidates, `labels:promote`; §1.2.29: synonym pairs from
+   app users, `labels:merge`); the human process and a promotion
+   threshold are not.
 6. **Apple key and secret management.** Where `APPLE_PRIVATE_KEY` and
    `APPLE_REFRESH_TOKEN_KEY` live, and how the latter rotates. A
    rotation needs a key ID on the stored ciphertext, which §3 does not
