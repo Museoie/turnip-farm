@@ -18,7 +18,14 @@ import {
   handleRegisterSource,
   type SourcesDeps,
 } from "./sources";
-import { handlePostClipLabels, handlePostClips, type ClipsDeps } from "./clips";
+import {
+  BLOB_VERIFICATION_RETRY_AFTER_S,
+  CONCURRENT_BLOB_VERIFICATIONS,
+  QUEUED_BLOB_VERIFICATIONS,
+  handlePostClipLabels,
+  handlePostClips,
+  type ClipsDeps,
+} from "./clips";
 
 const describeDb = TEST_DATABASE_URL ? describe : describe.skip;
 
@@ -34,7 +41,9 @@ const OTHER_KEY = "xxx".repeat(13) + "Xxxx"; // 43-char fixture, not a secret
 const CLIP_ID = "123e4567-e89b-42d3-a456-426614174000";
 const CLIP_ID_2 = "123e4567-e89b-42d3-a456-426614174001";
 
-function fakeR2(opts: { bytes?: Uint8Array | null; failDelete?: boolean; tooLarge?: boolean } = {}): R2Client & {
+function fakeR2(
+  opts: { bytes?: Uint8Array<ArrayBuffer> | null; failDelete?: boolean; tooLarge?: "declared" | "streamed" } = {},
+): R2Client & {
   deleted: string[];
 } {
   const deleted: string[] = [];
@@ -48,9 +57,23 @@ function fakeR2(opts: { bytes?: Uint8Array | null; failDelete?: boolean; tooLarg
       url: `https://r2.test/get/${key}?sig=get`,
       expiresAt: new Date("2026-10-14T08:15:00.000Z"),
     }),
-    getBytes: async () => {
-      if (opts.tooLarge) throw new BlobTooLargeError("poses/test.tkp1.gz", 10);
-      return opts.bytes ?? null;
+    getStream: async (key: string) => {
+      if (opts.tooLarge === "declared") throw new BlobTooLargeError(key, 10);
+      const bytes = opts.bytes ?? null;
+      if (bytes === null && opts.tooLarge !== "streamed") return null;
+      // Two chunks, so a digest over only the first would not match.
+      return new ReadableStream<Uint8Array<ArrayBuffer>>({
+        start(controller) {
+          if (opts.tooLarge === "streamed") {
+            controller.enqueue(new Uint8Array(10));
+            controller.error(new BlobTooLargeError(key, 10));
+            return;
+          }
+          controller.enqueue(bytes!.slice(0, 1));
+          controller.enqueue(bytes!.slice(1));
+          controller.close();
+        },
+      });
     },
     deleteObject: async (key: string) => {
       if (opts.failDelete) throw new Error("r2 down");
@@ -532,10 +555,104 @@ describeDb("POST /api/clips", () => {
     });
   });
 
-  test("422 BLOB_TOO_LARGE when the blob exceeds the cap", async () => {
+  test("at most CONCURRENT_BLOB_VERIFICATIONS submissions stream a source blob at once", async () => {
     await inRollback(sharedSql!, async (tx) => {
       const token = await seedUser(tx, "u1");
-      const d = deps(tx, fakeR2({ tooLarge: true }));
+      const blob = new TextEncoder().encode("b");
+      await seedIngestedSource(tx, token, createHash("sha256").update(blob).digest("hex"));
+      const finish: (() => void)[] = [];
+      let open = 0;
+      let mostOpen = 0;
+      const r2: R2Client = {
+        ...fakeR2(),
+        getStream: async () => {
+          mostOpen = Math.max(mostOpen, ++open);
+          return new ReadableStream<Uint8Array<ArrayBuffer>>({
+            start(controller) {
+              finish.push(() => {
+                open--;
+                controller.enqueue(blob.slice());
+                controller.close();
+              });
+            },
+          });
+        },
+      };
+      const d = deps(tx, r2);
+      let settled = 0;
+      const submissions = [0, 1, 2, 3].map(() =>
+        handlePostClips(post("/api/clips", clipBody(), authed(token)), d).finally(() => settled++),
+      );
+      const until = async (done: () => boolean) => {
+        for (let i = 0; i < 400 && !done(); i++) await Bun.sleep(5);
+      };
+      await until(() => finish.length === CONCURRENT_BLOB_VERIFICATIONS);
+      await Bun.sleep(30);
+      expect(finish).toHaveLength(CONCURRENT_BLOB_VERIFICATIONS);
+      // One stream at a time, so only one submission is in its transaction.
+      for (let i = 0; i < 4; i++) {
+        await until(() => finish.length > i);
+        finish[i]!();
+        await until(() => settled > i);
+      }
+      expect((await Promise.all(submissions)).map((res) => res.status)).toEqual([200, 200, 200, 200]);
+      expect(mostOpen).toBe(CONCURRENT_BLOB_VERIFICATIONS);
+    });
+  });
+
+  test("429 with Retry-After once the verification queue is full, without reading the blob", async () => {
+    await inRollback(sharedSql!, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      const blob = new TextEncoder().encode("b");
+      await seedIngestedSource(tx, token, createHash("sha256").update(blob).digest("hex"));
+      const finish: (() => void)[] = [];
+      let reads = 0;
+      const r2: R2Client = {
+        ...fakeR2(),
+        getStream: async () => {
+          reads++;
+          return new ReadableStream<Uint8Array<ArrayBuffer>>({
+            start(controller) {
+              finish.push(() => {
+                controller.enqueue(blob.slice());
+                controller.close();
+              });
+            },
+          });
+        },
+      };
+      const d = deps(tx, r2);
+      let settled = 0;
+      const admitted = CONCURRENT_BLOB_VERIFICATIONS + QUEUED_BLOB_VERIFICATIONS;
+      const submissions = Array.from({ length: admitted }, () =>
+        handlePostClips(post("/api/clips", clipBody(), authed(token)), d).finally(() => settled++),
+      );
+      const until = async (done: () => boolean) => {
+        for (let i = 0; i < 400 && !done(); i++) await Bun.sleep(5);
+      };
+      await until(() => finish.length === CONCURRENT_BLOB_VERIFICATIONS);
+      await Bun.sleep(30);
+
+      const refused = await handlePostClips(post("/api/clips", clipBody(), authed(token)), d);
+      await expectError(refused, 429, "RATE_LIMITED");
+      expect(refused.headers.get("retry-after")).toBe(String(BLOB_VERIFICATION_RETRY_AFTER_S));
+      expect(reads).toBe(CONCURRENT_BLOB_VERIFICATIONS);
+
+      // The admitted ones all finish, one stream at a time.
+      for (let i = 0; i < admitted; i++) {
+        await until(() => finish.length > i);
+        finish[i]!();
+        await until(() => settled > i);
+      }
+      expect((await Promise.all(submissions)).map((res) => res.status)).toEqual(Array(admitted).fill(200));
+      expect(reads).toBe(admitted);
+    });
+  });
+
+  test.each(["declared", "streamed"] as const)("422 BLOB_TOO_LARGE when the blob exceeds the cap (%s)", async (tooLarge) => {
+    await inRollback(sharedSql!, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      const d = deps(tx, fakeR2({ tooLarge }));
       await seedIngestedSource(tx, token, createHash("sha256").update("b").digest("hex"));
       await expectError(
         await handlePostClips(post("/api/clips", clipBody(), authed(token)), d),
