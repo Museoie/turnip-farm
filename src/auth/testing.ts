@@ -144,7 +144,7 @@ export const testCandidateKey = await deriveCandidateKey(new Uint8Array(32));
 // Everything an account leaves in the database besides its user row and
 // sessions, for the account-deletion tests (BACKEND_DESIGN.md §7.3
 // `DELETE /api/account`): on each of its sources a clip and a label, and on
-// the account a consent, a report and a label candidate. The account and
+// the account a consent, a report, a label candidate and a synonym candidate. The account and
 // its sources (with their attribution) are seeded by the caller.
 export async function seedAccountContributions(sql: SQL, userId: string, sourceIds: readonly string[]): Promise<void> {
   for (const sourceId of sourceIds) {
@@ -156,6 +156,8 @@ export async function seedAccountContributions(sql: SQL, userId: string, sourceI
     VALUES (${userId}, 'source', ${sourceIds[0] ?? "f".repeat(64)}, 'test report')`;
   await sql`INSERT INTO label_candidates (name, account_hash)
     VALUES ('raiz', ${await candidateAccountHash(testCandidateKey, userId)})`;
+  await sql`INSERT INTO synonym_candidates (name, same_as, account_hash)
+    VALUES ('cartwheel full twist', 'cartfull', ${await candidateAccountHash(testCandidateKey, userId)})`;
 }
 
 // What is left of the account and its sources, per table; every count is 0
@@ -180,6 +182,7 @@ export async function accountRemains(
            (SELECT count(*) FROM labels l JOIN clips c ON c.id = l.clip_id
               WHERE c.source_id = ANY(${ids}::char(64)[]))::int                             AS labels,
            (SELECT count(*) FROM label_candidates WHERE account_hash = ${hash})::int       AS label_candidates,
+           (SELECT count(*) FROM synonym_candidates WHERE account_hash = ${hash})::int     AS synonym_candidates,
            (SELECT count(*) FROM reports WHERE reporter_user_id = ${userId})::int          AS reports`;
   return row as Record<string, number>;
 }
@@ -194,5 +197,6 @@ export const NOTHING_REMAINS = {
   clips: 0,
   labels: 0,
   label_candidates: 0,
+  synonym_candidates: 0,
   reports: 0,
 };

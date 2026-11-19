@@ -15,10 +15,14 @@ import {
   candidateAccountHash,
   deriveCandidateKey,
   handlePostLabelCandidates,
+  handlePostLabelSynonyms,
   labelCandidatesCli,
+  labelSynonymsCli,
+  mergeLabelsCli,
   normalizeName,
   promoteLabelCli,
 } from "./labels";
+import { handleGetTaxonomyCurrent } from "./taxonomy";
 import type { R2Client } from "./r2/client";
 import { TokenBucket } from "./ratelimit";
 
@@ -331,5 +335,240 @@ describeDb("candidate maintainer scripts", () => {
       // The promoted name is now accepted on clips.
       await seedSource(tx);
       expect((await handlePostClips(post("/api/clips", clipsBody(["raiz"]), tokens[0]!), deps(tx))).status).toBe(200);
+    }));
+});
+
+const synonymsBody = (...pairs: [string, string][]) => ({
+  synonyms: pairs.map(([name, same_as]) => ({ name, same_as })),
+});
+
+async function vocabularyOf(tx: SQL) {
+  const res = await handleGetTaxonomyCurrent(new Request("http://farm.test/api/taxonomy/current"), { sql: tx });
+  return (await res.json()) as { taxonomy_version: number; vocabulary: { canonical: string; aliases: string[] }[] };
+}
+
+describeDb("POST /api/labels/synonyms", () => {
+  test("202 stores each pair under an HMAC of the account, once per account and pair", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const t1 = await seedUser(tx, "u1");
+      const t2 = await seedUser(tx, "u2");
+      const d = deps(tx);
+      const r1 = await handlePostLabelSynonyms(
+        post("/api/labels/synonyms", synonymsBody(["Cartwheel  Full Twist", "cartfull"], ["corkscrew", "CORK"]), t1),
+        d,
+      );
+      expect(r1.status).toBe(202);
+      expect(await r1.text()).toBe("");
+      await handlePostLabelSynonyms(post("/api/labels/synonyms", synonymsBody(["cartwheel full twist", "Cartfull"]), t1), d);
+      await handlePostLabelSynonyms(post("/api/labels/synonyms", synonymsBody(["cartwheel full twist", "cartfull"]), t2), d);
+      // The other direction is a different pair: which name to keep is part of it.
+      await handlePostLabelSynonyms(post("/api/labels/synonyms", synonymsBody(["cartfull", "cartwheel full twist"]), t2), d);
+
+      const rows = await tx`
+        SELECT name, same_as, account_hash FROM synonym_candidates ORDER BY lower(name), account_hash`;
+      const h1 = await candidateAccountHash(testCandidateKey, "u1");
+      const h2 = await candidateAccountHash(testCandidateKey, "u2");
+      // corkscrew and cork are already one trick; whitespace is collapsed as stored.
+      expect(rows.map((r: { name: string; same_as: string; account_hash: string }) => [r.name, r.same_as, r.account_hash])).toEqual(
+        [
+          ["cartfull", "cartwheel full twist", h2],
+          ["Cartwheel Full Twist", "cartfull", h1],
+          ["cartwheel full twist", "cartfull", h2],
+        ].sort((a, b) => (a[0]!.toLowerCase() + a[2]! < b[0]!.toLowerCase() + b[2]! ? -1 : 1)),
+      );
+      expect(JSON.stringify(rows)).not.toContain("u1");
+    }));
+
+  test("skips a pair whose names resolve to one trick, through a canonical with no raw row", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version) VALUES ('raiz', 'raiz flip', 2)`;
+      const res = await handlePostLabelSynonyms(
+        post("/api/labels/synonyms", synonymsBody(["RAIZ", "raiz  flip"], ["raiz", "butterfly twist"]), token),
+        deps(tx),
+      );
+      expect(res.status).toBe(202);
+      const rows = await tx`SELECT name, same_as FROM synonym_candidates`;
+      expect(rows.map((r: { name: string; same_as: string }) => [r.name, r.same_as])).toEqual([["raiz", "butterfly twist"]]);
+    }));
+
+  test("resolves names as the export does: a canonical only an older version names, and odd spellings", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      // "raiz flip" is a canonical only at version 2; "raiz" maps to itself from version 3.
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version)
+        VALUES ('raiz', 'raiz flip', 2), ('raiz', 'raiz', 3), ('Butterfly  Twist', 'btwist', 2), ('btwist', 'btwist', 2)`;
+      const res = await handlePostLabelSynonyms(
+        post("/api/labels/synonyms", synonymsBody(["butterfly twist", "BTwist"], ["raiz flip", "raiz"]), token),
+        deps(tx),
+      );
+      expect(res.status).toBe(202);
+      // butterfly twist and btwist are one trick through a raw spelled with odd spacing; raiz flip
+      // still resolves to itself, as the export's canonical fallback has it, so it is not raiz.
+      const rows = await tx`SELECT name, same_as FROM synonym_candidates`;
+      expect(rows.map((r: { name: string; same_as: string }) => [r.name, r.same_as])).toEqual([["raiz flip", "raiz"]]);
+
+      // A merge into it finds it as a trick, rather than adding it as a new canonical.
+      const at = async (version: number) =>
+        (await tx`SELECT raw, canonical FROM label_taxonomy WHERE taxonomy_version = ${version} ORDER BY raw`).map(
+          (r: { raw: string; canonical: string }) => [r.raw, r.canonical],
+        );
+      expect(await mergeLabelsCli(["gainer", "raiz flip"], tx, capture().io)).toBe(0);
+      expect(await at(4)).toEqual([["gainer", "raiz flip"]]);
+      // Merging it on moves it, and every name now under it, forward.
+      expect(await mergeLabelsCli(["raiz flip", "raiz"], tx, capture().io)).toBe(0);
+      expect(await at(5)).toEqual([
+        ["gainer", "raiz"],
+        ["raiz flip", "raiz"],
+      ]);
+      expect(await mergeLabelsCli(["RAIZ FLIP", "raiz"], tx, capture().io)).toBe(1);
+    }));
+
+  test("422 VALIDATION_ERROR on a bad body; 401 without a session", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      const cases: [unknown, number | undefined][] = [
+        [{}, undefined],
+        [{ synonyms: [] }, undefined],
+        [{ synonyms: { name: "a", same_as: "b" } }, undefined],
+        [{ synonyms: Array.from({ length: 21 }, (_, i) => ({ name: `n${i}`, same_as: "cork" })) }, undefined],
+        [{ synonyms: ["cork"] }, 0],
+        [{ synonyms: [["cork", "gainer"]] }, 0],
+        [{ synonyms: [{ name: "cork" }] }, 0],
+        [{ synonyms: [{ name: " ", same_as: "cork" }] }, 0],
+        [{ synonyms: [{ name: "cork", same_as: 7 }] }, 0],
+        [{ synonyms: [{ name: "x".repeat(65), same_as: "cork" }] }, 0],
+        [synonymsBody(["raiz", "gainer"], ["Back  Flip", "back flip"]), 1],
+      ];
+      for (const [body, index] of cases) {
+        const res = await handlePostLabelSynonyms(post("/api/labels/synonyms", body, token), deps(tx));
+        expect(await errorOf(res)).toEqual({
+          status: 422,
+          code: "VALIDATION_ERROR",
+          details: index === undefined ? { field: "synonyms" } : { field: "synonyms", index },
+        });
+      }
+      expect(await tx`SELECT 1 FROM synonym_candidates`).toHaveLength(0);
+      const anon = await handlePostLabelSynonyms(post("/api/labels/synonyms", synonymsBody(["raiz", "cork"]), "nope"), deps(tx));
+      expect(anon.status).toBe(401);
+    }));
+
+  test("synonym candidates expire after the TTL, and go with their account", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const t1 = await seedUser(tx, "u1");
+      const t2 = await seedUser(tx, "u2");
+      const d = deps(tx);
+      await handlePostLabelSynonyms(post("/api/labels/synonyms", synonymsBody(["raiz", "cork"], ["aerial", "gainer"]), t1), d);
+      await handlePostLabelSynonyms(post("/api/labels/synonyms", synonymsBody(["raiz", "cork"]), t2), d);
+      await tx`UPDATE synonym_candidates SET submitted_at = now() - interval '31 days' WHERE name = 'aerial'`;
+      await tx`UPDATE synonym_candidates SET submitted_at = now() - interval '29 days' WHERE name = 'raiz'`;
+      await purgeExpiredAttribution(tx);
+      expect(await tx`SELECT name FROM synonym_candidates`).toHaveLength(2);
+
+      await deleteAccountData({ sql: tx, r2, candidateKey: testCandidateKey }, "u1");
+      const left = await tx`SELECT account_hash FROM synonym_candidates`;
+      expect(left.map((r: { account_hash: string }) => r.account_hash)).toEqual([
+        await candidateAccountHash(testCandidateKey, "u2"),
+      ]);
+    }));
+});
+
+describeDb("synonym maintainer scripts", () => {
+  test("labels:synonyms lists each direction by distinct accounts", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const tokens = [await seedUser(tx, "u1"), await seedUser(tx, "u2")];
+      for (const t of tokens) {
+        await handlePostLabelSynonyms(post("/api/labels/synonyms", synonymsBody(["Cartwheel Full Twist", "cartfull"]), t), deps(tx));
+      }
+      await handlePostLabelSynonyms(post("/api/labels/synonyms", synonymsBody(["cartfull", "cartwheel full twist"]), tokens[0]!), deps(tx));
+
+      const list = capture();
+      expect(await labelSynonymsCli([], tx, list.io)).toBe(0);
+      expect(list.out).toEqual(["    2  Cartwheel Full Twist → cartfull", "    1  cartfull → cartwheel full twist"]);
+      const min = capture();
+      expect(await labelSynonymsCli(["--min", "2"], tx, min.io)).toBe(0);
+      expect(min.out).toEqual(["    2  Cartwheel Full Twist → cartfull"]);
+      const none = capture();
+      expect(await labelSynonymsCli(["--min", "3"], tx, none.io)).toBe(0);
+      expect(none.err).toEqual(["No synonym candidates."]);
+      expect(await labelSynonymsCli(["--bogus"], tx, capture().io)).toBe(2);
+    }));
+
+  test("labels:merge adds a name the vocabulary lacks under a trick, and settles its candidates", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      await handlePostLabelCandidates(post("/api/labels/candidates", { names: ["cartwheel full twist"] }, token), deps(tx));
+      await handlePostLabelSynonyms(
+        post("/api/labels/synonyms", synonymsBody(["cartwheel full twist", "cartfull"], ["cartfull", "Cartwheel Full Twist"]), token),
+        deps(tx),
+      );
+      const [{ before }] = await tx`SELECT max(taxonomy_version) AS before FROM label_taxonomy`;
+
+      const merged = capture();
+      expect(await mergeLabelsCli(["Cartwheel  Full Twist", "CARTFULL"], tx, merged.io)).toBe(0);
+      expect(merged.out).toEqual([
+        `Merged "cartwheel full twist" into "cartfull" at taxonomy version ${before + 1}: ` +
+          "1 names remapped; 2 synonym and 1 candidate rows dropped.",
+      ]);
+      const vocab = await vocabularyOf(tx);
+      expect(vocab.taxonomy_version).toBe(before + 1);
+      expect(vocab.vocabulary.find((e) => e.canonical === "cartfull")).toEqual({
+        canonical: "cartfull",
+        aliases: ["cartfull", "cartwheel full twist"],
+      });
+      expect(await tx`SELECT 1 FROM synonym_candidates`).toHaveLength(0);
+      expect(await tx`SELECT 1 FROM label_candidates`).toHaveLength(0);
+
+      // The merged name is now accepted on clips, and a second merge is refused.
+      await seedSource(tx);
+      expect((await handlePostClips(post("/api/clips", clipsBody(["Cartwheel Full Twist"]), token), deps(tx))).status).toBe(200);
+      const again = capture();
+      expect(await mergeLabelsCli(["cartfull", "cartwheel full twist"], tx, again.io)).toBe(1);
+      expect(again.err).toEqual([`"cartfull" and "cartwheel full twist" are already one trick, "cartfull".`]);
+    }));
+
+  test("labels:merge moves every name of a trick forward, to a new canonical when the target is new", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const token = await seedUser(tx, "u1");
+      await handlePostLabelSynonyms(
+        post("/api/labels/synonyms", synonymsBody(["gainer", "hook"], ["corkscrew", "screw"]), token),
+        deps(tx),
+      );
+      const [{ before }] = await tx`SELECT max(taxonomy_version) AS before FROM label_taxonomy`;
+
+      expect(await mergeLabelsCli(["corkscrew", "screw"], tx, capture().io)).toBe(0);
+      const vocab = await vocabularyOf(tx);
+      // The whole cork trick moved, its canonical included, so nothing still lists "cork" as a canonical.
+      expect(vocab.vocabulary.map((e) => e.canonical)).toEqual(["cartfull", "gainer", "hook", "scoot", "screw"]);
+      expect(vocab.vocabulary.find((e) => e.canonical === "screw")!.aliases).toEqual(["cork", "corkscrew", "screw"]);
+      const rows = await tx`SELECT raw, canonical FROM label_taxonomy WHERE taxonomy_version = ${before + 1} ORDER BY raw`;
+      expect(rows.map((r: { raw: string; canonical: string }) => [r.raw, r.canonical])).toEqual([
+        ["cork", "screw"],
+        ["corkscrew", "screw"],
+        ["screw", "screw"],
+      ]);
+      // Only the pair the merge settled is dropped.
+      const left = await tx`SELECT name, same_as FROM synonym_candidates`;
+      expect(left.map((r: { name: string; same_as: string }) => [r.name, r.same_as])).toEqual([["gainer", "hook"]]);
+    }));
+
+  test("labels:merge moves a canonical with no raw row of its own, two known tricks into one", async () =>
+    inRollback(sharedSql, async (tx) => {
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version) VALUES ('raiz', 'raiz flip', 2)`;
+      expect(await mergeLabelsCli(["raiz flip", "gainer"], tx, capture().io)).toBe(0);
+      const vocab = await vocabularyOf(tx);
+      expect(vocab.taxonomy_version).toBe(3);
+      expect(vocab.vocabulary.map((e) => e.canonical)).not.toContain("raiz flip");
+      expect(vocab.vocabulary.find((e) => e.canonical === "gainer")!.aliases).toEqual(["gainer", "raiz", "raiz flip"]);
+    }));
+
+  test("labels:merge usage", async () =>
+    inRollback(sharedSql, async (tx) => {
+      for (const args of [[], ["cork"], ["cork", "cork "], ["cork", " "], ["cork", "gainer", "hook"], ["x".repeat(65), "cork"]]) {
+        const out = capture();
+        expect(await mergeLabelsCli(args, tx, out.io)).toBe(2);
+        expect(out.err).toEqual(["usage: bun run labels:merge <name> <same_as>"]);
+      }
+      expect(await tx`SELECT 1 FROM label_taxonomy WHERE taxonomy_version > 1`).toHaveLength(0);
     }));
 });

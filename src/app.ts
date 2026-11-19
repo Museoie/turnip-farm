@@ -26,7 +26,7 @@ import {
 } from "./quarantine";
 import { handlePostReport } from "./reports";
 import { handlePostConsent } from "./consent";
-import { handlePostLabelCandidates } from "./labels";
+import { handlePostLabelCandidates, handlePostLabelSynonyms } from "./labels";
 import { handleGetAdminSourcePose, handleListAdminSources, handleSetAdminHoldout } from "./admin";
 import {
   type AdminAuth,
@@ -166,6 +166,9 @@ export function createHandler(deps: AppDeps, opts: HandlerOptions = {}): (req: R
         }
         if (method === "POST" && seg.length === 3 && seg[2] === "candidates") {
           return handlePostLabelCandidates(req, deps);
+        }
+        if (method === "POST" && seg.length === 3 && seg[2] === "synonyms") {
+          return handlePostLabelSynonyms(req, deps);
         }
       }
       if (seg[1] === "taxonomy") {

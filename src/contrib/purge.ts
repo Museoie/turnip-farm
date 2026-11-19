@@ -4,8 +4,8 @@
 // an account that never agreed to a disclosure saying so: it was told 30
 // days, so its attribution is still deleted 30 days after the source's last
 // write. Reports are deleted 30 days after they are filed, reviewed or not,
-// and label candidates LABEL_CANDIDATE_TTL_DAYS after their submission
-// (§1.2.25).
+// and label and synonym candidates LABEL_CANDIDATE_TTL_DAYS after their
+// submission (§1.2.25, §1.2.29).
 
 import type { SQL } from "bun";
 import { RETENTION_UNTIL_DELETION_DISCLOSURE } from "../consent";
@@ -23,5 +23,8 @@ export async function purgeExpiredAttribution(sql: SQL): Promise<void> {
   await sql`DELETE FROM reports WHERE created_at < now() - interval '30 days'`;
   await sql`
     DELETE FROM label_candidates
+    WHERE submitted_at < now() - make_interval(days => ${LABEL_CANDIDATE_TTL_DAYS})`;
+  await sql`
+    DELETE FROM synonym_candidates
     WHERE submitted_at < now() - make_interval(days => ${LABEL_CANDIDATE_TTL_DAYS})`;
 }

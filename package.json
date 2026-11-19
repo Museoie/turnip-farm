@@ -23,6 +23,8 @@
     "moderation:block": "bun scripts/block-account.ts",
     "labels:candidates": "bun scripts/label-candidates.ts",
     "labels:promote": "bun scripts/promote-label.ts",
+    "labels:synonyms": "bun scripts/label-synonyms.ts",
+    "labels:merge": "bun scripts/merge-labels.ts",
     "segments:purge-blobs": "bun scripts/purge-segment-blobs.ts",
     "sources:holdout": "bun scripts/source-holdout.ts"
   },

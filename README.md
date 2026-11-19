@@ -124,7 +124,7 @@ src/
   models.ts        the model registry: POST /api/models, GET /api/models/current
   reports.ts       POST /api/reports
   consent.ts       POST /api/consent and the consent gate on contribution writes (§7.3)
-  labels.ts        vocabulary-only labels, POST /api/labels/candidates, and the candidate scripts (§1.2.25)
+  labels.ts        vocabulary-only labels, POST /api/labels/candidates and /synonyms, and their scripts (§1.2.25, §1.2.29)
   moderation.ts    attribution lookup and blocking, for the scripts below
   holdout.ts       the curated-holdout flag on sources, for sources:holdout and admin.ts (§1.2.28)
   admin.ts         the /admin page's endpoints: sources, holdout flag, pose blob (§7.3)
@@ -222,6 +222,15 @@ after 30 days. Two scripts review and promote them:
 ```sh
 bun run labels:candidates [--min N]            # names by distinct accounts
 bun run labels:promote <name> [<canonical>]    # add to the taxonomy at a new version
+```
+
+App users can also mark two names as one trick. The pairs arrive as
+synonym candidates (`POST /api/labels/synonyms`, BACKEND_DESIGN.md
+§1.2.29), expire after 30 days, and change nothing until merged:
+
+```sh
+bun run labels:synonyms [--min N]              # pairs by distinct accounts, as "<name> → <same_as>"
+bun run labels:merge <name> <same_as>          # fold <name>'s trick into <same_as>'s at a new version
 ```
 
 ### Curated holdout

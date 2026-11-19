@@ -209,6 +209,7 @@ describeDb("DELETE /api/account", () => {
           clips: 1,
           labels: 1,
           label_candidates: 1,
+          synonym_candidates: 1,
           reports: 1,
         });
       }));
