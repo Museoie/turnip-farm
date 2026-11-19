@@ -70,7 +70,9 @@ export function App() {
       ) : route === "/privacy" ? (
         <Privacy />
       ) : route === "/admin" ? (
-        <AdminPage />
+        <AdminPage view="holdouts" />
+      ) : route === "/admin/synonyms" ? (
+        <AdminPage view="synonyms" />
       ) : (
         <NotFound />
       )}

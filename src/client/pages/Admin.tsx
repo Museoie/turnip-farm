@@ -11,12 +11,33 @@ import {
   shortId,
 } from "../admin/api";
 import { CANONICAL_HZ, formatSeconds } from "../admin/pose";
+import { SynonymsConsole } from "../admin/Synonyms";
 
-// The maintainer's holdout page, at /admin (BACKEND_DESIGN.md §1.2.28,
-// §7.3 admin endpoints). The maintainer signs in through the auth service
-// (§7.1 "Admin"), which leaves an admin session cookie the endpoints
-// check; the page shows nothing until GET /api/admin/session answers.
-// It shows no contributor account ids: the endpoints return none.
+// The maintainer's pages: the holdout at /admin (BACKEND_DESIGN.md
+// §1.2.28) and synonyms at /admin/synonyms (§1.2.29), over the §7.3 admin
+// endpoints. The maintainer signs in through the auth service (§7.1
+// "Admin"), which leaves an admin session cookie the endpoints check; a
+// page shows nothing until GET /api/admin/session answers. Neither shows a
+// contributor account id: the endpoints return none.
+
+export type AdminView = "holdouts" | "synonyms";
+
+const VIEWS: { view: AdminView; path: string; label: string; title: string; lead: string }[] = [
+  {
+    view: "holdouts",
+    path: "/admin",
+    label: "Holdouts",
+    title: "Turnip — Holdouts",
+    lead: "The curated holdout: sources turnip-ml evaluates on and never trains on.",
+  },
+  {
+    view: "synonyms",
+    path: "/admin/synonyms",
+    label: "Synonyms",
+    title: "Turnip — Synonyms",
+    lead: "Trick names that are the same trick: what app users sent, and the merges that make them one for everyone.",
+  },
+];
 
 const MARK_NOTE =
   "Holdout should be footage of people who never contribute: turnip-ml evaluates on it and never trains on it.";
@@ -195,6 +216,17 @@ function SourceList({
   );
 }
 
+function SessionBar({ session }: { session: AdminSessionInfo }) {
+  return (
+    <form className="admin-session" method="post" action="/auth/logout">
+      <span className="dim">Signed in as {session.username}</span>
+      <button className="btn btn-ghost" type="submit">
+        Sign out
+      </button>
+    </form>
+  );
+}
+
 function Console({ session, onSignedOut }: { session: AdminSessionInfo; onSignedOut: () => void }) {
   const [filter, setFilter] = useState<HoldoutFilter>("all");
   const [selected, setSelected] = useState<AdminSource | null>(null);
@@ -224,12 +256,7 @@ function Console({ session, onSignedOut }: { session: AdminSessionInfo; onSigned
 
   return (
     <>
-      <form className="admin-session" method="post" action="/auth/logout">
-        <span className="dim">Signed in as {session.username}</span>
-        <button className="btn btn-ghost" type="submit">
-          Sign out
-        </button>
-      </form>
+      <SessionBar session={session} />
       {actionError && <p className="admin-error">{actionError}</p>}
 
       <section>
@@ -298,21 +325,22 @@ type PageState =
   | { kind: "error"; message: string }
   | { kind: "signed-in"; session: AdminSessionInfo };
 
-export function AdminPage() {
+export function AdminPage({ view = "holdouts" }: { view?: AdminView }) {
   const [state, setState] = useState<PageState>({ kind: "checking" });
+  const page = VIEWS.find((v) => v.view === view)!;
 
   useEffect(() => {
     const previous = document.title;
-    document.title = "Turnip — Holdouts";
+    document.title = page.title;
     return () => {
       document.title = previous;
     };
-  }, []);
+  }, [page.title]);
 
   useEffect(() => {
     const reason = new URLSearchParams(window.location.search).get("signin");
     const notice = reason === null ? null : (SIGN_IN_FAILURES[reason] ?? SIGN_IN_FAILURES.failed!);
-    if (reason !== null) window.history.replaceState(null, "", "/admin");
+    if (reason !== null) window.history.replaceState(null, "", page.path);
     getSession()
       .then((session) => setState({ kind: "signed-in", session }))
       .catch((err: unknown) => {
@@ -320,7 +348,7 @@ export function AdminPage() {
         else if (err instanceof AdminError && err.status === 401) setState({ kind: "signed-out", notice });
         else setState({ kind: "error", message: err instanceof Error ? err.message : "The farm could not be reached." });
       });
-  }, []);
+  }, [page.path]);
 
   const onSignedOut = useCallback(() => {
     setState({ kind: "signed-out", notice: "Your admin session ended. Sign in again." });
@@ -329,8 +357,20 @@ export function AdminPage() {
   return (
     <main className="page admin">
       <div className="wrap">
-        <h1>Holdouts</h1>
-        <p className="lead">The curated holdout: sources turnip-ml evaluates on and never trains on.</p>
+        <nav className="admin-nav" aria-label="Admin pages">
+          {VIEWS.map((v) => (
+            <a
+              key={v.view}
+              href={v.path}
+              className={`btn ${v.view === view ? "btn-primary" : "btn-ghost"}`}
+              aria-current={v.view === view ? "page" : undefined}
+            >
+              {v.label}
+            </a>
+          ))}
+        </nav>
+        <h1>{page.label}</h1>
+        <p className="lead">{page.lead}</p>
         {state.kind === "checking" && <p>Checking your session…</p>}
         {state.kind === "off" && <p>Admin sign-in isn't configured on this farm (the AUTH_* settings are unset).</p>}
         {state.kind === "error" && <p className="admin-error">{state.message}</p>}
@@ -344,7 +384,15 @@ export function AdminPage() {
             </p>
           </>
         )}
-        {state.kind === "signed-in" && <Console session={state.session} onSignedOut={onSignedOut} />}
+        {state.kind === "signed-in" && view === "holdouts" && (
+          <Console session={state.session} onSignedOut={onSignedOut} />
+        )}
+        {state.kind === "signed-in" && view === "synonyms" && (
+          <>
+            <SessionBar session={state.session} />
+            <SynonymsConsole onSignedOut={onSignedOut} />
+          </>
+        )}
       </div>
     </main>
   );

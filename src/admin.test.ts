@@ -9,6 +9,7 @@ import { TEST_DATABASE_URL, inRollback } from "../db/testing";
 import { type AppDeps, createHandler, startServer } from "./app";
 import { fakeAdminAuth, seedAdminSession } from "./auth/admin-testing";
 import { noDatabase, testCandidateKey } from "./auth/testing";
+import { candidateAccountHash } from "./labels";
 import { sha256Hex } from "./auth/tokens";
 import { BlobTooLargeError, MAX_CANONICAL_BLOB_BYTES, type R2Client } from "./r2/client";
 import { TokenBucket } from "./ratelimit";
@@ -73,6 +74,8 @@ const ADMIN_ROUTES: [string, string][] = [
   ["PUT", `/api/admin/sources/${SOURCE}/holdout`],
   ["DELETE", `/api/admin/sources/${SOURCE}/holdout`],
   ["GET", `/api/admin/sources/${SOURCE}/pose`],
+  ["GET", "/api/admin/synonyms"],
+  ["POST", "/api/admin/merges"],
 ];
 
 describe("admin gate", () => {
@@ -110,6 +113,9 @@ describe("admin gate", () => {
       ["GET", `/api/admin/sources/${SOURCE}`],
       ["POST", `/api/admin/sources/${SOURCE}/holdout`],
       ["GET", "/api/admin"],
+      ["POST", "/api/admin/synonyms"],
+      ["GET", "/api/admin/merges"],
+      ["DELETE", "/api/admin/merges"],
     ] as const) {
       const res = await handle(req(method, path, { origin: "https://farm.test" }));
       expect(res.status).toBe(404);
@@ -447,5 +453,167 @@ describeDb("GET /api/admin/sources/:id/pose", () => {
       for (const id of [vid("c"), "nope"]) {
         expect((await handle(req("GET", `/api/admin/sources/${id}/pose`, asAdmin))).status).toBe(404);
       }
+    }));
+});
+
+async function seedSynonym(tx: TransactionSQL, name: string, sameAs: string, account: string, at = T1) {
+  await tx`INSERT INTO synonym_candidates (name, same_as, account_hash, submitted_at)
+    VALUES (${name}, ${sameAs}, ${await candidateAccountHash(testCandidateKey, account)}, ${at}::timestamptz)`;
+}
+
+function merge(asAdmin: Record<string, string>, body: unknown): Request {
+  return new Request("http://farm.test/api/admin/merges", {
+    method: "POST",
+    headers: { ...asAdmin, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+describeDb("GET /api/admin/synonyms", () => {
+  test("lists each pair by distinct accounts, with each name's canonical, and no account trace", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const asAdmin = await adminHeaders(tx);
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version) VALUES ('raiz', 'raiz flip', 2)`;
+      await seedSynonym(tx, "Cartwheel Full Twist", "cartfull", "u1", T1);
+      await seedSynonym(tx, "Cartwheel Full Twist", "cartfull", "u2", T0);
+      await seedSynonym(tx, "corkscrew", "raiz", "u1");
+      const handle = dbDeps(tx);
+
+      const res = await handle(req("GET", "/api/admin/synonyms", asAdmin));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Cache-Control")).toBe("no-store");
+      const body = (await res.json()) as any;
+      expect(body.truncated).toBe(false);
+      expect(body.synonyms).toEqual([
+        {
+          name: "Cartwheel Full Twist",
+          same_as: "cartfull",
+          accounts: 2,
+          name_canonical: null,
+          same_as_canonical: "cartfull",
+          first_submitted_at: "2026-11-01T10:00:00.123456Z",
+        },
+        {
+          name: "corkscrew",
+          same_as: "raiz",
+          accounts: 1,
+          name_canonical: "cork",
+          same_as_canonical: "raiz flip",
+          first_submitted_at: "2026-11-02T10:00:00.000001Z",
+        },
+      ]);
+      const hash = await candidateAccountHash(testCandidateKey, "u1");
+      expect(JSON.stringify(body)).not.toContain(hash);
+      expect(JSON.stringify(body)).not.toContain("u1");
+
+      const min = (await (await handle(req("GET", "/api/admin/synonyms?min=2", asAdmin))).json()) as any;
+      expect(min.synonyms.map((p: any) => p.name)).toEqual(["Cartwheel Full Twist"]);
+    }));
+
+  test("caps the list at the pairs most accounts sent, and says when it did", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const asAdmin = await adminHeaders(tx);
+      await seedSynonym(tx, "raiz", "cork", "u1");
+      await seedSynonym(tx, "raiz", "cork", "u2");
+      await seedSynonym(tx, "aerial", "gainer", "u1");
+      await seedSynonym(tx, "btwist", "hook", "u1");
+      const handle = dbDeps(tx, { adminSynonymLimit: 2 });
+      const capped = (await (await handle(req("GET", "/api/admin/synonyms", asAdmin))).json()) as any;
+      expect(capped.synonyms.map((p: any) => p.name)).toEqual(["raiz", "aerial"]);
+      expect(capped.truncated).toBe(true);
+      const all = (await (await handle(req("GET", "/api/admin/synonyms?min=2", asAdmin))).json()) as any;
+      expect(all.synonyms.map((p: any) => p.name)).toEqual(["raiz"]);
+      expect(all.truncated).toBe(false);
+      // Exactly as many pairs as the cap: all listed, nothing left out.
+      const exact = (await (await dbDeps(tx, { adminSynonymLimit: 3 })(req("GET", "/api/admin/synonyms", asAdmin))).json()) as any;
+      expect(exact.synonyms.map((p: any) => p.name)).toEqual(["raiz", "aerial", "btwist"]);
+      expect(exact.truncated).toBe(false);
+    }));
+
+  test("names the canonical a name resolves to as the export does, an older version's included", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const asAdmin = await adminHeaders(tx);
+      await tx`INSERT INTO label_taxonomy (raw, canonical, taxonomy_version)
+        VALUES ('raiz', 'raiz flip', 2), ('raiz', 'raiz', 3)`;
+      await seedSynonym(tx, "raiz flip", "raiz", "u1");
+      const body = (await (await dbDeps(tx)(req("GET", "/api/admin/synonyms", asAdmin))).json()) as any;
+      expect(body.synonyms[0]).toMatchObject({ name_canonical: "raiz flip", same_as_canonical: "raiz" });
+    }));
+
+  test("rejects a bad min", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const asAdmin = await adminHeaders(tx);
+      const handle = dbDeps(tx);
+      for (const min of ["0", "-1", "two", "", "1.5", "9999999"]) {
+        const res = await handle(req("GET", `/api/admin/synonyms?min=${min}`, asAdmin));
+        expect(res.status).toBe(422);
+        expect(((await res.json()) as any).error).toMatchObject({ code: "VALIDATION_ERROR", details: { field: "min" } });
+      }
+    }));
+});
+
+describeDb("POST /api/admin/merges", () => {
+  test("runs the labels:merge write and reports it; a second merge changes nothing", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const asAdmin = await adminHeaders(tx);
+      await seedSynonym(tx, "cartwheel full twist", "cartfull", "u1");
+      await tx`INSERT INTO label_candidates (name, account_hash)
+        VALUES ('cartwheel full twist', ${await candidateAccountHash(testCandidateKey, "u1")})`;
+      const [{ before }] = await tx`SELECT max(taxonomy_version) AS before FROM label_taxonomy`;
+      const handle = dbDeps(tx);
+
+      const res = await handle(merge(asAdmin, { name: "Cartwheel  Full Twist", same_as: "CARTFULL" }));
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Cache-Control")).toBe("no-store");
+      expect(await res.json()).toEqual({
+        merged: true,
+        name: "cartwheel full twist",
+        canonical: "cartfull",
+        taxonomy_version: before + 1,
+        remapped: 1,
+        synonyms_dropped: 1,
+        candidates_dropped: 1,
+      });
+      const vocab = (await (await handle(req("GET", "/api/taxonomy/current"))).json()) as any;
+      expect(vocab.vocabulary.find((e: any) => e.canonical === "cartfull").aliases).toEqual([
+        "cartfull",
+        "cartwheel full twist",
+      ]);
+
+      const again = await handle(merge(asAdmin, { name: "cartfull", same_as: "cartwheel full twist" }));
+      expect(await again.json()).toEqual({ merged: false, name: "cartfull", canonical: "cartfull" });
+      const [{ after }] = await tx`SELECT max(taxonomy_version) AS after FROM label_taxonomy`;
+      expect(after).toBe(before + 1);
+    }));
+
+  test("422 names the bad field; nothing is written", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const asAdmin = await adminHeaders(tx);
+      const handle = dbDeps(tx);
+      for (const [body, field] of [
+        [{}, "name"],
+        [{ name: " ", same_as: "cork" }, "name"],
+        [{ name: 7, same_as: "cork" }, "name"],
+        [{ name: "x".repeat(65), same_as: "cork" }, "name"],
+        [{ name: "raiz" }, "same_as"],
+        [{ name: "raiz", same_as: "x".repeat(65) }, "same_as"],
+        [{ name: "Raiz", same_as: " raiz" }, "same_as"],
+      ] as const) {
+        const res = await handle(merge(asAdmin, body));
+        expect(res.status).toBe(422);
+        expect(((await res.json()) as any).error).toMatchObject({ code: "VALIDATION_ERROR", details: { field } });
+      }
+      expect(await tx`SELECT 1 FROM label_taxonomy WHERE taxonomy_version > 1`).toHaveLength(0);
+    }));
+
+  test("403 from another origin, before anything is written", async () =>
+    inRollback(sharedSql, async (tx) => {
+      const { headers } = await seedAdminSession(tx);
+      const handle = dbDeps(tx);
+      for (const origin of [undefined, "https://evil.test"]) {
+        const res = await handle(merge(origin ? { ...headers, origin } : headers, { name: "raiz", same_as: "cork" }));
+        expect(res.status).toBe(403);
+      }
+      expect(await tx`SELECT 1 FROM label_taxonomy WHERE taxonomy_version > 1`).toHaveLength(0);
     }));
 });

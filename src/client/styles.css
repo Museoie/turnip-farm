@@ -712,6 +712,70 @@ main.admin section ol.clip-list li {
   font-variant-numeric: tabular-nums;
 }
 
+/* Synonyms admin page (/admin/synonyms). */
+.admin-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+main.admin .admin-nav .btn {
+  text-decoration: none;
+}
+
+.admin-notice {
+  color: var(--green);
+}
+
+main.admin input[type="text"],
+main.admin input[type="search"],
+main.admin input[type="number"] {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+
+main.admin input[type="number"] {
+  width: 5em;
+}
+
+.synonym-name {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.merge-form {
+  display: grid;
+  gap: 10px;
+  max-width: 480px;
+}
+
+.merge-form label {
+  display: grid;
+  gap: 4px;
+}
+
+.merge-form .confirm {
+  border-top: 0;
+  margin-top: 0;
+  padding-top: 0;
+}
+
+main.admin section ul.vocabulary-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 4px;
+  color: var(--text);
+}
+
 @media (max-width: 640px) {
   main.admin section li.source-row {
     grid-template-columns: minmax(0, 1fr);

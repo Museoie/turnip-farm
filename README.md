@@ -72,12 +72,15 @@ the vocabulary, and community stats (user signups and labeling
 contributions over the last 90 days, from the public `GET /api/stats`
 endpoint, every count rounded down to a multiple of 5). The status page reads only the public endpoints
 above; it never authenticates and never shows the model's presigned R2
-URL. The one page that authenticates is `/admin`, the maintainer's
-holdout page (BACKEND_DESIGN.md §1.2.28): it browses the ingested
-sources, plays a source's pose, and marks or unmarks holdout sources,
-through admin endpoints that need a sign-in through the auth service
-(`hoiekim/auth`) with the `admin` role and a second factor; they are off
-when the `AUTH_*` variables are unset. It is not linked from the site.
+URL. The only pages that authenticate are the maintainer's: `/admin`,
+the holdout page (BACKEND_DESIGN.md §1.2.28), which browses the ingested
+sources, plays a source's pose, and marks or unmarks holdout sources;
+and `/admin/synonyms` (§1.2.29), which lists the synonym pairs app users
+sent and merges two tricks, as `labels:synonyms` and `labels:merge` do.
+Both go through admin endpoints that need a sign-in through the auth
+service (`hoiekim/auth`) with the `admin` role and a second factor; they
+are off when the `AUTH_*` variables are unset. Neither is linked from
+the site.
 
 ## Layout
 
@@ -89,11 +92,11 @@ src/
   client/          the web client (Vite + React): the public site — the
                    marketing home at `/`, support and privacy pages, and
                    the read-only status page at `/status` — and the
-                   maintainer's holdout page at `/admin`; builds into
-                   build/client
+                   maintainer's holdout and synonyms pages at `/admin` and
+                   `/admin/synonyms`; builds into build/client
     pages/         Home, Support, Privacy, Status, Admin; App.tsx is the
                    shell (header/footer) and pathname router
-    admin/         the holdout page's API calls and pose player
+    admin/         the admin pages' API calls, the pose player and the synonyms view
   app.ts           HTTP routing
   errors.ts        the API error shape (BACKEND_DESIGN.md §7.2)
   ratelimit.ts     per-user and per-IP token buckets, and the client address they key on (§7.2)
@@ -127,7 +130,7 @@ src/
   labels.ts        vocabulary-only labels, POST /api/labels/candidates and /synonyms, and their scripts (§1.2.25, §1.2.29)
   moderation.ts    attribution lookup and blocking, for the scripts below
   holdout.ts       the curated-holdout flag on sources, for sources:holdout and admin.ts (§1.2.28)
-  admin.ts         the /admin page's endpoints: sources, holdout flag, pose blob (§7.3)
+  admin.ts         the /admin pages' endpoints: sources, holdout flag, pose blob, synonyms, merges (§7.3)
   *.test.ts        tests (bun test), next to the code they cover
 scripts/           maintainer scripts, run with bun run (see Moderation)
 db/
@@ -232,6 +235,11 @@ synonym candidates (`POST /api/labels/synonyms`, BACKEND_DESIGN.md
 bun run labels:synonyms [--min N]              # pairs by distinct accounts, as "<name> → <same_as>"
 bun run labels:merge <name> <same_as>          # fold <name>'s trick into <same_as>'s at a new version
 ```
+
+The `/admin/synonyms` page does the same from a browser, signed in as the
+maintainer: it lists the pairs with each name's current canonical, merges
+one either way after a confirmation, merges any two typed names, and shows
+the vocabulary as it stands.
 
 ### Curated holdout
 

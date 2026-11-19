@@ -1,25 +1,33 @@
 // The maintainer's admin endpoints (BACKEND_DESIGN.md §7.1 "Admin", §7.3):
 // browse ingested sources, play one's pose blob, and set or clear the
-// curated-holdout flag (§1.2.28). They back the /admin page of the web
-// client and need an admin session, from a sign-in through the auth
-// service (auth/admin.ts). With admin sign-in not configured, every route
-// here answers 404, as if it did not exist.
+// curated-holdout flag (§1.2.28); list synonym candidates and merge two
+// tricks (§1.2.29). They back the /admin pages of the web client and need
+// an admin session, from a sign-in through the auth service
+// (auth/admin.ts). With admin sign-in not configured, every route here
+// answers 404, as if it did not exist.
 //
-// Nothing here returns an account id or anything from source_attribution.
+// Nothing here returns an account id, an account hash or anything from
+// source_attribution.
 
 import { type AdminAuthDeps, authenticateAdmin } from "./auth/admin";
-import { isVideoId } from "./contrib/validate";
+import { isVideoId, readJsonObject } from "./contrib/validate";
 import { errorResponse } from "./errors";
 import { setHoldout } from "./holdout";
+import { MAX_CANDIDATE_LENGTH, listSynonymCandidates, mergeLabels, normalizeName, readMergeNames } from "./labels";
 import { BlobTooLargeError, MAX_CANONICAL_BLOB_BYTES, type R2Client } from "./r2/client";
 
 export interface AdminDeps extends AdminAuthDeps {
   r2: R2Client;
   /** Page size of GET /api/admin/sources; tests lower it to cross pages cheaply. */
   adminPageLimit?: number;
+  /** Most pairs GET /api/admin/synonyms returns; tests lower it. */
+  adminSynonymLimit?: number;
 }
 
 export const ADMIN_PAGE_LIMIT = 50;
+
+/** Most pairs GET /api/admin/synonyms returns, those most accounts sent (§7.3). */
+export const ADMIN_SYNONYM_LIMIT = 100;
 
 // Admin responses describe sources by id; no shared cache keeps them.
 const NO_STORE = { "Cache-Control": "no-store" };
@@ -202,4 +210,46 @@ export async function handleGetAdminSourcePose(
       "X-Content-Type-Options": "nosniff",
     },
   });
+}
+
+// GET /api/admin/synonyms?min=N — what `bun run labels:synonyms` lists,
+// with each name's current canonical, for the synonyms page (§1.2.29):
+// at most ADMIN_SYNONYM_LIMIT pairs, `truncated` when more meet `min`.
+export async function handleListAdminSynonyms(req: Request, deps: AdminDeps): Promise<Response> {
+  const session = await authenticateAdmin(req, deps);
+  if (session instanceof Response) return session;
+  const raw = new URL(req.url).searchParams.get("min");
+  if (raw !== null && !/^[1-9]\d{0,5}$/.test(raw)) {
+    return errorResponse(422, "VALIDATION_ERROR", "min must be a whole number from 1", {
+      details: { field: "min" },
+    });
+  }
+  const limit = deps.adminSynonymLimit ?? ADMIN_SYNONYM_LIMIT;
+  const rows = await listSynonymCandidates(deps.sql, raw === null ? 1 : Number(raw), limit + 1);
+  return Response.json(
+    { synonyms: rows.slice(0, limit), truncated: rows.length > limit },
+    { headers: NO_STORE },
+  );
+}
+
+// POST /api/admin/merges {"name", "same_as"} — the `bun run labels:merge`
+// write (§1.2.29). Two names already one trick answer merged: false and
+// change nothing, as a holdout flag set twice does.
+export async function handlePostAdminMerge(req: Request, deps: AdminDeps): Promise<Response> {
+  const session = await authenticateAdmin(req, deps);
+  if (session instanceof Response) return session;
+  const body = await readJsonObject(req);
+  const names = readMergeNames(body?.name, body?.same_as);
+  if (names === null) {
+    // `same_as` when `name` alone is fine: it is the bad one, or the same name again.
+    const name = typeof body?.name === "string" ? normalizeName(body.name) : "";
+    const field = name === "" || name.length > MAX_CANDIDATE_LENGTH ? "name" : "same_as";
+    return errorResponse(
+      422,
+      "VALIDATION_ERROR",
+      "name and same_as must be two different names of 1 to 64 characters",
+      { details: { field } },
+    );
+  }
+  return Response.json(await mergeLabels(deps.sql, names.name, names.into), { headers: NO_STORE });
 }

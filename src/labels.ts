@@ -285,6 +285,50 @@ export async function promoteLabelCli(args: string[], sql: SQL, io: Output): Pro
   });
 }
 
+/** One open synonym candidate pair, as the list and the admin page show it. */
+export interface SynonymCandidate {
+  name: string;
+  same_as: string;
+  accounts: number;
+  /** The canonical each name resolves to now, or null for a name the vocabulary lacks. */
+  name_canonical: string | null;
+  same_as_canonical: string | null;
+  first_submitted_at: string;
+}
+
+/**
+ * The open synonym candidates (§1.2.29): one per ordered pair,
+ * case-insensitively, that at least `min` distinct accounts sent, the
+ * pairs most accounts sent first, ties in name order. At most `limit` of
+ * them when one is given (null: all). Counts only, never an account hash.
+ */
+export async function listSynonymCandidates(sql: SQL, min = 1, limit: number | null = null): Promise<SynonymCandidate[]> {
+  // LIMIT NULL is no limit.
+  const rows = (await sql`
+    SELECT min(name) AS name, min(same_as) AS same_as, count(DISTINCT account_hash)::int AS accounts,
+           to_char(min(submitted_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS first_submitted_at
+    FROM synonym_candidates
+    GROUP BY lower(name), lower(same_as)
+    HAVING count(DISTINCT account_hash) >= ${min}
+    ORDER BY accounts DESC, lower(name), lower(same_as)
+    LIMIT ${limit}`) as Omit<SynonymCandidate, "name_canonical" | "same_as_canonical">[];
+  const mappings = await currentMappings(sql);
+  const resolve = resolver(mappings);
+  const spelled = new Map(mappings.map((m) => [normalizeName(m.canonical), m.canonical]));
+  const canonical = (name: string) => {
+    const key = resolve.get(normalizeName(name));
+    return key === undefined ? null : (spelled.get(key) ?? key);
+  };
+  return rows.map((r) => ({
+    name: r.name,
+    same_as: r.same_as,
+    accounts: r.accounts,
+    name_canonical: canonical(r.name),
+    same_as_canonical: canonical(r.same_as),
+    first_submitted_at: r.first_submitted_at,
+  }));
+}
+
 // scripts/label-synonyms.ts [--min N]: the open synonym candidates, the
 // pairs most accounts sent first, as "<accounts>  <name> → <same_as>".
 // Each direction is its own line: which name to keep is part of what was
@@ -296,37 +340,52 @@ export async function labelSynonymsCli(args: string[], sql: SQL, io: Output): Pr
     io.err("usage: bun run labels:synonyms [--min N]");
     return 2;
   }
-  const rows = (await sql`
-    SELECT min(name) AS name, min(same_as) AS same_as, count(DISTINCT account_hash)::int AS accounts
-    FROM synonym_candidates
-    GROUP BY lower(name), lower(same_as)
-    HAVING count(DISTINCT account_hash) >= ${min}
-    ORDER BY accounts DESC, lower(name), lower(same_as)`) as { name: string; same_as: string; accounts: number }[];
+  const rows = await listSynonymCandidates(sql, min);
   for (const r of rows) io.out(`${String(r.accounts).padStart(5)}  ${r.name} → ${r.same_as}`);
   if (rows.length === 0) io.err("No synonym candidates.");
   return 0;
 }
 
-// scripts/merge-labels.ts <name> <same_as>: makes the trick <name> names
-// part of the trick <same_as> names, at a new taxonomy version. Every raw
-// that resolves to <name>'s canonical (the canonical itself included) is
-// remapped to <same_as>'s canonical, as a rename is (§3 "renames resolve
-// forward"); a name the vocabulary lacks is added under it, and a <same_as>
-// it lacks becomes a canonical of its own. Then the candidates the merge
-// settles are dropped: names now in the vocabulary, and pairs now one
-// trick. Exit status: 0 merged, 1 already one trick, 2 usage.
-export async function mergeLabelsCli(args: string[], sql: SQL, io: Output): Promise<number> {
-  const name = normalizeName(args[0] ?? "");
-  const into = normalizeName(args[1] ?? "");
-  if (
-    args.length !== 2 || name === "" || into === "" || name === into ||
-    name.length > MAX_CANDIDATE_LENGTH || into.length > MAX_CANDIDATE_LENGTH
-  ) {
-    io.err("usage: bun run labels:merge <name> <same_as>");
-    return 2;
+/** What a merge did: nothing when the two names were already one trick. */
+export type MergeOutcome =
+  | { merged: false; name: string; canonical: string }
+  | {
+      merged: true;
+      name: string;
+      canonical: string;
+      taxonomy_version: number;
+      remapped: number;
+      synonyms_dropped: number;
+      candidates_dropped: number;
+    };
+
+/**
+ * The two names a merge takes, normalized (§1.2.25), or null when either
+ * is blank or over MAX_CANDIDATE_LENGTH, or the two are the same name.
+ */
+export function readMergeNames(name: unknown, sameAs: unknown): { name: string; into: string } | null {
+  if (typeof name !== "string" || typeof sameAs !== "string") return null;
+  const n = normalizeName(name);
+  const into = normalizeName(sameAs);
+  if (n === "" || into === "" || n === into || n.length > MAX_CANDIDATE_LENGTH || into.length > MAX_CANDIDATE_LENGTH) {
+    return null;
   }
+  return { name: n, into };
+}
+
+/**
+ * Makes the trick `name` names part of the trick `into` names, at a new
+ * taxonomy version (§1.2.29). Every raw that resolves to `name`'s canonical
+ * (the canonical itself included) is remapped to `into`'s canonical, as a
+ * rename is (§3 "renames resolve forward"); a name the vocabulary lacks is
+ * added under it, and an `into` it lacks becomes a canonical of its own.
+ * Then the candidates the merge settles are dropped: names now in the
+ * vocabulary, and pairs now one trick. Both names come normalized
+ * (readMergeNames). One transaction, serialized with every other version
+ * bump by the table lock labels:promote also takes.
+ */
+export async function mergeLabels(sql: SQL, name: string, into: string): Promise<MergeOutcome> {
   return transaction(sql, async (tx) => {
-    // Serialize version bumps, as labels:promote does.
     await tx`LOCK TABLE label_taxonomy IN SHARE ROW EXCLUSIVE MODE`;
     const mappings = await currentMappings(tx);
     const resolve = resolver(mappings);
@@ -335,10 +394,7 @@ export async function mergeLabelsCli(args: string[], sql: SQL, io: Output): Prom
       ? into
       : mappings.find((m) => normalizeName(m.canonical) === target)!.canonical;
     const source = resolve.get(name);
-    if (source !== undefined && source === target) {
-      io.err(`"${name}" and "${into}" are already one trick, "${targetCanonical}".`);
-      return 1;
-    }
+    if (source !== undefined && source === target) return { merged: false, name, canonical: targetCanonical };
     const moved = source === undefined
       ? [name]
       : mappings.filter((m) => normalizeName(m.canonical) === source).map((m) => m.raw);
@@ -367,10 +423,35 @@ export async function mergeLabelsCli(args: string[], sql: SQL, io: Output): Prom
         WHERE lower(name) = ${pair.name} AND lower(same_as) = ${pair.same_as}
         RETURNING 1`).length;
     }
-    io.out(
-      `Merged "${name}" into "${targetCanonical}" at taxonomy version ${version}: ` +
-        `${moved.length} names remapped; ${synonyms} synonym and ${candidates} candidate rows dropped.`,
-    );
-    return 0;
+    return {
+      merged: true,
+      name,
+      canonical: targetCanonical,
+      taxonomy_version: version as number,
+      remapped: moved.length,
+      synonyms_dropped: synonyms,
+      candidates_dropped: candidates,
+    };
   });
+}
+
+// scripts/merge-labels.ts <name> <same_as>: mergeLabels from the command
+// line. Exit status: 0 merged, 1 already one trick, 2 usage.
+export async function mergeLabelsCli(args: string[], sql: SQL, io: Output): Promise<number> {
+  const names = args.length === 2 ? readMergeNames(args[0], args[1]) : null;
+  if (names === null) {
+    io.err("usage: bun run labels:merge <name> <same_as>");
+    return 2;
+  }
+  const outcome = await mergeLabels(sql, names.name, names.into);
+  if (!outcome.merged) {
+    io.err(`"${names.name}" and "${names.into}" are already one trick, "${outcome.canonical}".`);
+    return 1;
+  }
+  io.out(
+    `Merged "${outcome.name}" into "${outcome.canonical}" at taxonomy version ${outcome.taxonomy_version}: ` +
+      `${outcome.remapped} names remapped; ${outcome.synonyms_dropped} synonym and ` +
+      `${outcome.candidates_dropped} candidate rows dropped.`,
+  );
+  return 0;
 }

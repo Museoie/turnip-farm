@@ -27,7 +27,13 @@ import {
 import { handlePostReport } from "./reports";
 import { handlePostConsent } from "./consent";
 import { handlePostLabelCandidates, handlePostLabelSynonyms } from "./labels";
-import { handleGetAdminSourcePose, handleListAdminSources, handleSetAdminHoldout } from "./admin";
+import {
+  handleGetAdminSourcePose,
+  handleListAdminSources,
+  handleListAdminSynonyms,
+  handlePostAdminMerge,
+  handleSetAdminHoldout,
+} from "./admin";
 import {
   type AdminAuth,
   handleAdminCallback,
@@ -72,6 +78,8 @@ export type AppDeps = SignInDeps & {
   adminAuth?: AdminAuth | null;
   /** Page size of GET /api/admin/sources; tests lower it (admin.ts ADMIN_PAGE_LIMIT). */
   adminPageLimit?: number;
+  /** Most pairs GET /api/admin/synonyms returns; tests lower it (admin.ts ADMIN_SYNONYM_LIMIT). */
+  adminSynonymLimit?: number;
 };
 
 export interface HandlerOptions {
@@ -212,6 +220,12 @@ export function createHandler(deps: AppDeps, opts: HandlerOptions = {}): (req: R
         if (method === "GET" && seg.length === 5 && seg[4] === "pose") {
           return handleGetAdminSourcePose(req, deps, seg[3]!);
         }
+      }
+      if (method === "GET" && seg.length === 3 && seg[1] === "admin" && seg[2] === "synonyms") {
+        return handleListAdminSynonyms(req, deps);
+      }
+      if (method === "POST" && seg.length === 3 && seg[1] === "admin" && seg[2] === "merges") {
+        return handlePostAdminMerge(req, deps);
       }
     }
     // The maintainer's sign-in through auth (§7.1 "Admin"). Like /api, the
